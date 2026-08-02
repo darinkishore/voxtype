@@ -57,17 +57,17 @@ OpenAI Realtime's `audio/pcm` input format accepts **only 24 kHz mono s16le**. V
 
 ## Turn Detection (Server VAD)
 
-`[openai_realtime] turn_detection = true` (the default) turns on server-side VAD: OpenAI finalizes each utterance on its own as you speak, and voxtype types progressive finals at the cursor — no different from holding the hotkey through several sentences. On record stop, voxtype sends ~700ms of trailing silence to nudge the server into finalizing whatever utterance was in progress, then drains events for a bounded ~3s.
+`[openai_realtime] turn_detection = true` turns on server-side VAD — **only for models that support it; the default model `gpt-live-transcribe` rejects turn_detection outright, so the default is `false`**. When enabled: OpenAI finalizes each utterance on its own as you speak, and voxtype types progressive finals at the cursor — no different from holding the hotkey through several sentences. On record stop, voxtype sends ~700ms of trailing silence to nudge the server into finalizing whatever utterance was in progress, then drains events for a bounded ~3s.
 
 ```toml
 [openai_realtime]
-turn_detection = true             # default
+turn_detection = false            # default; gpt-live-transcribe rejects server VAD
 vad_threshold = 0.5               # default
 vad_prefix_padding_ms = 300       # default
 vad_silence_duration_ms = 550     # default
 ```
 
-Set `turn_detection = false` to disable server VAD entirely — voxtype then sends an explicit `input_audio_buffer.commit` at record stop instead of trailing silence, ending the (single) turn itself.
+With `turn_detection = false` (the default) voxtype sends an explicit `input_audio_buffer.commit` at record stop instead of trailing silence, ending the (single) turn itself.
 
 ## Streaming vs Batch
 
@@ -125,7 +125,7 @@ See [CONFIGURATION.md → [openai_realtime]](CONFIGURATION.md#openai_realtime) f
 | `keywords` | `[]` | Literal spellings to prime |
 | `languages` | `["en"]` | ISO 639-1, plural array |
 | `noise_reduction` | `near_field` | `""` disables |
-| `turn_detection` | `true` | Server VAD on/off |
+| `turn_detection` | `false` | Server VAD on/off (unsupported by `gpt-live-transcribe`) |
 | `vad_threshold` | `0.5` | Server VAD only |
 | `vad_prefix_padding_ms` | `300` | Server VAD only |
 | `vad_silence_duration_ms` | `550` | Server VAD only |

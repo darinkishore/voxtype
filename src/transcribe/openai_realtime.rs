@@ -1,7 +1,7 @@
 //! OpenAI Realtime cloud streaming WebSocket STT backend (GA transcription
 //! API).
 //!
-//! Connects to `wss://api.openai.com/v1/realtime?model=<model>` and pipes
+//! Connects to `wss://api.openai.com/v1/realtime?intent=transcription` and pipes
 //! 24 kHz mono `audio/pcm` (s16le) frames over WebSocket as base64-encoded
 //! `input_audio_buffer.append` messages, receiving JSON transcription
 //! events keyed by `item_id`. Implements both:
@@ -23,8 +23,10 @@
 //!
 //! ## Protocol notes (GA, 2026-08)
 //!
-//! This is the **GA** transcription API — `?model=<model>` in the
-//! connect URL (not the pre-GA `?intent=transcription`), and the nested
+//! This is the **GA** transcription API — `?intent=transcription` in the
+//! connect URL (the transcription model must NOT be the URL `model`
+//! param, which names the *session* model; the live API rejects that —
+//! see [`OpenaiRealtimeTranscriber::ws_url`]), and the nested
 //! `session.audio.input.{format,noise_reduction,transcription,turn_detection}`
 //! `session.update` shape. `session.audio.input.format.rate` accepts only
 //! `24000`; `languages` is a plural array field (there is no singular
@@ -262,11 +264,15 @@ impl OpenaiRealtimeTranscriber {
         })
     }
 
+    /// `?intent=transcription` — NOT `?model=<transcription model>`. The URL
+    /// `model` param sets the *session* model, and the live API rejects
+    /// transcription models there ("cannot be used as the realtime session
+    /// model … pass this transcription model as
+    /// audio.input.transcription.model instead" — verified against the live
+    /// API 2026-08-02). The transcription model rides only in
+    /// `session.update`'s `audio.input.transcription.model`.
     fn ws_url(&self) -> String {
-        format!(
-            "wss://api.openai.com/v1/realtime?model={}",
-            self.config.model
-        )
+        "wss://api.openai.com/v1/realtime?intent=transcription".to_string()
     }
 
     fn connect_request(
@@ -1302,14 +1308,13 @@ mod tests {
     }
 
     #[test]
-    fn ws_url_uses_model_query_param_not_intent() {
+    fn ws_url_uses_intent_transcription_not_session_model() {
+        // The live API rejects transcription models as the URL `model`
+        // (session model) param — see ws_url's doc comment.
         let t = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("k"))).unwrap();
         let url = t.ws_url();
-        assert_eq!(
-            url,
-            "wss://api.openai.com/v1/realtime?model=gpt-live-transcribe"
-        );
-        assert!(!url.contains("intent"));
+        assert_eq!(url, "wss://api.openai.com/v1/realtime?intent=transcription");
+        assert!(!url.contains("model="));
     }
 
     // === streaming gate ===

@@ -62,12 +62,16 @@ pub struct OpenaiRealtimeConfig {
     pub noise_reduction: String,
 
     /// Enable server-side VAD (`turn_detection: {"type":"server_vad"}`).
-    /// When true (default), the server finalizes turns on its own —
-    /// progressive per-utterance finals are typed while dictating, mirroring
-    /// Soniox's `is_final` semantics. When false, `turn_detection` is sent
-    /// as `null` and voxtype must send `input_audio_buffer.commit` itself to
-    /// end a turn (e.g. on hotkey release).
-    #[serde(default = "default_true")]
+    /// Default **false**: the default model `gpt-live-transcribe` rejects
+    /// turn_detection outright ("Turn detection is not supported for this
+    /// transcription model" — verified against the live API 2026-08-02),
+    /// and its intended flow is deltas streaming during recording with an
+    /// explicit `input_audio_buffer.commit` on record stop (which voxtype
+    /// sends automatically). Set true only with a model that supports
+    /// server VAD; the server then finalizes turns on its own —
+    /// progressive per-utterance finals typed while dictating, mirroring
+    /// Soniox's `is_final` semantics.
+    #[serde(default)]
     pub turn_detection: bool,
 
     /// Server VAD speech-probability threshold (0.0-1.0). Only used when
@@ -138,7 +142,7 @@ impl Default for OpenaiRealtimeConfig {
             keywords: Vec::new(),
             languages: default_openai_realtime_languages(),
             noise_reduction: default_openai_realtime_noise_reduction(),
-            turn_detection: true,
+            turn_detection: false,
             vad_threshold: default_openai_realtime_vad_threshold(),
             vad_prefix_padding_ms: default_openai_realtime_vad_prefix_padding_ms(),
             vad_silence_duration_ms: default_openai_realtime_vad_silence_duration_ms(),

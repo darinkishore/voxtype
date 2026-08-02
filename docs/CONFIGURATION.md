@@ -1723,10 +1723,10 @@ Input noise reduction mode: `"near_field"`, `"far_field"`, or `""` to disable (o
 ### turn_detection
 
 **Type:** Boolean
-**Default:** `true`
+**Default:** `false`
 **Required:** No
 
-Enable server-side VAD (`turn_detection: {"type":"server_vad", ...}`). When `true`, the server finalizes turns on its own as you speak — progressive per-utterance finals are typed while dictating, mirroring Soniox's `is_final` semantics. When `false`, `turn_detection` is sent as `null` and voxtype sends an explicit `input_audio_buffer.commit` to end the (single) turn at record stop instead of trailing silence.
+Enable server-side VAD (`turn_detection: {"type":"server_vad", ...}`). Default `false` — the default model `gpt-live-transcribe` does not support turn detection (the live API rejects it). With a model that supports it and `true`, the server finalizes turns on its own as you speak — progressive per-utterance finals are typed while dictating, mirroring Soniox's `is_final` semantics. When `false`, `turn_detection` is sent as `null` and voxtype sends an explicit `input_audio_buffer.commit` to end the (single) turn at record stop instead of trailing silence.
 
 ### vad_threshold
 
