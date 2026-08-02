@@ -8,9 +8,12 @@
 //!
 //! - [`Transcriber::transcribe`] — batch path used when
 //!   `[openai_realtime] streaming = false` (push-to-talk compatible).
-//!   Buffers the audio, opens a one-shot WS session, sends the whole
-//!   buffer, ends the turn (trailing silence with server VAD, or an
-//!   explicit commit without it), and returns the first item's transcript.
+//!   Buffers the audio, opens a one-shot WS session with `turn_detection:
+//!   null` (**regardless** of the `turn_detection` config, which governs
+//!   streaming only — with server VAD a multi-utterance buffer would be
+//!   split into several items and only the first could be returned),
+//!   sends the whole buffer, commits, and returns the single item's
+//!   transcript. This is the GA docs' recommended committed-turn flow.
 //!
 //! - [`StreamingTranscriber::start_stream`] — live streaming session.
 //!   Exposed only when `[openai_realtime] streaming = true` (the default).
@@ -43,8 +46,14 @@
 //!
 //! Because completion order across turns is not guaranteed, reconciliation
 //! is keyed **per `item_id`** (a `HashMap`), never a single global
-//! "currently typed" string like Soniox's reconciler uses. See
-//! [`Reconciler`].
+//! "currently typed" string like Soniox's reconciler uses. On top of that,
+//! the output device is a *linear keyboard cursor*: only the most recent
+//! item's typed text is still the tail of the screen text, so only that
+//! item (the **active** item) may revise via backspacing. Items displaced
+//! by a newer item are *frozen* — their typed partials are buried under
+//! later text, so late deltas for them are dropped and a late divergent
+//! completion keeps the as-typed text (logged, never "corrected" by
+//! backspacing through newer text). See [`Reconciler`].
 //!
 //! On record stop: with VAD enabled, ~700 ms of zero-valued PCM samples is
 //! sent (nudges the server to finalize a turn ending exactly at stop),
@@ -58,9 +67,14 @@
 //! `samples_rx` contract as 16 kHz mono f32 (matching
 //! `crate::audio::AudioCapture`'s output — the same assumption `soniox.rs`
 //! makes). OpenAI Realtime's `audio/pcm` format accepts **only 24 kHz**.
-//! This backend resamples every incoming chunk 16 kHz → 24 kHz (linear
-//! interpolation, mirroring `crate::audio::cpal_capture`'s resampler)
+//! This backend resamples 16 kHz → 24 kHz (linear interpolation, same
+//! technique as `crate::audio::cpal_capture`'s whole-buffer resampler)
 //! before encoding to PCM16 — never mislabels 16 kHz audio as 24 kHz.
+//! Unlike a per-chunk free function, the [`Resampler`] is **stateful**: it
+//! carries the previous chunk's last sample and the fractional read
+//! position across calls, so chunk boundaries interpolate into the next
+//! chunk instead of duplicating the boundary sample once per chunk
+//! (chunking-invariant; proven by `resampler_is_chunking_invariant`).
 //!
 //! ## Errors
 //!
@@ -204,8 +218,11 @@ impl OpenaiRealtimeTranscriber {
     }
 
     /// Build the `session.update` payload (GA nested `audio.input.*`
-    /// shape). `turn_detection` is `null` when server VAD is disabled.
-    fn session_update(&self) -> serde_json::Value {
+    /// shape). `turn_detection` is `null` when server VAD is disabled —
+    /// or unconditionally when `manual_commit` is set (the batch path,
+    /// which must produce exactly one item for the whole buffer; see the
+    /// module doc).
+    fn session_update(&self, manual_commit: bool) -> serde_json::Value {
         let mut transcription = serde_json::json!({
             "model": self.config.model,
             "delay": self.config.delay,
@@ -225,7 +242,7 @@ impl OpenaiRealtimeTranscriber {
         if !self.config.noise_reduction.trim().is_empty() {
             input["noise_reduction"] = serde_json::json!({ "type": self.config.noise_reduction });
         }
-        input["turn_detection"] = if self.config.turn_detection {
+        input["turn_detection"] = if self.config.turn_detection && !manual_commit {
             serde_json::json!({
                 "type": "server_vad",
                 "threshold": self.config.vad_threshold,
@@ -288,39 +305,88 @@ fn f32_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Linear interpolation resampling. Mirrors
-/// `crate::audio::cpal_capture::resample` (private to that module, so
-/// duplicated here rather than exposed cross-module for one caller).
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-
-    let ratio = to_rate as f64 / from_rate as f64;
-    let new_len = (samples.len() as f64 * ratio).ceil() as usize;
-    let mut output = Vec::with_capacity(new_len);
-
-    for i in 0..new_len {
-        let src_idx = i as f64 / ratio;
-        let idx = src_idx.floor() as usize;
-        let frac = (src_idx - idx as f64) as f32;
-
-        let sample = if idx + 1 < samples.len() {
-            samples[idx] * (1.0 - frac) + samples[idx + 1] * frac
-        } else {
-            samples.get(idx).copied().unwrap_or(0.0)
-        };
-
-        output.push(sample);
-    }
-
-    output
+/// Stateful linear-interpolation resampler (16 kHz → 24 kHz here; the
+/// rates are parameters so the same-rate identity is testable).
+///
+/// The technique matches `crate::audio::cpal_capture::resample`, but where
+/// that free function resamples one whole buffer, this carries the previous
+/// chunk's last sample plus the fractional read position across `process`
+/// calls. A per-chunk free function duplicates the boundary sample once per
+/// chunk (it has no right-hand interpolation endpoint at the chunk edge);
+/// this one interpolates across the boundary, so output is identical
+/// whether the stream arrives whole or split at arbitrary chunk sizes.
+///
+/// At most one output sample stays pending in `phase` at end of stream
+/// (~42 µs at 24 kHz) — irrelevant for speech, and the streaming path
+/// always appends trailing silence or a commit after the last chunk.
+#[derive(Debug)]
+struct Resampler {
+    /// Source samples advanced per output sample (2/3 for 16 → 24 kHz).
+    step: f64,
+    /// Read position in source samples, relative to the carried sample
+    /// (index 0 of the virtual `[carry] + input` buffer). In (0, 1] between
+    /// calls once a chunk has been processed.
+    phase: f64,
+    /// Last input sample of the previous chunk — the left interpolation
+    /// endpoint for read positions that fall before this chunk's first
+    /// sample.
+    carry: Option<f32>,
 }
 
-/// Resample a 16 kHz mono chunk to 24 kHz and encode as PCM16 LE bytes.
-fn encode_chunk(samples: &[f32]) -> Vec<u8> {
-    let resampled = resample(samples, SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE);
-    f32_to_s16le_bytes(&resampled)
+impl Resampler {
+    fn new(from_rate: u32, to_rate: u32) -> Self {
+        Self {
+            step: from_rate as f64 / to_rate as f64,
+            phase: 0.0,
+            carry: None,
+        }
+    }
+
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+        let carry_len = usize::from(self.carry.is_some());
+        let virt_len = carry_len + input.len();
+        let at = |i: usize| -> f32 {
+            if i < carry_len {
+                self.carry.expect("carry_len == 1 implies carry is Some")
+            } else {
+                input[i - carry_len]
+            }
+        };
+
+        let mut out = Vec::with_capacity(((virt_len as f64 - self.phase) / self.step) as usize + 1);
+        let mut pos = self.phase;
+        // Emit every grid position whose interpolation endpoints both exist.
+        // `pos == virt_len - 1` is included (frac 0 ⇒ the last sample
+        // exactly); anything past it waits for the next chunk. The epsilon
+        // keeps grid points that land exactly on the boundary (the 2:3 grid
+        // does hit integers) on a consistent side of the comparison despite
+        // the ~1e-10 of float drift `pos += step` accumulates — without it,
+        // whole-stream and chunked processing could disagree by one sample
+        // at such a boundary.
+        const BOUNDARY_EPS: f64 = 1e-9;
+        while pos <= (virt_len - 1) as f64 + BOUNDARY_EPS {
+            let idx = pos.floor() as usize;
+            let frac = (pos - idx as f64) as f32;
+            let a = at(idx.min(virt_len - 1));
+            let b = at((idx + 1).min(virt_len - 1));
+            out.push(a * (1.0 - frac) + b * frac);
+            pos += self.step;
+        }
+
+        // Re-base the read position onto the new carry (this chunk's last
+        // sample, which becomes virtual index 0 next call).
+        self.phase = pos - (virt_len - 1) as f64;
+        self.carry = Some(input[input.len() - 1]);
+        out
+    }
+
+    /// Resample a 16 kHz chunk and encode as 24 kHz PCM16 LE bytes.
+    fn encode_chunk(&mut self, samples: &[f32]) -> Vec<u8> {
+        f32_to_s16le_bytes(&self.process(samples))
+    }
 }
 
 /// Count the number of Unicode scalars shared as a prefix between `a` and
@@ -343,9 +409,27 @@ struct ItemState {
 /// voxtype `StreamingEvent`s, keyed per `item_id` — completion order across
 /// turns is not guaranteed by the protocol, so (unlike `soniox.rs`'s single
 /// `typed_partial` string) this tracks one `ItemState` per item.
+///
+/// ## Cursor ownership (active vs frozen items)
+///
+/// The output is a linear keyboard cursor: backspacing can only revise the
+/// **tail** of what's on screen. Therefore only the most recently started
+/// item — the one whose typed partials are still the tail — may revise.
+/// `active` names that item. When a newer item starts (or an unknown
+/// item's completion types at the cursor), every earlier item is
+/// implicitly *frozen*: its typed text is buried under newer text, so
+///
+/// - late **deltas** for a frozen item are dropped (typing them would land
+///   at the wrong position), and
+/// - a late divergent **completion** for a frozen item keeps the as-typed
+///   text (revising would backspace through the newer item's text). Both
+///   are logged; with server VAD's sequential turns these paths are
+///   protective rails, not the hot path.
 #[derive(Debug, Default)]
 struct Reconciler {
     items: HashMap<String, ItemState>,
+    /// The item currently owning the cursor tail, if any.
+    active: Option<String>,
     next_segment_id: SegmentId,
 }
 
@@ -359,6 +443,10 @@ impl Reconciler {
     /// `delta` is already an incremental fragment (not cumulative) per the
     /// OpenAI protocol, so — like Soniox's per-token deltas and Parakeet's
     /// chunk deltas — it is forwarded directly as a `Partial` event's text.
+    ///
+    /// A delta for a *frozen* item (one displaced by a newer item) is
+    /// dropped: its position on screen is buried, so typing it at the
+    /// cursor would interleave it into the newer item's text.
     fn process_delta(
         &mut self,
         item_id: &str,
@@ -368,27 +456,37 @@ impl Reconciler {
         if delta.is_empty() {
             return None;
         }
-        let segment_id = match self.items.get(item_id) {
-            Some(state) => state.segment_id,
-            None => {
-                let id = self.alloc_segment_id();
-                self.items.insert(
-                    item_id.to_string(),
-                    ItemState {
-                        segment_id: id,
-                        typed_partial: String::new(),
-                    },
+        let is_active = self.active.as_deref() == Some(item_id);
+        if !is_active {
+            if self.items.contains_key(item_id) {
+                tracing::debug!(
+                    "OpenAI Realtime: dropping late delta {:?} for frozen item {}",
+                    delta,
+                    item_id,
                 );
-                id
+                return None;
             }
-        };
+            // New item: it takes cursor ownership; any previous active
+            // item is implicitly frozen from here on.
+            let id = self.alloc_segment_id();
+            self.items.insert(
+                item_id.to_string(),
+                ItemState {
+                    segment_id: id,
+                    typed_partial: String::new(),
+                },
+            );
+            self.active = Some(item_id.to_string());
+        }
+        let state = self
+            .items
+            .get_mut(item_id)
+            .expect("active item is always present in the map");
         if type_partials {
-            if let Some(state) = self.items.get_mut(item_id) {
-                state.typed_partial.push_str(delta);
-            }
+            state.typed_partial.push_str(delta);
             Some(StreamingEvent::Partial {
                 text: delta.to_string(),
-                segment_id,
+                segment_id: state.segment_id,
             })
         } else {
             None
@@ -404,10 +502,44 @@ impl Reconciler {
     /// `type_partials = false` since `typed_partial` stays empty), this
     /// reduces to a plain `Final` with just the new tail.
     fn process_completed(&mut self, item_id: &str, transcript: &str) -> Option<StreamingEvent> {
+        let was_active = self.active.as_deref() == Some(item_id);
+        if was_active {
+            self.active = None;
+        }
         let (segment_id, typed_partial) = match self.items.remove(item_id) {
             Some(state) => (state.segment_id, state.typed_partial),
-            None => (self.alloc_segment_id(), String::new()),
+            None => {
+                // Unknown item completing (no deltas seen). Its Final will
+                // type at the cursor, which buries any item still typing —
+                // freeze it so its own later completion can't backspace
+                // through this text.
+                if let Some(displaced) = self.active.take() {
+                    tracing::debug!(
+                        "OpenAI Realtime: completion of unseen item {} freezes in-flight item {}",
+                        item_id,
+                        displaced,
+                    );
+                }
+                (self.alloc_segment_id(), String::new())
+            }
         };
+
+        // Frozen item with typed text: buried under a newer item's text.
+        // Revising would backspace through that newer text and appending
+        // the tail would land at the wrong position — keep the as-typed
+        // version.
+        if !was_active && !typed_partial.is_empty() {
+            if typed_partial != transcript {
+                tracing::info!(
+                    "OpenAI Realtime: keeping as-typed text for out-of-order completion \
+                     of item {} (typed {:?}, final {:?})",
+                    item_id,
+                    typed_partial,
+                    transcript,
+                );
+            }
+            return None;
+        }
 
         if transcript.starts_with(&typed_partial) {
             let tail = &transcript[typed_partial.len()..];
@@ -438,12 +570,27 @@ impl Reconciler {
     }
 
     /// `...transcription.failed` — drop that item's partial. If any of it
-    /// was already typed at the cursor, erase it with a pure-backspace
-    /// `Replace` (empty replacement text) so the cursor doesn't show a
-    /// half-finished utterance that will never be completed.
+    /// was already typed at the cursor *and the item still owns the tail*,
+    /// erase it with a pure-backspace `Replace` (empty replacement text)
+    /// so the cursor doesn't show a half-finished utterance that will
+    /// never be completed. A frozen item's typed text is buried and stays
+    /// as-typed (same rail as `process_completed`).
     fn process_failed(&mut self, item_id: &str) -> Option<StreamingEvent> {
+        let was_active = self.active.as_deref() == Some(item_id);
+        if was_active {
+            self.active = None;
+        }
         let state = self.items.remove(item_id)?;
         if state.typed_partial.is_empty() {
+            return None;
+        }
+        if !was_active {
+            tracing::warn!(
+                "OpenAI Realtime: item {} failed after being displaced; leaving its \
+                 typed text {:?} in place",
+                item_id,
+                state.typed_partial,
+            );
             return None;
         }
         Some(StreamingEvent::Replace {
@@ -502,8 +649,12 @@ impl OpenaiRealtimeTranscriber {
 
         let (mut write, mut read) = ws_stream.split();
 
+        // Batch always disables server VAD (see session_update docs): the
+        // whole buffer must become exactly one committed item, or a
+        // recording with mid-speech pauses would be split into several
+        // items of which only the first could be returned.
         write
-            .send(Message::Text(self.session_update().to_string()))
+            .send(Message::Text(self.session_update(true).to_string()))
             .await
             .map_err(|e| {
                 TranscribeError::InferenceFailed(format!(
@@ -514,28 +665,23 @@ impl OpenaiRealtimeTranscriber {
 
         wait_for_session_updated(&mut read).await?;
 
+        let mut resampler = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE);
         for chunk in samples.chunks(BATCH_INPUT_CHUNK_SAMPLES) {
-            let bytes = encode_chunk(chunk);
+            let bytes = resampler.encode_chunk(chunk);
             send_append(&mut write, &bytes).await?;
         }
 
-        if self.config.turn_detection {
-            let silence = vec![0.0_f32; (TARGET_SAMPLE_RATE * TRAILING_SILENCE_MS / 1000) as usize];
-            let bytes = f32_to_s16le_bytes(&silence);
-            send_append(&mut write, &bytes).await?;
-        } else {
-            write
-                .send(Message::Text(
-                    r#"{"type":"input_audio_buffer.commit"}"#.to_string(),
+        write
+            .send(Message::Text(
+                r#"{"type":"input_audio_buffer.commit"}"#.to_string(),
+            ))
+            .await
+            .map_err(|e| {
+                TranscribeError::InferenceFailed(format!(
+                    "OpenAI Realtime: send commit failed: {}",
+                    e
                 ))
-                .await
-                .map_err(|e| {
-                    TranscribeError::InferenceFailed(format!(
-                        "OpenAI Realtime: send commit failed: {}",
-                        e
-                    ))
-                })?;
-        }
+            })?;
 
         let deadline = tokio::time::Instant::now() + BATCH_TIMEOUT;
         loop {
@@ -689,7 +835,7 @@ impl StreamingTranscriber for OpenaiRealtimeTranscriber {
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
         let request = self.connect_request()?;
-        let session_update = self.session_update().to_string();
+        let session_update = self.session_update(false).to_string();
         let type_partials = self.config.type_partials;
         let turn_detection = self.config.turn_detection;
 
@@ -770,6 +916,7 @@ async fn run_streaming_session(
     tracing::debug!("OpenAI Realtime: session.updated received, streaming audio");
 
     let mut reconciler = Reconciler::default();
+    let mut resampler = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE);
     let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_BYTES * 2);
     let mut samples_closed = false;
     let mut sent_stop_sequence = false;
@@ -809,14 +956,23 @@ async fn run_streaming_session(
             chunk = samples_rx.recv(), if !samples_closed => {
                 match chunk {
                     Some(c) if !c.is_empty() => {
-                        let bytes = encode_chunk(&c);
+                        let bytes = resampler.encode_chunk(&c);
                         pending.extend_from_slice(&bytes);
+                        let mut send_failed = false;
                         while pending.len() >= CHUNK_BYTES {
                             let frame_bytes: Vec<u8> = pending.drain(..CHUNK_BYTES).collect();
                             if let Err(e) = send_append(&mut write, &frame_bytes).await {
                                 let _ = events_tx.send(StreamingEvent::Error(e)).await;
+                                send_failed = true;
                                 break;
                             }
+                        }
+                        if send_failed {
+                            // The socket is dead; a session that can't ship
+                            // audio has nothing left to do. Ends the
+                            // session (Ended follows below) rather than
+                            // limping on emitting an Error per chunk.
+                            break;
                         }
                     }
                     Some(_) => { /* empty chunk, skip */ }
@@ -1032,7 +1188,7 @@ mod tests {
     #[test]
     fn session_update_contains_required_fields() {
         let t = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("k"))).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         assert_eq!(payload["type"], "session.update");
         assert_eq!(payload["session"]["type"], "transcription");
         let input = &payload["session"]["audio"]["input"];
@@ -1047,7 +1203,7 @@ mod tests {
     #[test]
     fn session_update_omits_prompt_when_unset() {
         let t = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("k"))).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         assert!(payload["session"]["audio"]["input"]["transcription"]
             .get("prompt")
             .is_none());
@@ -1058,7 +1214,7 @@ mod tests {
         let mut cfg = cfg_with_key(Some("k"));
         cfg.prompt = Some("bias toward Rust jargon".into());
         let t = OpenaiRealtimeTranscriber::new(cfg).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         assert_eq!(
             payload["session"]["audio"]["input"]["transcription"]["prompt"],
             "bias toward Rust jargon"
@@ -1068,7 +1224,7 @@ mod tests {
     #[test]
     fn session_update_omits_keywords_when_empty() {
         let t = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("k"))).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         assert!(payload["session"]["audio"]["input"]["transcription"]
             .get("keywords")
             .is_none());
@@ -1079,7 +1235,7 @@ mod tests {
         let mut cfg = cfg_with_key(Some("k"));
         cfg.keywords = vec!["Claude".into(), "Hyprland".into()];
         let t = OpenaiRealtimeTranscriber::new(cfg).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         let keywords = payload["session"]["audio"]["input"]["transcription"]["keywords"]
             .as_array()
             .unwrap();
@@ -1092,7 +1248,7 @@ mod tests {
         let mut cfg = cfg_with_key(Some("k"));
         cfg.noise_reduction = String::new();
         let t = OpenaiRealtimeTranscriber::new(cfg).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         assert!(payload["session"]["audio"]["input"]
             .get("noise_reduction")
             .is_none());
@@ -1101,7 +1257,7 @@ mod tests {
     #[test]
     fn session_update_includes_noise_reduction_when_set() {
         let t = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("k"))).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         assert_eq!(
             payload["session"]["audio"]["input"]["noise_reduction"]["type"],
             "near_field"
@@ -1111,7 +1267,7 @@ mod tests {
     #[test]
     fn session_update_turn_detection_server_vad_when_enabled() {
         let t = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("k"))).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         let td = &payload["session"]["audio"]["input"]["turn_detection"];
         assert_eq!(td["type"], "server_vad");
         assert_eq!(td["threshold"], 0.5);
@@ -1124,8 +1280,25 @@ mod tests {
         let mut cfg = cfg_with_key(Some("k"));
         cfg.turn_detection = false;
         let t = OpenaiRealtimeTranscriber::new(cfg).unwrap();
-        let payload = t.session_update();
+        let payload = t.session_update(false);
         assert!(payload["session"]["audio"]["input"]["turn_detection"].is_null());
+    }
+
+    #[test]
+    fn session_update_batch_forces_turn_detection_null() {
+        // Batch (manual_commit) must disable server VAD even when the
+        // config enables it: the whole buffer has to become exactly one
+        // committed item or later utterances would be silently dropped.
+        let t = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("k"))).unwrap();
+        assert!(t.config.turn_detection, "precondition: VAD on in config");
+        let update = t.session_update(true);
+        assert!(update["session"]["audio"]["input"]["turn_detection"].is_null());
+        // Streaming keeps the configured server VAD.
+        let update = t.session_update(false);
+        assert_eq!(
+            update["session"]["audio"]["input"]["turn_detection"]["type"],
+            "server_vad"
+        );
     }
 
     #[test]
@@ -1177,32 +1350,73 @@ mod tests {
     }
 
     #[test]
-    fn resample_16k_to_24k_upsamples() {
-        let samples = vec![0.0_f32; 1600]; // 100ms @ 16kHz
-        let result = resample(&samples, 16000, 24000);
-        // 16000 -> 24000 is 2:3 ratio, so 1600 samples -> 2400 samples.
-        assert_eq!(result.len(), 2400);
+    fn resampler_16k_to_24k_upsamples_at_3_to_2() {
+        // 2:3 ratio. The first call withholds the sub-sample tail pending
+        // the next chunk (no right interpolation endpoint yet), so a fresh
+        // resampler emits 2399 for 1600 in; each subsequent 1600-sample
+        // chunk emits 2400. Long-run rate is exactly 1.5×.
+        let mut r = Resampler::new(16000, 24000);
+        assert_eq!(r.process(&vec![0.0_f32; 1600]).len(), 2399);
+        assert_eq!(r.process(&vec![0.0_f32; 1600]).len(), 2400);
+        assert_eq!(r.process(&vec![0.0_f32; 1600]).len(), 2400);
     }
 
     #[test]
-    fn resample_same_rate_is_noop() {
-        let samples = vec![1.0, 2.0, 3.0];
-        assert_eq!(resample(&samples, 24000, 24000), samples);
+    fn resampler_same_rate_is_identity() {
+        let mut r = Resampler::new(24000, 24000);
+        assert_eq!(r.process(&[1.0, 2.0, 3.0]), vec![1.0, 2.0, 3.0]);
+        // Continuation across calls stays the identity.
+        assert_eq!(r.process(&[4.0, 5.0]), vec![4.0, 5.0]);
     }
 
     #[test]
-    fn resample_empty_is_empty() {
-        let samples: Vec<f32> = vec![];
-        assert!(resample(&samples, 16000, 24000).is_empty());
+    fn resampler_empty_is_empty_and_preserves_state() {
+        let mut r = Resampler::new(16000, 24000);
+        let first = r.process(&[0.5, 0.5]);
+        assert!(r.process(&[]).is_empty());
+        // State untouched by the empty call: continuing produces the same
+        // stream as if the empty call never happened.
+        let mut r2 = Resampler::new(16000, 24000);
+        assert_eq!(r2.process(&[0.5, 0.5]), first);
+        assert_eq!(r.process(&[0.5]), r2.process(&[0.5]));
+    }
+
+    #[test]
+    fn resampler_is_chunking_invariant() {
+        // The property that motivates statefulness: resampling a signal
+        // whole vs. split at arbitrary chunk boundaries yields identical
+        // output. A per-chunk free function fails this (it duplicates the
+        // boundary sample at every chunk edge).
+        let signal: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.01).sin()).collect();
+
+        let mut whole = Resampler::new(16000, 24000);
+        let expected = whole.process(&signal);
+
+        let mut chunked = Resampler::new(16000, 24000);
+        let mut got = Vec::new();
+        for chunk in signal.chunks(160) {
+            got.extend(chunked.process(chunk));
+        }
+        assert_eq!(expected.len(), got.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "diverged at output sample {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
     }
 
     #[test]
     fn encode_chunk_produces_24khz_pcm16_byte_count() {
-        // 100ms @ 16kHz = 1600 samples in -> 100ms @ 24kHz = 2400 samples
-        // out -> 4800 bytes (s16le).
-        let samples = vec![0.0_f32; 1600];
-        let bytes = encode_chunk(&samples);
-        assert_eq!(bytes.len(), 4800);
+        // 2 bytes/sample; counts follow the resampler's chunking rule
+        // (2399 first call, 2400 steady-state — see
+        // resampler_16k_to_24k_upsamples_at_3_to_2).
+        let mut r = Resampler::new(16000, 24000);
+        assert_eq!(r.encode_chunk(&vec![0.0_f32; 1600]).len(), 4798);
+        assert_eq!(r.encode_chunk(&vec![0.0_f32; 1600]).len(), 4800);
     }
 
     // === Reconciler ===
@@ -1298,26 +1512,72 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_completion_across_items_uses_correct_state() {
-        // Protocol note: completion order across turns is not guaranteed.
+    fn out_of_order_completion_keeps_frozen_items_as_typed() {
+        // Protocol note: completion order across turns is not guaranteed —
+        // but the keyboard cursor is linear. Once item_2 has typed after
+        // item_1, item_1's text is buried: its late completion must NOT
+        // emit anything (a Final would type at the wrong position; a
+        // Replace would backspace through item_2's text).
         let mut r = Reconciler::default();
         r.process_delta("item_1", "first", true);
-        r.process_delta("item_2", "second", true);
-        // item_2 completes before item_1.
-        let ev2 = r
-            .process_completed("item_2", "second")
-            .unwrap_or(StreamingEvent::Final {
-                text: String::new(),
-                segment_id: 999,
-            });
-        // "second" == typed_partial exactly -> emits nothing per the
-        // no-op-on-exact-match rule; assert the *other* item is untouched.
-        let _ = ev2;
+        r.process_delta("item_2", "second", true); // item_1 now frozen
+        let ev2 = r.process_completed("item_2", "second");
+        assert!(ev2.is_none(), "exact match emits nothing");
         assert!(r.items.contains_key("item_1"));
         assert!(!r.items.contains_key("item_2"));
-        let ev1 = r.process_completed("item_1", "first thing").unwrap();
-        match ev1 {
-            StreamingEvent::Final { text, .. } => assert_eq!(text, " thing"),
+        // item_1 completes late with extra text — kept as typed.
+        assert!(r.process_completed("item_1", "first thing").is_none());
+        assert!(!r.items.contains_key("item_1"));
+    }
+
+    #[test]
+    fn late_delta_for_frozen_item_is_dropped() {
+        let mut r = Reconciler::default();
+        r.process_delta("item_1", "first", true);
+        r.process_delta("item_2", "second", true); // item_1 frozen
+        assert!(
+            r.process_delta("item_1", " more", true).is_none(),
+            "buried item must not type at the cursor"
+        );
+        // item_2 (active) still streams normally.
+        assert!(r.process_delta("item_2", " part", true).is_some());
+    }
+
+    #[test]
+    fn frozen_item_failed_leaves_typed_text_in_place() {
+        let mut r = Reconciler::default();
+        r.process_delta("item_1", "first", true);
+        r.process_delta("item_2", "second", true); // item_1 frozen
+        assert!(
+            r.process_failed("item_1").is_none(),
+            "backspacing would erase item_2's text, not item_1's"
+        );
+    }
+
+    #[test]
+    fn unseen_completion_freezes_in_flight_item() {
+        let mut r = Reconciler::default();
+        r.process_delta("item_1", "typing", true);
+        // A completion for an item we never saw deltas for types at the
+        // cursor, burying item_1's partials.
+        let ev = r.process_completed("item_x", "interjection").unwrap();
+        assert!(matches!(ev, StreamingEvent::Final { .. }));
+        // item_1's later completion must now keep the as-typed text.
+        assert!(r.process_completed("item_1", "typing plus").is_none());
+    }
+
+    #[test]
+    fn sequential_turns_revise_normally_after_completion() {
+        // The hot path: turns complete before the next one starts. Each
+        // item owns the cursor in turn and may revise its own tail.
+        let mut r = Reconciler::default();
+        r.process_delta("item_1", "hello", true);
+        let ev = r.process_completed("item_1", "Hello.").unwrap();
+        assert!(matches!(ev, StreamingEvent::Replace { backspace: 5, .. }));
+        r.process_delta("item_2", "world", true);
+        let ev = r.process_completed("item_2", "world!").unwrap();
+        match ev {
+            StreamingEvent::Final { text, .. } => assert_eq!(text, "!"),
             _ => panic!("expected Final"),
         }
     }
