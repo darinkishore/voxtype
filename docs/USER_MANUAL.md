@@ -485,6 +485,24 @@ language_hints = ["en"]
 
 See [SONIOX.md](SONIOX.md) for the full reference (realtime vs async modes, performance tips with dotoold, privacy considerations).
 
+### Cloud Backend: OpenAI Realtime
+
+Another cloud streaming alternative: [OpenAI Realtime](https://platform.openai.com/docs/guides/realtime) (GA transcription API, `gpt-live-transcribe`). Paid SaaS, no local model, server-side VAD with progressive per-utterance finals typed at the cursor.
+
+Build with `--features openai-realtime`, set `OPENAI_API_KEY`, and:
+
+```toml
+engine = "openairealtime"
+
+[hotkey]
+mode = "toggle"   # required when streaming (default)
+
+[openai_realtime]
+languages = ["en"]
+```
+
+See [OPENAI_REALTIME.md](OPENAI_REALTIME.md) for the full reference (turn detection, streaming vs batch, vocabulary priming, privacy considerations).
+
 ### Creating a Custom Configuration
 
 ```bash

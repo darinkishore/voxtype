@@ -18,8 +18,11 @@ Voxtype has seven transcription engines. Two are bundled with the standard binar
 | **Dolphin** | 40+ langs, 22 Chinese dialects | CTC E-Branchformer | 198 MB | Fast | No | ONNX |
 | **Omnilingual** | 1600+ | CTC wav2vec2 | 3.9 GB | Moderate | No | ONNX |
 | **Soniox** (cloud) | 60+ | Cloud (WebSocket / REST) | n/a (no local model) | Cloud-bound | Yes | Soniox feature |
+| **OpenAI Realtime** (cloud) | Multilingual | Cloud (WebSocket) | n/a (no local model) | Cloud-bound | Yes | openai-realtime feature |
 
 **Soniox** is different from the others — it's a paid cloud service over WebSocket / REST. No local model, no GPU. Sub-second partial latency. Strong for non-English languages where local Whisper-based engines struggle on lower-end hardware. Requires `cargo build --features soniox` and a `SONIOX_API_KEY`. See [SONIOX.md](SONIOX.md) for the full story.
+
+**OpenAI Realtime** is likewise a paid cloud service, over WebSocket only (no separate REST batch endpoint). No local model, no GPU. Server-side VAD gives progressive per-utterance finals while dictating. Requires `cargo build --features openai-realtime` and an `OPENAI_API_KEY`. See [OPENAI_REALTIME.md](OPENAI_REALTIME.md) for the full story.
 
 ---
 
@@ -61,13 +64,14 @@ OR — independently of language:
 
 ├─ Want sub-second live partials at the cursor?
 │   ├─ English + GPU available?           → Parakeet TDT (streaming, local)
-│   └─ Any of 60+ languages, paid OK?     → Soniox (cloud, sub-100ms partials)
+│   ├─ Any of 60+ languages, paid OK?     → Soniox (cloud, sub-100ms partials)
+│   └─ Want server-side VAD turn-taking?  → OpenAI Realtime (cloud, gpt-live-transcribe)
 │
 ├─ Want highest accuracy and don't mind a few seconds of wait?
 │   └─ Soniox async API (cloud, stt-async-v4)
 │
 └─ Cannot send audio off-device (privacy-sensitive)?
-    └─ Pick any *local* engine above. Never Soniox.
+    └─ Pick any *local* engine above. Never Soniox or OpenAI Realtime.
 ```
 
 ---

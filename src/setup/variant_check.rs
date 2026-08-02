@@ -61,9 +61,19 @@ pub enum Remediation {
 /// reason whisper-rs is a non-optional dependency). Every other engine is
 /// behind a feature flag of the same name — so once Whisper is excluded
 /// the feature name is just the engine's canonical name.
+///
+/// `OpenaiRealtime` is the one exception: its `.name()` is the strum-derived
+/// concatenated lowercase enum name (`"openairealtime"`, matching the
+/// `SenseVoice` → `"sensevoice"` convention used for the TOML `engine =`
+/// string), but the Cargo feature is kebab-case (`"openai-realtime"`) per
+/// the project's existing multi-word feature naming (see `parakeet-cuda`
+/// etc.). Special-cased here rather than changing the enum's serde
+/// representation, which would break existing `engine = "..."` configs for
+/// every other variant.
 pub fn required_feature(engine: TranscriptionEngine) -> Option<&'static str> {
     match engine {
         TranscriptionEngine::Whisper => None,
+        TranscriptionEngine::OpenaiRealtime => Some("openai-realtime"),
         other => Some(other.name()),
     }
 }
@@ -231,6 +241,7 @@ mod tests {
             TranscriptionEngine::Omnilingual,
             TranscriptionEngine::Cohere,
             TranscriptionEngine::Soniox,
+            TranscriptionEngine::OpenaiRealtime,
         ];
         for e in engines {
             assert!(
@@ -240,5 +251,18 @@ mod tests {
             );
         }
         assert_eq!(required_feature(TranscriptionEngine::Whisper), None);
+    }
+
+    #[test]
+    fn openai_realtime_required_feature_is_kebab_case() {
+        // Regression guard for the .name() != cargo-feature-name exception
+        // documented on required_feature(): the enum's canonical name is
+        // "openairealtime" (strum-concatenated), but the Cargo feature is
+        // "openai-realtime".
+        assert_eq!(
+            required_feature(TranscriptionEngine::OpenaiRealtime),
+            Some("openai-realtime")
+        );
+        assert_eq!(TranscriptionEngine::OpenaiRealtime.name(), "openairealtime");
     }
 }

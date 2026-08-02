@@ -13,6 +13,8 @@
 //! - Optionally Omnilingual via ONNX Runtime (when `omnilingual` feature is enabled)
 
 pub mod cli;
+#[cfg(feature = "openai-realtime")]
+pub mod openai_realtime;
 #[cfg(feature = "parakeet")]
 pub mod parakeet_streaming;
 pub mod remote;
@@ -281,6 +283,23 @@ pub fn create_transcriber(config: &Config) -> Result<Box<dyn Transcriber>, Trans
         #[cfg(not(feature = "soniox"))]
         TranscriptionEngine::Soniox => Err(TranscribeError::InitFailed(
             "Soniox engine requested but voxtype was not compiled with --features soniox"
+                .to_string(),
+        )),
+        #[cfg(feature = "openai-realtime")]
+        TranscriptionEngine::OpenaiRealtime => {
+            let cfg = config.openai_realtime.as_ref().ok_or_else(|| {
+                TranscribeError::InitFailed(
+                    "OpenAI Realtime engine selected but [openai_realtime] config section is missing"
+                        .to_string(),
+                )
+            })?;
+            Ok(Box::new(openai_realtime::OpenaiRealtimeTranscriber::new(
+                cfg.clone(),
+            )?))
+        }
+        #[cfg(not(feature = "openai-realtime"))]
+        TranscriptionEngine::OpenaiRealtime => Err(TranscribeError::InitFailed(
+            "OpenAI Realtime engine requested but voxtype was not compiled with --features openai-realtime"
                 .to_string(),
         )),
     }

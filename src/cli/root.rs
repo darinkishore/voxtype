@@ -188,6 +188,16 @@ pub struct Cli {
     )]
     pub soniox_api_key: Option<String>,
 
+    // -- OpenAI Realtime --
+    /// API key for OpenAI Realtime (or use OPENAI_API_KEY env var)
+    #[arg(
+        long,
+        value_name = "KEY",
+        help_heading = "OpenAI Realtime",
+        hide_short_help = true
+    )]
+    pub openai_realtime_api_key: Option<String>,
+
     // -- Hotkey --
     /// Override hotkey (e.g., SCROLLLOCK, PAUSE, F13, MEDIA, WEV_234, EVTEST_226)
     #[arg(long, value_name = "KEY", help_heading = "Hotkey")]

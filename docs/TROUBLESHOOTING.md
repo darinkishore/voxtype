@@ -16,6 +16,7 @@ Solutions to common issues when using Voxtype.
   - [Wrong characters on non-US keyboard layouts](#wrong-characters-on-non-us-keyboard-layouts-yz-swapped-qwertz-azerty)
 - [Performance Issues](#performance-issues)
 - [Soniox Backend Issues](#soniox-backend-issues)
+- [OpenAI Realtime Backend Issues](#openai-realtime-backend-issues)
 - [Quickshell OSD Issues](#quickshell-osd-issues)
 - [Systemd Service Issues](#systemd-service-issues)
 - [Debug Mode](#debug-mode)
@@ -1109,6 +1110,68 @@ async_max_wait_secs = 300
 ### Post-stop "Streaming Error: Soniox server error (408): Request timeout"
 
 This notification used to appear when you released the hotkey and Soniox's server-side timer fired before the connection fully closed. Voxtype now suppresses 408s that arrive **after** you've signalled end-of-audio, so this should be silent. If you still see it, your build predates the fix (any release after v0.7.2 + soniox).
+
+---
+
+## OpenAI Realtime Backend Issues
+
+### "OpenAI Realtime API key required: set [openai_realtime] api_key, api_key_file, or OPENAI_API_KEY"
+
+The backend can't find a credential. Set the env var:
+
+```bash
+export OPENAI_API_KEY="your-key-here"
+```
+
+…or add it to `~/.config/voxtype/config.toml`:
+
+```toml
+[openai_realtime]
+api_key = "your-key-here"   # less safe — lands in dotfiles
+# or:
+api_key_file = "/run/secrets/openai_api_key"
+```
+
+Resolution order is `api_key` > `api_key_file` > `OPENAI_API_KEY`. An `api_key_file` that's set but unreadable or empty is a hard startup error — it does not silently fall back to the env var.
+
+### "OpenAI Realtime: WS connect failed: ..." or "connect timeout"
+
+Network or DNS issue reaching `wss://api.openai.com`. Check:
+- Internet connectivity (`curl https://api.openai.com`)
+- Firewall / corporate proxy blocking outbound 443
+- VPN that mangles WebSocket handshakes
+
+Voxtype emits one `Streaming Error` notification and returns to idle. Press the hotkey again to retry once the network is back.
+
+### "OpenAI Realtime: fatal error during session configuration: ..."
+
+The server rejected `session.update` before ever sending `session.updated`. Common causes:
+- Invalid or revoked API key (check https://platform.openai.com/api-keys)
+- Account lacks Realtime API access
+- A `keywords` entry slipped past voxtype's client-side validation somehow (file a bug — this should be caught locally, see [keyword validation](CONFIGURATION.md#keywords))
+
+The full server error is logged verbatim — check `journalctl --user -u voxtype` for the `OpenAI Realtime error: ...` line.
+
+### OpenAI Realtime typed text occasionally diverges from spoken words
+
+OpenAI's `completed` event is the canonical transcript for an item and **replaces** whatever was typed from `delta` events — if it diverges, voxtype emits a `StreamingEvent::Replace { backspace, text }` to patch the cursor, the same primitive Soniox uses for tail revisions. The patch only works if a backspace-capable driver is in the chain (`wtype`, `dotool` via `dotoolc`, or `ydotool` — `eitype` has no backspace implementation).
+
+If you see persistent duplication or wrong tails:
+1. Check `journalctl --user -u voxtype` for `OpenAI Realtime tail revision: backspace N chars, type ...` lines.
+2. If you also see `Streaming replace: no backspace-capable backend available; skipping backspace and accepting cursor artifact`, install at least one backspace-capable driver.
+3. Disable partial typing entirely: `[openai_realtime] type_partials = false`. Finals (`completed`) are still typed, but no live cursor feedback.
+
+### PTT auto-promoted to toggle every time you start the daemon
+
+Expected when `[openai_realtime] streaming = true` (the default). Live cursor typing while the PTT key is still held breaks libinput's held-key state tracking on Hyprland/Sway/River. Voxtype auto-promotes to toggle for the running session and warns.
+
+To use OpenAI Realtime with **real** push-to-talk:
+- `[openai_realtime] streaming = false` — one-shot WebSocket session on key release, no live partials
+- `[hotkey] mode = "toggle"` — accept toggle activation (silences the warning)
+
+### Transcript seems cut off at the end of a long pause
+
+With `turn_detection = true` (server VAD, the default), the drain window after record-stop is a fixed ~3 seconds — there's no `finished:true`-equivalent terminal signal from OpenAI's protocol to wait on, unlike Soniox. If the server is slow to emit the final `completed` event for the last utterance, it can be dropped by the drain timeout. This is a known tradeoff of the bounded-drain design; there's no user-facing knob for it currently.
 
 ---
 

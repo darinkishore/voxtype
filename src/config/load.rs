@@ -1,5 +1,7 @@
 use super::parse::parse_config_with_defaults;
-use super::{Config, LanguageConfig, OutputMode, SonioxConfig, TranscriptionEngine};
+use super::{
+    Config, LanguageConfig, OpenaiRealtimeConfig, OutputMode, SonioxConfig, TranscriptionEngine,
+};
 use crate::error::VoxtypeError;
 use std::path::{Path, PathBuf};
 
@@ -182,6 +184,13 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
         config
             .soniox
             .get_or_insert_with(SonioxConfig::default)
+            .api_key = Some(key);
+    }
+    // OpenAI Realtime
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        config
+            .openai_realtime
+            .get_or_insert_with(OpenaiRealtimeConfig::default)
             .api_key = Some(key);
     }
     if let Ok(val) = std::env::var("VOXTYPE_RESTORE_CLIPBOARD") {

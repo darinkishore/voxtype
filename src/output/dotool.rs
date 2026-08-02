@@ -14,7 +14,7 @@
 //! ~700ms uinput device setup is paid once at daemon startup, not on every
 //! typed segment. Sub-10ms per call.
 //!
-//! Strongly recommended for streaming backends (Parakeet, Soniox), where
+//! Strongly recommended for streaming backends (Parakeet, Soniox, OpenAI Realtime), where
 //! 60+ output() calls land per session — without the daemon, the first
 //! call alone stalls for nearly a second. Voxtype's Arch package
 //! installs `dotoold` as a dependency; setup is out of scope here.

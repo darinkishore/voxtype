@@ -1627,6 +1627,212 @@ The `soniox` feature is independent of the other engine features and adds a smal
 
 ---
 
+## [openai_realtime]
+
+Configuration for the OpenAI Realtime cloud streaming WebSocket STT engine (GA transcription API, `gpt-live-transcribe`). This section is only used when `engine = "openairealtime"`.
+
+Unlike voxtype's local engines, no model runs on your machine — audio streams to OpenAI's servers over WebSocket and transcription events stream back.
+
+**Privacy:** Audio is sent to a third-party service. Use the local engines (Whisper, Parakeet, etc.) if you cannot send dictation off-device.
+
+### api_key
+
+**Type:** String (optional)
+**Default:** unset (falls back to `api_key_file`, then the `OPENAI_API_KEY` env var)
+**Required:** Yes (via this field, `api_key_file`, or the env var)
+
+OpenAI API key with Realtime API access. Get one at https://platform.openai.com/api-keys.
+
+Prefer the env var so the key never lands in shell history or a checked-in config file:
+
+```bash
+export OPENAI_API_KEY="your-key-here"
+```
+
+### api_key_file
+
+**Type:** Path (optional)
+**Default:** unset
+**Required:** No
+
+Path to a file containing just the API key (read once at daemon startup, trimmed of surrounding whitespace). Checked after `api_key`, before the `OPENAI_API_KEY` env var. An explicitly-configured but unreadable or empty file is a startup error — it does not silently fall through to the env var.
+
+```toml
+[openai_realtime]
+api_key_file = "/run/secrets/openai_api_key"
+```
+
+### model
+
+**Type:** String
+**Default:** `"gpt-live-transcribe"`
+**Required:** No
+
+OpenAI Realtime transcription model. `"gpt-live-transcribe"` is the GA live transcription model. `"gpt-transcribe"` is also valid (transcribes after commit; returns detected languages).
+
+### delay
+
+**Type:** String
+**Default:** `"low"`
+**Required:** No
+
+Transcription latency/quality tradeoff: `"minimal"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`.
+
+### prompt
+
+**Type:** String (optional)
+**Default:** unset
+**Required:** No
+
+Free-form vocabulary bias prompt. Mapped to `session.audio.input.transcription.prompt`. Empty/unset omits the field entirely.
+
+### keywords
+
+**Type:** Array of strings
+**Default:** `[]`
+**Required:** No
+
+Literal high-value spellings to prime the model with (proper names, jargon). Mapped to `session.audio.input.transcription.keywords`. Entries must not contain `<`, `>`, or newlines — the API rejects the `session.update` otherwise; voxtype validates this at startup.
+
+```toml
+[openai_realtime]
+keywords = ["Voxtype", "Hyprland", "tokio-tungstenite"]
+```
+
+### languages
+
+**Type:** Array of strings
+**Default:** `["en"]`
+**Required:** No
+
+ISO 639-1 codes. Mapped to `session.audio.input.transcription.languages` — plural, per the GA API (there is no singular `language` field in this version).
+
+```toml
+[openai_realtime]
+languages = ["en", "de"]
+```
+
+### noise_reduction
+
+**Type:** String
+**Default:** `"near_field"`
+**Required:** No
+
+Input noise reduction mode: `"near_field"`, `"far_field"`, or `""` to disable (omits `session.audio.input.noise_reduction` entirely).
+
+### turn_detection
+
+**Type:** Boolean
+**Default:** `true`
+**Required:** No
+
+Enable server-side VAD (`turn_detection: {"type":"server_vad", ...}`). When `true`, the server finalizes turns on its own as you speak — progressive per-utterance finals are typed while dictating, mirroring Soniox's `is_final` semantics. When `false`, `turn_detection` is sent as `null` and voxtype sends an explicit `input_audio_buffer.commit` to end the (single) turn at record stop instead of trailing silence.
+
+### vad_threshold
+
+**Type:** Float
+**Default:** `0.5`
+**Required:** No
+
+Server VAD speech-probability threshold (0.0-1.0). Only used when `turn_detection = true`.
+
+### vad_prefix_padding_ms
+
+**Type:** Integer
+**Default:** `300`
+**Required:** No
+
+Server VAD: milliseconds of audio to include before detected speech start. Only used when `turn_detection = true`.
+
+### vad_silence_duration_ms
+
+**Type:** Integer
+**Default:** `550`
+**Required:** No
+
+Server VAD: milliseconds of trailing silence required to end a turn. Only used when `turn_detection = true`.
+
+### streaming
+
+**Type:** Boolean
+**Default:** `true`
+**Required:** No
+
+Activation mode for the OpenAI Realtime backend:
+
+- `true` — Live WebSocket session. Delta/completed events stream back during recording and are typed at the cursor as they arrive (or only on `completed` if `type_partials = false`). **Requires `[hotkey] mode = "toggle"`.** Push-to-talk is auto-promoted to toggle for the running session with a warning, same reasoning as Soniox.
+- `false` — Batch mode. Audio buffered while the hotkey is held; on release one WebSocket session opens, the entire buffer is sent, the turn is ended, and the resulting transcript is typed in one shot. Push-to-talk compatible. Still uses the same WebSocket protocol — OpenAI has no separate REST batch endpoint like Soniox's async API.
+
+### type_partials
+
+**Type:** Boolean
+**Default:** `true`
+**Required:** No
+
+Only used when `streaming = true`. When `true`, delta text is typed at the cursor as it arrives (lower perceived latency). When `false`, only `completed` (canonical final) segments are typed.
+
+OpenAI's `completed` transcript is canonical and **replaces** whatever was typed as a delta for that item — if it diverges from the accumulated deltas, voxtype backspaces the mismatched tail and types the correction (same `StreamingEvent::Replace` primitive Soniox uses for tail revisions). If you see occasional churn at the cursor, set `type_partials = false`.
+
+### Configuration Summary
+
+| Option | CLI Flag | Environment Variable | Default | Description |
+|--------|----------|---------------------|---------|-------------|
+| `api_key` | `--openai-realtime-api-key` | `OPENAI_API_KEY` | none (required) | OpenAI API key |
+| `api_key_file` | - | - | none | Path to a file containing the key |
+| `model` | - | - | `"gpt-live-transcribe"` | Transcription model |
+| `delay` | - | - | `"low"` | Latency/quality tradeoff |
+| `prompt` | - | - | none | Free-form vocabulary bias |
+| `keywords` | - | - | `[]` | Literal spellings to prime |
+| `languages` | - | - | `["en"]` | Language preference (plural) |
+| `noise_reduction` | - | - | `"near_field"` | Input noise reduction mode |
+| `turn_detection` | - | - | `true` | Server VAD on/off |
+| `vad_threshold` | - | - | `0.5` | Server VAD speech threshold |
+| `vad_prefix_padding_ms` | - | - | `300` | Server VAD pre-speech padding |
+| `vad_silence_duration_ms` | - | - | `550` | Server VAD trailing silence |
+| `streaming` | - | - | `true` | Live WebSocket vs batch-on-release |
+| `type_partials` | - | - | `true` | Type delta text at cursor (realtime only) |
+
+### Complete Example — Realtime (with live partials)
+
+```toml
+engine = "openairealtime"
+
+[hotkey]
+mode = "toggle"   # Required when [openai_realtime] streaming = true
+
+[openai_realtime]
+languages = ["en"]
+streaming = true
+type_partials = true
+# api_key set via OPENAI_API_KEY env var
+```
+
+### Complete Example — Batch (PTT-compatible)
+
+```toml
+engine = "openairealtime"
+
+[hotkey]
+mode = "push_to_talk"   # Works with streaming = false; no toggle promotion
+
+[openai_realtime]
+streaming = false
+languages = ["en"]
+# api_key set via OPENAI_API_KEY env var
+```
+
+### Building from Source
+
+Source builds need the `openai-realtime` Cargo feature:
+
+```bash
+cargo build --release --features openai-realtime
+```
+
+The `openai-realtime` feature is independent of the other engine features and reuses the same WebSocket client as `soniox` (tokio-tungstenite + rustls), adding only `base64` for PCM16 audio frame encoding. It can be combined with any local engine feature, e.g. `--features "openai-realtime parakeet"` for a binary that runs Parakeet locally and OpenAI Realtime in the cloud depending on the `engine` setting.
+
+---
+
 ## [output]
 
 Controls how transcribed text is delivered.
@@ -1770,7 +1976,7 @@ Custom order of output drivers to try when `mode = "type"`. Each driver is tried
 **Available drivers:**
 - `wtype` - Wayland virtual keyboard protocol (best CJK/Unicode support, wlroots compositors only)
 - `eitype` - Wayland via libei/EI protocol (works on GNOME, KDE, and compositors with libei support). On KDE Plasma 6, each invocation briefly registers via the XDG RemoteDesktop portal, which can cause a system-tray icon to flicker during streaming dictation (many fast typing calls). Prefer `dotool` for streaming if you're on KDE.
-- `dotool` - uinput-based typing (supports keyboard layouts, works on X11/Wayland/TTY). For streaming backends (Parakeet, Soniox), run `dotoold` to make this **much** faster when no per-call layout or variant hint is needed — see [Streaming performance: dotoold fast path](#streaming-performance-dotoold-fast-path) below.
+- `dotool` - uinput-based typing (supports keyboard layouts, works on X11/Wayland/TTY). For streaming backends (Parakeet, Soniox, OpenAI Realtime), run `dotoold` to make this **much** faster when no per-call layout or variant hint is needed — see [Streaming performance: dotoold fast path](#streaming-performance-dotoold-fast-path) below.
 - `ydotool` - uinput-based typing (requires `ydotoold` daemon, X11/Wayland/TTY). Fast spawn, but **does not support keyboard layouts** — sends raw US keycodes. Wrong output on non-US layouts (e.g. Hungarian Z/Y swap).
 - `clipboard` - Wayland clipboard via wl-copy
 - `xclip` - X11 clipboard via xclip
@@ -1806,7 +2012,7 @@ voxtype --driver=ydotool,clipboard daemon
 
 #### Streaming performance: dotoold fast path
 
-Streaming backends (Parakeet, Soniox) call the output driver many times per session — once for every partial token batch. With direct `dotool` invocations each call spawns a fresh dotool process that pays the kernel uinput device setup cost (**~700-800ms** on most systems). For 60+ partials per session this stacks into 40+ seconds of typing latency — unusable.
+Streaming backends (Parakeet, Soniox, OpenAI Realtime) call the output driver many times per session — once for every partial token batch. With direct `dotool` invocations each call spawns a fresh dotool process that pays the kernel uinput device setup cost (**~700-800ms** on most systems). For 60+ partials per session this stacks into 40+ seconds of typing latency — unusable.
 
 dotool ships a daemon/client pair (`dotoold` + `dotoolc`) specifically for this case. When `dotoold` is running and voxtype has no per-call XKB layout or variant hint, voxtype auto-detects its FIFO at `/tmp/dotool-pipe` and routes typing through `dotoolc`, which simply relays commands to the long-lived daemon. The uinput device is registered **once** at daemon startup, not on every typed segment. Sub-10ms per call.
 

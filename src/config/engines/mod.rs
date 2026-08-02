@@ -6,6 +6,7 @@ mod cohere;
 mod dolphin;
 mod moonshine;
 mod omnilingual;
+mod openai_realtime;
 mod paraformer;
 mod parakeet;
 mod sensevoice;
@@ -15,6 +16,7 @@ pub use cohere::CohereConfig;
 pub use dolphin::DolphinConfig;
 pub use moonshine::MoonshineConfig;
 pub use omnilingual::OmnilingualConfig;
+pub use openai_realtime::OpenaiRealtimeConfig;
 pub use paraformer::ParaformerConfig;
 pub use parakeet::{ParakeetConfig, ParakeetModelType};
 pub use sensevoice::SenseVoiceConfig;
@@ -66,6 +68,10 @@ pub enum TranscriptionEngine {
     /// Use Soniox (cloud streaming WebSocket STT).
     /// Requires: cargo build --features soniox
     Soniox,
+    /// Use OpenAI Realtime (cloud streaming WebSocket STT, GA
+    /// `gpt-live-transcribe`).
+    /// Requires: cargo build --features openai-realtime
+    OpenaiRealtime,
 }
 
 impl TranscriptionEngine {

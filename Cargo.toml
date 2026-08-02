@@ -60,6 +60,10 @@ tokio-tungstenite = { version = "0.24", optional = true, features = ["rustls-tls
 futures-util = { version = "0.3", optional = true }
 # Async HTTP client for Soniox async transcription API (multipart upload + poll)
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "multipart", "rustls-tls"] }
+# base64 for PCM16 audio frames over the OpenAI Realtime WebSocket protocol
+# (optional). Already resolved transitively via reqwest, so this adds no new
+# dependency to the build graph — just a direct handle to encode with.
+base64 = { version = "0.22", optional = true }
 
 # JSON parsing (for CLI backend)
 serde_json = "1"
@@ -244,6 +248,10 @@ cohere-cuda = ["cohere", "onnx-cuda-enabled"]
 cohere-tensorrt = ["cohere", "onnx-tensorrt-enabled"]
 # Soniox cloud streaming WebSocket STT backend (no local model, just a network client)
 soniox = ["dep:tokio-tungstenite", "dep:futures-util", "dep:reqwest"]
+# OpenAI Realtime cloud streaming WebSocket STT backend (no local model).
+# Reuses the same WebSocket client as soniox; adds base64 for PCM16 audio
+# frame encoding (no REST/multipart client needed — no reqwest).
+openai-realtime = ["dep:tokio-tungstenite", "dep:futures-util", "dep:base64"]
 # No cohere-migraphx feature: MIGraphX 7.2 still fails on the
 # onnx-community q4 export. Original blocker was MatMulNBits bits=8
 # (cstr int8); q4 has bits=4 which is supported, but its zero_points

@@ -5957,6 +5957,7 @@ version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bytemuck",
  "cachedir",
  "cairo-rs 0.22.0",

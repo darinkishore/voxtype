@@ -285,6 +285,15 @@
           ORT_LIB_LOCATION = "${onnxruntimeRocm}/lib";
         });
 
+        # OpenAI Realtime variant (unwrapped): CPU whisper build plus the
+        # openai-realtime Cargo feature (cloud streaming WebSocket STT, no
+        # local model / ONNX runtime needed — just the WS client already
+        # pulled in by mkVoxtypeUnwrapped's common build inputs).
+        openaiRealtimeUnwrapped = mkVoxtypeUnwrapped {
+          pname = "voxtype-openai-realtime";
+          features = [ "openai-realtime" ];
+        };
+
         # OSD frontend packages. The launcher binary (`voxtype-osd`) ships
         # with every main voxtype package, these provide the GUI frontend
         # the launcher execs into.
@@ -360,6 +369,7 @@
           default = wrapVoxtype (mkVoxtypeUnwrapped {});
           vulkan = wrapVoxtype vulkanUnwrapped;
           rocm = wrapVoxtype rocmUnwrapped;
+          openai-realtime = wrapVoxtype openaiRealtimeUnwrapped;
 
           # ONNX variants (all ONNX engines: Parakeet, Moonshine, SenseVoice,
           # Paraformer, Dolphin, Omnilingual)
@@ -383,6 +393,7 @@
           voxtype-unwrapped = mkVoxtypeUnwrapped {};
           voxtype-vulkan-unwrapped = vulkanUnwrapped;
           voxtype-rocm-unwrapped = rocmUnwrapped;
+          voxtype-openai-realtime-unwrapped = openaiRealtimeUnwrapped;
           voxtype-onnx-unwrapped = onnxUnwrapped;
           voxtype-onnx-cuda-unwrapped = onnxCudaUnwrapped;
           voxtype-onnx-migraphx-unwrapped = onnxMigraphxUnwrapped;

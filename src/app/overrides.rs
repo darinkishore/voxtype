@@ -170,6 +170,14 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
             .api_key = Some(key.clone());
     }
 
+    // OpenAI Realtime overrides
+    if let Some(ref key) = cli.openai_realtime_api_key {
+        config
+            .openai_realtime
+            .get_or_insert_with(config::OpenaiRealtimeConfig::default)
+            .api_key = Some(key.clone());
+    }
+
     // Audio overrides
     if let Some(ref device) = cli.audio_device {
         config.audio.device = device.clone();

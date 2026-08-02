@@ -1,7 +1,8 @@
 use super::{
     AudioConfig, CohereConfig, DolphinConfig, HotkeyConfig, MeetingConfig, MoonshineConfig,
-    OmnilingualConfig, OutputConfig, ParaformerConfig, ParakeetConfig, Profile, SenseVoiceConfig,
-    SonioxConfig, StatusConfig, TextConfig, TranscriptionEngine, VadConfig, WhisperConfig,
+    OmnilingualConfig, OpenaiRealtimeConfig, OutputConfig, ParaformerConfig, ParakeetConfig,
+    Profile, SenseVoiceConfig, SonioxConfig, StatusConfig, TextConfig, TranscriptionEngine,
+    VadConfig, WhisperConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,6 +62,11 @@ pub struct Config {
     #[serde(default)]
     pub soniox: Option<SonioxConfig>,
 
+    /// OpenAI Realtime cloud streaming WebSocket STT configuration
+    /// (optional, only used when engine = "openairealtime")
+    #[serde(default)]
+    pub openai_realtime: Option<OpenaiRealtimeConfig>,
+
     /// Text processing configuration (replacements, spoken punctuation)
     #[serde(default)]
     pub text: TextConfig,
@@ -113,6 +119,7 @@ impl Default for Config {
             omnilingual: None,
             cohere: None,
             soniox: None,
+            openai_realtime: None,
             text: TextConfig::default(),
             vad: VadConfig::default(),
             status: StatusConfig::default(),
@@ -145,6 +152,13 @@ impl Config {
                 .soniox
                 .as_ref()
                 .map(|s| s.streaming && !s.async_api)
+                .unwrap_or(false),
+            // Missing [openai_realtime] section → don't auto-promote PTT,
+            // same reasoning as the Soniox arm above.
+            TranscriptionEngine::OpenaiRealtime => self
+                .openai_realtime
+                .as_ref()
+                .map(|o| o.streaming)
                 .unwrap_or(false),
             _ => false,
         }
@@ -312,6 +326,8 @@ impl Config {
                 .unwrap_or(false),
             // Soniox is a cloud backend; nothing to load on demand.
             TranscriptionEngine::Soniox => false,
+            // OpenAI Realtime is a cloud backend; nothing to load on demand.
+            TranscriptionEngine::OpenaiRealtime => false,
         }
     }
 
@@ -359,6 +375,11 @@ impl Config {
                 .as_ref()
                 .map(|s| s.model.as_str())
                 .unwrap_or("soniox (not configured)"),
+            TranscriptionEngine::OpenaiRealtime => self
+                .openai_realtime
+                .as_ref()
+                .map(|o| o.model.as_str())
+                .unwrap_or("openai_realtime (not configured)"),
         }
     }
 

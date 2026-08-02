@@ -488,7 +488,8 @@ fn guidance_enabled<'a>(state: &'a HotkeyState) -> Vec<Line<'a>> {
 
     // Streaming dictation requires toggle activation; if the user has it
     // enabled, suppress PTT-pair suggestions in favor of a toggle binding.
-    // Covers all streaming-capable backends (Parakeet, Soniox, future).
+    // Covers all streaming-capable backends (Parakeet, Soniox, OpenAI
+    // Realtime, future).
     let streaming = {
         let ed = ConfigEditor::load().ok();
         let engine = ed
@@ -503,6 +504,10 @@ fn guidance_enabled<'a>(state: &'a HotkeyState) -> Vec<Line<'a>> {
             "soniox" => ed
                 .as_ref()
                 .and_then(|e| e.get_bool("soniox", "streaming"))
+                .unwrap_or(true),
+            "openairealtime" => ed
+                .as_ref()
+                .and_then(|e| e.get_bool("openai_realtime", "streaming"))
                 .unwrap_or(true),
             _ => false,
         }
