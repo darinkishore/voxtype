@@ -148,6 +148,29 @@ impl StreamingSession {
         self.typed_chars
     }
 
+    /// Accumulate a finalized segment WITHOUT touching the cursor
+    /// (deferred delivery: `[output] streaming_delivery = "end"`). The
+    /// daemon delivers `finalized_text()` once, through the normal output
+    /// chain, when the session ends. Segments are joined with a single
+    /// space when the boundary would otherwise glue two words together.
+    pub fn accumulate_segment(&mut self, text: &str) {
+        if text.is_empty() {
+            self.clear_partial();
+            return;
+        }
+        let needs_space = self
+            .finalized_text
+            .chars()
+            .last()
+            .is_some_and(|c| !c.is_whitespace())
+            && text.chars().next().is_some_and(|c| c.is_alphanumeric());
+        if needs_space {
+            self.finalized_text.push(' ');
+        }
+        self.finalized_text.push_str(text);
+        self.clear_partial();
+    }
+
     /// Type a finalized segment to the output, optionally running it
     /// through `post_process` first (with `VOXTYPE_CONTEXT` =
     /// `finalized_text_so_far`).

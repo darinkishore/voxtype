@@ -12,6 +12,20 @@ fn default_restore_clipboard_delay() -> u32 {
     200 // 200ms - delay for paste to complete before restoring clipboard
 }
 
+/// When a *streaming* session delivers finalized text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StreamingDelivery {
+    /// Type each finalized segment at the cursor as it arrives (upstream
+    /// behavior).
+    #[default]
+    Live,
+    /// Accumulate silently and deliver the whole transcript once when the
+    /// session ends, through the normal output chain. Pair with
+    /// `mode = "paste"` for a Wispr-Flow-style single insertion.
+    End,
+}
+
 /// Text output configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutputConfig {
@@ -22,6 +36,11 @@ pub struct OutputConfig {
     /// Fall back to clipboard if typing fails
     #[serde(default = "default_true")]
     pub fallback_to_clipboard: bool,
+
+    /// Streaming sessions: deliver finalized text live (typed as segments
+    /// finalize) or once at session end. See [`StreamingDelivery`].
+    #[serde(default)]
+    pub streaming_delivery: StreamingDelivery,
 
     /// Custom driver order for type mode (overrides default: wtype -> dotool -> ydotool -> clipboard)
     /// Specify which drivers to try and in what order.
@@ -183,6 +202,7 @@ impl Default for OutputConfig {
         Self {
             mode: OutputMode::default(),
             fallback_to_clipboard: true,
+            streaming_delivery: StreamingDelivery::default(),
             driver_order: None,
             notification: NotificationConfig::default(),
             type_delay_ms: 0,
