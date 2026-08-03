@@ -927,6 +927,11 @@ async fn run_streaming_session(
     let mut samples_closed = false;
     let mut sent_stop_sequence = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
+    // `input_audio_buffer.committed` names the turn's final item; once that
+    // item settles (completed/failed) the drain can end early instead of
+    // sleeping out the full DRAIN_TIMEOUT.
+    let mut committed_item: Option<String> = None;
+    let mut committed_item_done = false;
 
     loop {
         let drain_timer = async {
@@ -1061,11 +1066,21 @@ async fn run_streaming_session(
                     }
                     "conversation.item.input_audio_transcription.completed" => {
                         let transcript = parsed.get("transcript").and_then(|v| v.as_str()).unwrap_or("");
+                        if committed_item.as_deref() == Some(item_id) {
+                            committed_item_done = true;
+                        }
                         reconciler.process_completed(item_id, transcript)
                     }
                     "conversation.item.input_audio_transcription.failed" => {
                         tracing::warn!("OpenAI Realtime: item {} failed", item_id);
+                        if committed_item.as_deref() == Some(item_id) {
+                            committed_item_done = true;
+                        }
                         reconciler.process_failed(item_id)
+                    }
+                    "input_audio_buffer.committed" => {
+                        committed_item = Some(item_id.to_string());
+                        None
                     }
                     "error" => {
                         // Fatal: mirrors soniox.rs's error_message handling.
@@ -1086,6 +1101,17 @@ async fn run_streaming_session(
                     if events_tx.send(ev).await.is_err() {
                         break;
                     }
+                }
+
+                // Early drain exit: after end-of-turn, once the committed
+                // (final) item has settled and no earlier item is still
+                // open, nothing more can arrive — end the session now so
+                // stop→settled latency is the model's, not DRAIN_TIMEOUT.
+                if drain_deadline.is_some() && committed_item_done && reconciler.items.is_empty() {
+                    tracing::debug!(
+                        "OpenAI Realtime: committed item settled; ending drain early"
+                    );
+                    break;
                 }
             }
         }

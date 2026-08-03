@@ -717,6 +717,9 @@ pub fn compiled_features() -> Vec<&'static str> {
     if cfg!(feature = "cohere") {
         f.push("cohere");
     }
+    if cfg!(feature = "openai-realtime") {
+        f.push("openai-realtime");
+    }
     // Meeting-mode capability: ML-based speaker diarization (ECAPA-TDNN).
     // When absent, meeting mode falls back to source-based attribution.
     if cfg!(feature = "ml-diarization") {
@@ -1060,6 +1063,7 @@ mod tests {
         require_feature_listed!("gpu-metal");
         require_feature_listed!("osd-native");
         require_feature_listed!("osd-gtk4");
+        require_feature_listed!("openai-realtime");
     }
 
     /// Regression test for #443: when `install_active_binary` is called

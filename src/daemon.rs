@@ -1013,6 +1013,32 @@ impl Daemon {
             let _ = h.task.await;
         }
         self.stop_streaming_drain_pump();
+
+        // Deferred delivery: the whole transcript lands here, once,
+        // through the configured output chain (paste mode makes it a
+        // single clipboard+keystroke insertion, Wispr-Flow-style).
+        if self.config.output.streaming_delivery == crate::config::StreamingDelivery::End {
+            if let Some(s) = streaming_session.as_ref() {
+                let text = s.finalized_text().to_string();
+                if !text.is_empty() {
+                    let output_chain = output::create_output_chain(&self.config.output);
+                    let opts = output::OutputOptions {
+                        pre_output_command: self.config.output.pre_output_command.as_deref(),
+                        post_output_command: self.config.output.post_output_command.as_deref(),
+                        wait_for_modifier_release: self.config.output.wait_for_modifier_release,
+                        modifier_release_timeout: std::time::Duration::from_millis(
+                            self.config.output.modifier_release_timeout_ms,
+                        ),
+                    };
+                    if let Err(e) =
+                        output::output_with_fallback(&output_chain, &text, opts).await
+                    {
+                        tracing::error!("Deferred streaming output failed: {}", e);
+                    }
+                }
+            }
+        }
+
         *streaming_session = None;
         *streaming_chain = None;
 
@@ -2804,14 +2830,13 @@ impl Daemon {
                         (HotkeyEvent::Released, ActivationMode::PushToTalk) => {
                             tracing::debug!("Received HotkeyEvent::Released (push-to-talk), state.is_recording() = {}", state.is_recording());
                             if state.is_streaming() {
-                                tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
+                                tracing::debug!("Streaming push-to-talk released; closing capture, draining trailing transcript");
                                 self.stop_streaming_capture(&mut audio_capture).await;
-                                // Drop session/chain so the backend's
-                                // post-stop flush emission is dropped at
-                                // the event pump instead of typed.
-                                // Matches the SIGUSR2 stop path.
-                                streaming_session = None;
-                                streaming_chain = None;
+                                // Grace-drain (vendor patch): keep
+                                // session/chain so trailing finals still
+                                // type after release. Matches the SIGUSR2
+                                // stop path.
+                                self.update_state("transcribing");
                             } else if let State::Recording { model_override, .. } = &state {
                                 let transcriber = match self.get_transcriber_for_recording(
                                     model_override.as_deref(),
@@ -3392,6 +3417,23 @@ impl Daemon {
                 // Handle SIGUSR1 - start recording (for compositor keybindings)
                 _ = sigusr1.recv() => {
                     tracing::debug!("Received SIGUSR1 (start recording)");
+                    // Grace-drain (vendor patch): a start during the
+                    // post-stop drain finalizes the previous session now
+                    // (keeping its typed text) instead of eating the press.
+                    if state.is_streaming() && audio_capture.is_none() {
+                        tracing::info!("SIGUSR1 during drain; finalizing previous session early");
+                        if let Some(h) = streaming_handle.take() {
+                            let _ = h.cancel.send(());
+                            let _ = h.task.await;
+                        }
+                        self.end_streaming(
+                            &mut state,
+                            &mut audio_capture,
+                            &mut streaming_handle,
+                            &mut streaming_session,
+                            &mut streaming_chain,
+                        ).await;
+                    }
                     if state.is_idle() {
                         // Read model override from file (set by `voxtype record start --model X`)
                         let model_override = read_model_override();
@@ -3519,16 +3561,15 @@ impl Daemon {
                 _ = sigusr2.recv() => {
                     tracing::debug!("Received SIGUSR2 (stop recording)");
                     if state.is_streaming() {
-                        tracing::info!("SIGUSR2 stop while streaming; closing capture and disowning session");
+                        tracing::info!("SIGUSR2 stop while streaming; closing capture, draining trailing transcript");
                         self.stop_streaming_capture(&mut audio_capture).await;
-                        // Drop the typing surface synchronously so any
-                        // Final/Partial events the backend emits while
-                        // draining its internal buffer reach the event-pump
-                        // arm with `streaming_session = None` and get
-                        // discarded instead of typed into whatever window
-                        // has focus by then.
-                        streaming_session = None;
-                        streaming_chain = None;
+                        // Grace-drain (vendor patch): keep the typing
+                        // surface alive so the model's trailing deltas and
+                        // finals — which lag speech by ~1-2s — still land
+                        // after the stop press instead of being discarded.
+                        // Bounded by the backend's drain window; Ended
+                        // cleans up via end_streaming.
+                        self.update_state("transcribing");
                     } else if let State::Recording { model_override, .. } = &state {
                         let transcriber = match self.get_transcriber_for_recording(
                             model_override.as_deref(),
@@ -3622,35 +3663,48 @@ impl Daemon {
                 }, if state.is_streaming() && streaming_handle.is_some() => {
                     match event {
                         Some(StreamingEvent::Partial { text, .. }) => {
+                            let deferred = self.config.output.streaming_delivery
+                                == crate::config::StreamingDelivery::End;
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
-                                if let Err(e) = s.type_partial_delta(
-                                    chain,
-                                    text,
-                                    self.config.output.pre_output_command.as_deref(),
-                                    self.config.output.post_output_command.as_deref(),
-                                ).await {
-                                    tracing::warn!("Streaming partial delta type failed: {}", e);
-                                }
-                                if let State::Streaming { typed_chars, .. } = &mut state {
-                                    *typed_chars = s.typed_chars();
+                                if deferred {
+                                    // Deferred delivery: partials are status-only.
+                                    s.observe_partial(text);
+                                } else {
+                                    if let Err(e) = s.type_partial_delta(
+                                        chain,
+                                        text,
+                                        self.config.output.pre_output_command.as_deref(),
+                                        self.config.output.post_output_command.as_deref(),
+                                    ).await {
+                                        tracing::warn!("Streaming partial delta type failed: {}", e);
+                                    }
+                                    if let State::Streaming { typed_chars, .. } = &mut state {
+                                        *typed_chars = s.typed_chars();
+                                    }
                                 }
                             }
                         }
                         Some(StreamingEvent::Final { text, .. }) => {
+                            let deferred = self.config.output.streaming_delivery
+                                == crate::config::StreamingDelivery::End;
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
-                                let pp = self.post_processor.as_ref();
-                                if let Err(e) = s.commit_segment(
-                                    chain,
-                                    &text,
-                                    pp,
-                                    self.config.output.pre_output_command.as_deref(),
-                                    self.config.output.post_output_command.as_deref(),
-                                ).await {
-                                    tracing::error!("Streaming commit_segment failed: {}", e);
+                                if deferred {
+                                    s.accumulate_segment(&text);
+                                } else {
+                                    let pp = self.post_processor.as_ref();
+                                    if let Err(e) = s.commit_segment(
+                                        chain,
+                                        &text,
+                                        pp,
+                                        self.config.output.pre_output_command.as_deref(),
+                                        self.config.output.post_output_command.as_deref(),
+                                    ).await {
+                                        tracing::error!("Streaming commit_segment failed: {}", e);
+                                    }
                                 }
                                 // Mirror typed_chars onto the state for cancel-rewind.
                                 if let State::Streaming { typed_chars, finalized_text, .. } = &mut state {
@@ -3661,10 +3715,16 @@ impl Daemon {
                             }
                         }
                         Some(StreamingEvent::Replace { backspace, text, .. }) => {
+                            let deferred = self.config.output.streaming_delivery
+                                == crate::config::StreamingDelivery::End;
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
-                                if let Err(e) = s.replace_and_commit(
+                                if deferred {
+                                    // Nothing was typed, so there is nothing to
+                                    // backspace — just accumulate the revision.
+                                    s.accumulate_segment(&text);
+                                } else if let Err(e) = s.replace_and_commit(
                                     chain,
                                     backspace,
                                     &text,
