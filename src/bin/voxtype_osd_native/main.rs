@@ -32,7 +32,6 @@ use clap::Parser;
 use voxtype::audio::levels::{AudioFrame, FRAME_HZ};
 use voxtype::osd::config::OsdConfig;
 use voxtype::osd::ipc::{resolve_socket_path, run_ipc_loop, FrameRing, DEFAULT_RING_DEPTH};
-use voxtype::osd::theme::ThemeWatcher;
 use voxtype::osd::visual::PeakHold;
 
 use crate::app::SharedState;
@@ -153,14 +152,10 @@ fn main() -> anyhow::Result<()> {
         osd_config.height_px
     );
 
-    let theme = ThemeWatcher::new();
-    let palette = theme.palette();
-
     let shared = SharedState {
         ring: Arc::new(Mutex::new(FrameRing::new(DEFAULT_RING_DEPTH))),
         peak_hold: Arc::new(Mutex::new(PeakHold::new(osd_config.peak_decay_db_per_sec))),
         last_frame_at: Arc::new(Mutex::new(None)),
-        palette,
         config: osd_config,
     };
 

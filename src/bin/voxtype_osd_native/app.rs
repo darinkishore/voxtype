@@ -39,12 +39,9 @@ use smithay_client_toolkit::{
     },
 };
 
-use voxtype::audio::levels::AudioFrame;
 use voxtype::osd::config::{OsdConfig, OsdPosition};
 use voxtype::osd::ipc::FrameRing;
-use voxtype::osd::visual::{
-    peak_meter_fraction, project_envelope, EnvelopeColumn, MeterZone, Palette, PeakHold,
-};
+use voxtype::osd::visual::PeakHold;
 
 /// State shared between the IPC thread and the render thread.
 #[derive(Clone)]
@@ -54,7 +51,6 @@ pub struct SharedState {
     /// Wall-clock timestamp of the most recent frame. Used to drive idle
     /// teardown when no frames have arrived for a while.
     pub last_frame_at: Arc<Mutex<Option<Instant>>>,
-    pub palette: Palette,
     pub config: OsdConfig,
 }
 
@@ -99,6 +95,11 @@ struct RenderSurface {
     height: u32,
     /// Whether we've received the first configure (and thus may render).
     configured: bool,
+    /// When this surface appeared; drives the fade-in animation and the
+    /// idle-wave phase clock.
+    shown_at: Instant,
+    /// Smoothed mic level (linear 0..1), for calm bar attack/decay.
+    level_smooth: f32,
 
     // wgpu plumbing.
     _instance: wgpu::Instance,
@@ -313,6 +314,8 @@ impl App {
             width: cfg.width_px,
             height: cfg.height_px,
             configured: false,
+            shown_at: Instant::now(),
+            level_smooth: 0.0,
             _instance: instance,
             surface,
             device,
@@ -381,51 +384,48 @@ impl App {
             ..Default::default()
         };
 
-        let palette = self.shared.palette;
-        let cfg = &self.shared.config;
-        let waveform_window_secs = cfg.waveform_window_secs;
-        let meter_w = ((rs.width as f32) * 0.05).max(8.0);
-        let waveform_w = (rs.width as f32) - meter_w - 4.0;
-        let n_columns = waveform_w.max(32.0) as usize;
-
-        let envelope_cols = {
+        // Live mic level: latest frame's peak (dBFS → linear), smoothed for
+        // a calm attack/decay like Wispr's CSS-transitioned bars.
+        let target_level = {
             let ring = self.shared.ring.lock().expect("ring poisoned");
-            let frames_in_window =
-                (waveform_window_secs * voxtype::audio::levels::FRAME_HZ as f32) as usize;
-            let mut buf: Vec<AudioFrame> = ring.iter().collect();
-            if buf.len() > frames_in_window {
-                let skip = buf.len() - frames_in_window;
-                buf = buf.split_off(skip);
-            }
-            project_envelope(&buf, n_columns)
+            ring.latest()
+                .map(|f| 10.0_f32.powf(f.peak_dbfs / 20.0))
+                .unwrap_or(0.0)
         };
+        // Fast attack, slow release: bars jump with your voice and settle
+        // gracefully, instead of symmetric low-pass mush.
+        let coeff = if target_level > rs.level_smooth {
+            0.55
+        } else {
+            0.10
+        };
+        rs.level_smooth += (target_level - rs.level_smooth) * coeff;
+        let level = rs.level_smooth;
 
-        let (peak_dbfs, held_dbfs) = {
-            let ring = self.shared.ring.lock().expect("ring poisoned");
-            let p = ring.latest().map(|f| f.peak_dbfs).unwrap_or(-120.0);
-            let h = self
-                .shared
-                .peak_hold
-                .lock()
-                .map(|x| x.held_dbfs)
-                .unwrap_or(-120.0);
-            (p, h)
-        };
+        // Fade in on appear, fade out as the frame stream goes quiet before
+        // idle teardown. 280ms, matching Wispr Flow's opacity transition.
+        let t = rs.shown_at.elapsed().as_secs_f32();
+        let since_frame = self
+            .shared
+            .last_frame_at
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|i| i.elapsed().as_secs_f32())
+            .unwrap_or(f32::MAX);
+        let fade_in = ease_in_out((t / 0.28).clamp(0.0, 1.0));
+        let fade_out = ease_in_out(
+            (1.0 - (since_frame - (IDLE_TEARDOWN_SECS - 0.28)) / 0.28).clamp(0.0, 1.0),
+        );
+        let ui_alpha = fade_in * fade_out;
+        // Entrance: the pill pops from 94% scale as it fades in.
+        let appear = 0.94 + 0.06 * fade_in;
 
         let width_px = rs.width;
         let height_px = rs.height;
         let gain = self.shared.config.waveform_gain;
         let full_output = rs.egui_ctx.run_ui(raw_input, |ui| {
-            draw_ui(
-                ui,
-                width_px,
-                height_px,
-                &palette,
-                &envelope_cols,
-                peak_dbfs,
-                held_dbfs,
-                gain,
-            );
+            draw_ui(ui, width_px, height_px, level, gain, t, ui_alpha, appear);
         });
 
         let primitives = rs
@@ -457,7 +457,8 @@ impl App {
         );
 
         {
-            let bg = palette.background;
+            // Transparent clear: the pill is drawn by egui, so everything
+            // outside its rounded capsule stays see-through.
             let mut rpass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("voxtype-osd-pass"),
@@ -465,12 +466,7 @@ impl App {
                         view: &view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: bg.r as f64,
-                                g: bg.g as f64,
-                                b: bg.b as f64,
-                                a: bg.a as f64,
-                            }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -523,132 +519,162 @@ fn position_to_anchor_and_margins(pos: OsdPosition, margin: i32) -> (Anchor, i32
     }
 }
 
-/// Render the egui UI: scrolling waveform on the left, segmented vertical
-/// peak meter on the right.
+/// Render the egui UI: a Wispr-Flow-style dictation pill — solid black
+/// capsule, ten slim white bars breathing on a staggered wave animation,
+/// scaled live by mic level with a center bulge.
+///
+/// Geometry and motion transcribed from Wispr Flow's flow-bar waveform
+/// (`Waveform/styles.module.scss` + its React bar component): 10 bars,
+/// center bulge `1 - p²/48`, keyframes ×1 → ×1.2 → ×1.5 → ×1.1 → ×1.3 → ×1
+/// over 1s ease-in-out, 0.1s stagger fanning out from center, bars white
+/// at 40% opacity when quiet and brightening with voice.
+#[allow(clippy::too_many_arguments)]
 fn draw_ui(
     ui: &mut egui::Ui,
     width: u32,
     height: u32,
-    palette: &Palette,
-    envelope: &[EnvelopeColumn],
-    peak_dbfs: f32,
-    held_dbfs: f32,
+    level: f32,
     gain: f32,
+    t: f32,
+    alpha: f32,
+    appear: f32,
 ) {
-    use egui::{Pos2, Rect};
+    use egui::{pos2, vec2, Color32, Rect, StrokeKind};
     let painter = ui.painter().clone();
     let w = width as f32;
     let h = height as f32;
-    let meter_w = (w * 0.05).max(8.0);
-    let waveform_w = w - meter_w - 4.0;
-    let waveform_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(waveform_w, h));
-    let meter_rect = Rect::from_min_size(Pos2::new(w - meter_w, 0.0), egui::vec2(meter_w, h));
 
-    draw_waveform(&painter, waveform_rect, palette, envelope, gain);
-    draw_meter(&painter, meter_rect, palette, peak_dbfs, held_dbfs);
-}
-
-fn draw_waveform(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    palette: &Palette,
-    envelope: &[EnvelopeColumn],
-    gain: f32,
-) {
-    use egui::{pos2, Shape};
-    if envelope.is_empty() {
-        return;
-    }
-    let n = envelope.len();
-    let col_w = rect.width() / n as f32;
-    let mid_y = rect.center().y;
-    let half_h = rect.height() * 0.45;
-
-    let mut top_pts = Vec::with_capacity(n);
-    let mut bot_pts = Vec::with_capacity(n);
-    for (i, col) in envelope.iter().enumerate() {
-        let x = rect.left() + (i as f32 + 0.5) * col_w;
-        // Apply visual gain, then clamp to -1.0..=1.0, then map to pixel y.
-        // y grows downward so we subtract from mid_y for the top edge.
-        let top = mid_y - (col.max * gain).clamp(-1.0, 1.0) * half_h;
-        let bot = mid_y - (col.min * gain).clamp(-1.0, 1.0) * half_h;
-        top_pts.push(pos2(x, top));
-        bot_pts.push(pos2(x, bot));
-    }
-
-    // Build a closed polygon: top points left-to-right, bottom right-to-left.
-    let mut polygon = top_pts;
-    for p in bot_pts.iter().rev() {
-        polygon.push(*p);
-    }
-
-    let fill = color_to_egui(palette.accent);
-    painter.add(Shape::convex_polygon(polygon, fill, egui::Stroke::NONE));
-
-    // Centerline tick for visual reference at low levels.
-    let line_color = color_to_egui(palette.foreground.with_alpha(0.25));
-    painter.line_segment(
-        [pos2(rect.left(), mid_y), pos2(rect.right(), mid_y)],
-        egui::Stroke::new(1.0, line_color),
+    // Black capsule with a hairline ring, scale-popping in around center.
+    let full = Rect::from_min_size(egui::Pos2::ZERO, vec2(w, h));
+    let pill = Rect::from_center_size(full.center(), full.size() * appear).shrink(1.0);
+    let radius = pill.height() * 0.5;
+    painter.rect_filled(
+        pill,
+        radius,
+        mul_alpha(Color32::from_rgba_unmultiplied(0, 0, 0, 245), alpha),
     );
-}
+    painter.rect_stroke(
+        pill,
+        radius,
+        egui::Stroke::new(
+            1.0,
+            mul_alpha(Color32::from_rgba_unmultiplied(255, 255, 255, 22), alpha),
+        ),
+        StrokeKind::Inside,
+    );
 
-fn draw_meter(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    palette: &Palette,
-    peak_dbfs: f32,
-    held_dbfs: f32,
-) {
-    use egui::{pos2, Rect};
-    const SEGMENTS: usize = 10;
-    const FLOOR_DBFS: f32 = -60.0;
+    const N: usize = 10;
+    // Per-bar audio gain, center-weighted, so speech makes the middle dance
+    // hardest and the edges sway — organic instead of uniform pumping.
+    const BAR_GAIN: [f32; N] = [0.75, 0.9, 1.05, 1.2, 1.3, 1.3, 1.2, 1.05, 0.9, 0.75];
+    let bar_w = 4.0_f32;
+    let gap = 4.0_f32;
+    let total = N as f32 * bar_w + (N as f32 - 1.0) * gap;
+    let x0 = pill.center().x - total * 0.5 + bar_w * 0.5;
+    let base_h = 8.0_f32 * appear;
+    let max_h = pill.height() * 0.68;
+    let center = (N as f32 - 1.0) / 2.0;
+    let half = N.div_ceil(2);
 
-    let segment_h = rect.height() / SEGMENTS as f32;
-    let segment_gap = (segment_h * 0.15).clamp(1.0, 3.0);
-    let inner_w = rect.width() - 4.0;
-    let lit_fraction = peak_meter_fraction(peak_dbfs, FLOOR_DBFS);
-    let lit_segments = (lit_fraction * SEGMENTS as f32).round() as usize;
+    let presence = (level * 10.0).clamp(0.0, 1.0);
+    let bar_alpha = 0.42 + 0.55 * presence;
 
-    for i in 0..SEGMENTS {
-        // Segment 0 is the BOTTOM of the bar (low dB == bottom).
-        let y_top = rect.bottom() - (i as f32 + 1.0) * segment_h + segment_gap * 0.5;
-        let y_bot = rect.bottom() - i as f32 * segment_h - segment_gap * 0.5;
-        let seg_rect = Rect::from_min_max(
-            pos2(rect.left() + 2.0, y_top),
-            pos2(rect.left() + 2.0 + inner_w, y_bot),
-        );
+    // Resting bars are a quiet lavender-white; voice blooms them into a
+    // purple→pink sweep across the pill (Dracula Pro accents on AMOLED
+    // black). Silence keeps the Wispr-style idle breathing wave.
+    const REST: (f32, f32, f32) = (244.0, 240.0, 255.0);
+    const PURPLE: (f32, f32, f32) = (189.0, 147.0, 249.0);
+    const PINK: (f32, f32, f32) = (255.0, 121.0, 198.0);
 
-        let segment_peak_dbfs = FLOOR_DBFS * (1.0 - i as f32 / SEGMENTS as f32);
-        let zone = MeterZone::from_dbfs(segment_peak_dbfs);
-        let lit = i < lit_segments;
-        let base = zone.color(palette);
-        let color = if lit {
-            color_to_egui(base)
+    for i in 0..N {
+        let p = (center - i as f32).abs();
+        let bulge = (1.0 - (p * p) / 48.0).max(0.0);
+        let delay = if i < half {
+            0.1 * i as f32
         } else {
-            color_to_egui(base.with_alpha(0.18))
+            0.1 * (i as f32 - N as f32)
         };
-        painter.rect_filled(seg_rect, 1.0, color);
-    }
+        let wave = wave_multiplier(t - delay);
+        // `max(1, …)` floor mirrors Wispr's `--bar-audio-scale` so silence
+        // still shows the idle breathing wave at resting size.
+        let audio_scale = (1.0 + level * gain * 3.0 * BAR_GAIN[i]).max(1.0);
+        let bar_h = (base_h * bulge * wave * audio_scale).clamp(bar_w, max_h);
+        let x = x0 + i as f32 * (bar_w + gap);
+        let rect = Rect::from_center_size(pos2(x, pill.center().y), vec2(bar_w, bar_h));
 
-    // Held-peak tick, drawn as a thin foreground bar.
-    let held_fraction = peak_meter_fraction(held_dbfs, FLOOR_DBFS);
-    if held_fraction > 0.0 {
-        let y = rect.bottom() - held_fraction * rect.height();
-        let tick_rect = Rect::from_min_max(
-            pos2(rect.left() + 2.0, y - 1.0),
-            pos2(rect.left() + 2.0 + inner_w, y + 1.0),
-        );
-        painter.rect_filled(tick_rect, 0.0, color_to_egui(palette.foreground));
+        let g = i as f32 / (N as f32 - 1.0);
+        let grad = lerp_rgb(PURPLE, PINK, g);
+        let (r, gr, b) = lerp_rgb(REST, grad, presence);
+        let color =
+            Color32::from_rgba_unmultiplied(r as u8, gr as u8, b as u8, (bar_alpha * 255.0) as u8);
+
+        // Soft halo behind the bar while speaking — a whisper of glow, not
+        // a lamp.
+        if presence > 0.05 {
+            let halo = Rect::from_center_size(rect.center(), rect.size() + vec2(4.0, 4.0));
+            let halo_alpha = 0.10 * presence;
+            painter.rect_filled(
+                halo,
+                (bar_w + 4.0) * 0.5,
+                mul_alpha(
+                    Color32::from_rgba_unmultiplied(
+                        r as u8,
+                        gr as u8,
+                        b as u8,
+                        (halo_alpha * 255.0) as u8,
+                    ),
+                    alpha,
+                ),
+            );
+        }
+        painter.rect_filled(rect, bar_w * 0.5, mul_alpha(color, alpha));
     }
 }
 
-fn color_to_egui(c: voxtype::osd::visual::Color) -> egui::Color32 {
+fn lerp_rgb(a: (f32, f32, f32), b: (f32, f32, f32), f: f32) -> (f32, f32, f32) {
+    let f = f.clamp(0.0, 1.0);
+    (
+        a.0 + (b.0 - a.0) * f,
+        a.1 + (b.1 - a.1) * f,
+        a.2 + (b.2 - a.2) * f,
+    )
+}
+
+/// Wispr Flow's `@keyframes wave`, as a phase function: stops at
+/// (0, ×1) (0.2, ×1.2) (0.4, ×1.5) (0.8, ×1.1) (0.9, ×1.3) (1, ×1),
+/// ease-in-out between stops, looping at 1 Hz.
+fn wave_multiplier(phase: f32) -> f32 {
+    const STOPS: [(f32, f32); 6] = [
+        (0.0, 1.0),
+        (0.2, 1.2),
+        (0.4, 1.5),
+        (0.8, 1.1),
+        (0.9, 1.3),
+        (1.0, 1.0),
+    ];
+    let p = phase.rem_euclid(1.0);
+    for w in STOPS.windows(2) {
+        let (t0, v0) = w[0];
+        let (t1, v1) = w[1];
+        if p <= t1 {
+            let f = ((p - t0) / (t1 - t0)).clamp(0.0, 1.0);
+            return v0 + (v1 - v0) * ease_in_out(f);
+        }
+    }
+    1.0
+}
+
+fn ease_in_out(f: f32) -> f32 {
+    let f = f.clamp(0.0, 1.0);
+    f * f * (3.0 - 2.0 * f)
+}
+
+fn mul_alpha(c: egui::Color32, a: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
-        (c.r.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.g.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.b.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.a.clamp(0.0, 1.0) * 255.0) as u8,
+        c.r(),
+        c.g(),
+        c.b(),
+        (c.a() as f32 * a.clamp(0.0, 1.0)) as u8,
     )
 }
 
