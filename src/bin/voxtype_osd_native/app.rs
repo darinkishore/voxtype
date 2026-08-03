@@ -104,9 +104,9 @@ struct RenderSurface {
     shown_at: Instant,
     /// Smoothed mic level (linear 0..1), for calm bar attack/decay.
     level_smooth: f32,
-    /// Smoothed bar brightness (dim while transcribing, solid while
-    /// recording).
-    bright_smooth: f32,
+    /// Recording→processing morph progress (0 = recording pill with
+    /// waveform, 1 = compact processing pill with bouncing dots).
+    proc_blend: f32,
 
     // wgpu plumbing.
     _instance: wgpu::Instance,
@@ -323,7 +323,7 @@ impl App {
             configured: false,
             shown_at: Instant::now(),
             level_smooth: 0.0,
-            bright_smooth: 1.0,
+            proc_blend: 0.0,
             _instance: instance,
             surface,
             device,
@@ -409,15 +409,17 @@ impl App {
         rs.level_smooth += (target_voice - rs.level_smooth) * 0.25;
         let voice = rs.level_smooth;
 
-        // Wispr's state signal: solid-white bars while recording, dimmed
-        // while the drain finishes transcription. The daemon's state file
-        // lives on tmpfs; a 60 Hz read is nothing.
+        // Wispr's state signal is a SHAPE change, not a tint: recording is
+        // the waveform pill; the moment you stop, it morphs (~100ms, their
+        // cubic-bezier(.05,.6,.4,.95)) into a compact capsule with three
+        // bouncing dots until delivery. The daemon's state file lives on
+        // tmpfs; a 60 Hz read is nothing.
         let recording = std::fs::read_to_string(&self.shared.state_path)
             .map(|s| s.trim() == "recording")
             .unwrap_or(true);
-        let bright_target = if recording { 1.0 } else { 0.45 };
-        rs.bright_smooth += (bright_target - rs.bright_smooth) * 0.08;
-        let brightness = rs.bright_smooth;
+        let proc_target = if recording { 0.0 } else { 1.0 };
+        rs.proc_blend += (proc_target - rs.proc_blend) * 0.30;
+        let proc = rs.proc_blend;
 
         // Fade in on appear, fade out as the frame stream goes quiet before
         // idle teardown. 280ms, matching Wispr Flow's opacity transition.
@@ -443,7 +445,7 @@ impl App {
         let gain = self.shared.config.waveform_gain;
         let full_output = rs.egui_ctx.run_ui(raw_input, |ui| {
             draw_ui(
-                ui, width_px, height_px, voice, gain, t, ui_alpha, appear, brightness,
+                ui, width_px, height_px, voice, gain, t, ui_alpha, appear, proc,
             );
         });
 
@@ -557,7 +559,7 @@ fn draw_ui(
     t: f32,
     alpha: f32,
     appear: f32,
-    brightness: f32,
+    proc: f32,
 ) {
     use egui::{pos2, vec2, Color32, Rect, StrokeKind};
     let painter = ui.painter().clone();
@@ -565,8 +567,12 @@ fn draw_ui(
     let h = height as f32;
 
     // Black capsule with a hairline ring, scale-popping in around center.
+    // Recording→processing morphs the capsule ~38% narrower (Wispr changes
+    // the pill's SILHOUETTE per state — that shape change is what makes
+    // the mode legible at a glance).
     let full = Rect::from_min_size(egui::Pos2::ZERO, vec2(w, h));
-    let pill = Rect::from_center_size(full.center(), full.size() * appear).shrink(1.0);
+    let pill_w = w * (1.0 - 0.38 * ease_in_out(proc));
+    let pill = Rect::from_center_size(full.center(), vec2(pill_w, h) * appear).shrink(1.0);
     let radius = pill.height() * 0.5;
     painter.rect_filled(
         pill,
@@ -602,25 +608,60 @@ fn draw_ui(
     // cap. `gain` ([osd] waveform_gain, default 10) is a trim: 10 → 1.0×.
     let audio = voice * (gain / 10.0);
 
-    for i in 0..N {
-        let p = (center - i as f32).abs();
-        let bulge = (1.0 - (p * p) / 48.0).max(0.0);
-        let delay = if i < half {
-            0.1 * i as f32
-        } else {
-            0.1 * (i as f32 - N as f32)
-        };
-        let wave = wave_multiplier(t - delay);
-        let audio_scale = (1.0 + 4.0 * audio * BAR_GAIN[i]).min(5.0);
-        let bar_h = (base_h * bulge * wave * audio_scale).clamp(bar_w, max_h);
-        let x = x0 + i as f32 * (bar_w + gap);
-        let rect = Rect::from_center_size(pos2(x, pill.center().y), vec2(bar_w, bar_h));
+    // Waveform (recording face) — crossfades out as the pill morphs to
+    // processing. Wispr `.micActive`: bars solid white while the mic is
+    // hot; no hue games.
+    let bars_alpha = (1.0 - ease_in_out(proc)) * alpha;
+    if bars_alpha > 0.02 {
+        for i in 0..N {
+            let p = (center - i as f32).abs();
+            let bulge = (1.0 - (p * p) / 48.0).max(0.0);
+            let delay = if i < half {
+                0.1 * i as f32
+            } else {
+                0.1 * (i as f32 - N as f32)
+            };
+            let wave = wave_multiplier(t - delay);
+            let audio_scale = (1.0 + 4.0 * audio * BAR_GAIN[i]).min(5.0);
+            let bar_h = (base_h * bulge * wave * audio_scale).clamp(bar_w, max_h);
+            let x = x0 + i as f32 * (bar_w + gap);
+            let rect = Rect::from_center_size(pos2(x, pill.center().y), vec2(bar_w, bar_h));
+            painter.rect_filled(
+                rect,
+                bar_w * 0.5,
+                mul_alpha(Color32::WHITE, bars_alpha),
+            );
+        }
+    }
 
-        // Wispr's palette: white, full-strength while recording
-        // (`.micActive`), dimmed toward their resting 40% while the drain
-        // finishes transcription. No hue games.
-        let color = Color32::from_rgba_unmultiplied(255, 255, 255, (brightness * 255.0) as u8);
-        painter.rect_filled(rect, bar_w * 0.5, mul_alpha(color, alpha));
+    // Processing face: Wispr's AnimatingDots — three dots on a 1.4s
+    // ease-in-out bounce (up 4px at the 30% mark), staggered 0.2s.
+    let dots_alpha = ease_in_out(proc) * alpha;
+    if dots_alpha > 0.02 {
+        let dot_r = 2.5_f32;
+        let dot_gap = 10.0_f32;
+        for i in 0..3 {
+            let dy = dots_bounce(t - 0.2 * i as f32);
+            let x = pill.center().x + (i as f32 - 1.0) * dot_gap;
+            painter.circle_filled(
+                pos2(x, pill.center().y + dy),
+                dot_r,
+                mul_alpha(Color32::WHITE, dots_alpha),
+            );
+        }
+    }
+}
+
+/// Wispr's AnimatingDots bounce keyframe: 1.4s ease-in-out infinite,
+/// `translateY(0)` at 0%/60%/100%, `translateY(-4px)` at 30%.
+fn dots_bounce(t: f32) -> f32 {
+    let p = t.rem_euclid(1.4) / 1.4;
+    if p < 0.30 {
+        -4.0 * ease_in_out(p / 0.30)
+    } else if p < 0.60 {
+        -4.0 * (1.0 - ease_in_out((p - 0.30) / 0.30))
+    } else {
+        0.0
     }
 }
 
