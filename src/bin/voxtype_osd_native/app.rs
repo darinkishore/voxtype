@@ -392,17 +392,22 @@ impl App {
             ..Default::default()
         };
 
-        // Live mic level: window amplitude of the latest 10ms frame,
-        // smoothed with Wispr's one-pole (0.85 retain per 60 Hz frame) so
-        // the bars move calmly instead of twitching.
-        let target_level = {
+        // Live mic level → perceptual "voice" 0..1: map the 10ms window
+        // amplitude from dBFS (-45 quiet .. -15 loud speech) so bar
+        // response doesn't depend on absolute mic gain, then smooth with a
+        // calm one-pole. Raw linear amplitude sat almost entirely below
+        // the ×1 scale floor — bars looked dead.
+        let target_voice = {
             let ring = self.shared.ring.lock().expect("ring poisoned");
-            ring.latest()
+            let amp = ring
+                .latest()
                 .map(|f| f.max.abs().max(f.min.abs()))
-                .unwrap_or(0.0)
+                .unwrap_or(0.0);
+            let amp_db = 20.0 * amp.max(1e-4).log10();
+            ((amp_db + 45.0) / 30.0).clamp(0.0, 1.0)
         };
-        rs.level_smooth += (target_level - rs.level_smooth) * 0.15;
-        let level = rs.level_smooth;
+        rs.level_smooth += (target_voice - rs.level_smooth) * 0.25;
+        let voice = rs.level_smooth;
 
         // Wispr's state signal: solid-white bars while recording, dimmed
         // while the drain finishes transcription. The daemon's state file
@@ -438,7 +443,7 @@ impl App {
         let gain = self.shared.config.waveform_gain;
         let full_output = rs.egui_ctx.run_ui(raw_input, |ui| {
             draw_ui(
-                ui, width_px, height_px, level, gain, t, ui_alpha, appear, brightness,
+                ui, width_px, height_px, voice, gain, t, ui_alpha, appear, brightness,
             );
         });
 
@@ -547,7 +552,7 @@ fn draw_ui(
     ui: &mut egui::Ui,
     width: u32,
     height: u32,
-    level: f32,
+    voice: f32,
     gain: f32,
     t: f32,
     alpha: f32,
@@ -582,20 +587,20 @@ fn draw_ui(
     // Wispr's mini-waveform per-bar level gains, extended to 10 bars:
     // center reacts hardest, edges sway.
     const BAR_GAIN: [f32; N] = [0.8, 0.9, 1.0, 1.1, 1.2, 1.2, 1.1, 1.0, 0.9, 0.8];
-    let bar_w = 3.0_f32;
-    let gap = 3.0_f32;
+    let bar_w = 2.5_f32;
+    let gap = 3.5_f32;
     let total = N as f32 * bar_w + (N as f32 - 1.0) * gap;
     let x0 = pill.center().x - total * 0.5 + bar_w * 0.5;
     let base_h = 6.0_f32 * appear;
-    let max_h = pill.height() * 0.66;
+    let max_h = pill.height() * 0.62;
     let center = (N as f32 - 1.0) / 2.0;
     let half = N.div_ceil(2);
 
-    // Wispr's scale math: `max(1, audio_scale * bar_level_gain)`, where
-    // audio_scale ≈ 5 × smoothed level. `gain` is [osd] waveform_gain
-    // (default 10) halved so the default lands exactly on Wispr's 5×.
-    // Capped at 5 so shouting compresses instead of pinning every bar.
-    let audio = level * gain * 0.5;
+    // Wispr's scale shape `max(1, audio × bar_level_gain)` on the
+    // perceptual voice level: silence sits at ×1 (pure idle wave), normal
+    // speech lands mid-range (~×3), only loud voice approaches the ×5
+    // cap. `gain` ([osd] waveform_gain, default 10) is a trim: 10 → 1.0×.
+    let audio = voice * (gain / 10.0);
 
     for i in 0..N {
         let p = (center - i as f32).abs();
@@ -606,7 +611,7 @@ fn draw_ui(
             0.1 * (i as f32 - N as f32)
         };
         let wave = wave_multiplier(t - delay);
-        let audio_scale = (audio * BAR_GAIN[i]).max(1.0).min(5.0);
+        let audio_scale = (1.0 + 4.0 * audio * BAR_GAIN[i]).min(5.0);
         let bar_h = (base_h * bulge * wave * audio_scale).clamp(bar_w, max_h);
         let x = x0 + i as f32 * (bar_w + gap);
         let rect = Rect::from_center_size(pos2(x, pill.center().y), vec2(bar_w, bar_h));

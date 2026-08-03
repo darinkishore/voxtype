@@ -383,6 +383,21 @@ pub(crate) async fn dispatch(
             run_status(&config, follow, &format, extended, icon_theme).await?;
         }
 
+        Commands::History { count } => {
+            let entries = voxtype::history::read_last(count);
+            if entries.is_empty() {
+                println!(
+                    "No history yet ({})",
+                    voxtype::history::history_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "no data dir".into())
+                );
+            }
+            for e in entries {
+                println!("[{}] ({}) {}", e.at, e.ended, e.text);
+            }
+        }
+
         Commands::Record { action } => {
             send_record_command(&config, action, top_level_model.as_deref())?;
         }

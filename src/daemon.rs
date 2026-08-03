@@ -1072,6 +1072,20 @@ impl Daemon {
                 }
             }
         }
+        // Transcript history (both live and deferred delivery).
+        if let Some(s) = streaming_session.as_ref() {
+            let text = s.finalized_text();
+            if !text.is_empty() {
+                crate::history::append(
+                    text,
+                    if self.streaming_timed_out {
+                        "timeout"
+                    } else {
+                        "stop"
+                    },
+                );
+            }
+        }
         self.streaming_timed_out = false;
 
         *streaming_session = None;
@@ -2326,6 +2340,7 @@ impl Daemon {
                     {
                         tracing::error!("Output failed: {}", e);
                     } else {
+                        crate::history::append(&final_text, "batch");
                         self.play_feedback(SoundEvent::TranscriptionComplete);
 
                         if self.config.output.notification.on_transcription {

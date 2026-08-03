@@ -78,6 +78,7 @@ pub mod daemon_status;
 pub mod eager;
 pub mod error;
 #[cfg(target_os = "linux")]
+pub mod history;
 pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod hotkey_macos;

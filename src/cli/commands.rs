@@ -119,6 +119,13 @@ pub enum Commands {
         icon_theme: Option<String>,
     },
 
+    /// Show recent dictation transcripts (newest last)
+    History {
+        /// Number of entries to show
+        #[arg(short = 'n', long, default_value_t = 20)]
+        count: usize,
+    },
+
     /// Control recording from external sources (compositor keybindings, scripts)
     Record {
         #[command(subcommand)]
