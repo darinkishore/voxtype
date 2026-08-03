@@ -12,7 +12,8 @@ use std::path::PathBuf;
 pub struct HistoryEntry {
     /// RFC 3339 local timestamp of delivery.
     pub at: String,
-    /// How the session ended: "stop", "timeout", or "batch".
+    /// How the session ended: "stop", "timeout", "shutdown" (daemon was
+    /// terminated mid-dictation and salvaged the transcript), or "batch".
     pub ended: String,
     pub text: String,
 }

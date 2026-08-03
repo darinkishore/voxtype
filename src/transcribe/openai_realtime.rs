@@ -1080,6 +1080,10 @@ async fn run_streaming_session(
                     }
                     "input_audio_buffer.committed" => {
                         committed_item = Some(item_id.to_string());
+                        // Reset: with server VAD a prior turn's settled item
+                        // must not satisfy the exit check for THIS commit
+                        // before its transcript has arrived.
+                        committed_item_done = false;
                         None
                     }
                     "error" => {

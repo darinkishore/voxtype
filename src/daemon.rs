@@ -2338,6 +2338,8 @@ impl Daemon {
                         output::output_with_fallback(&output_chain, &final_text, output_options)
                             .await
                     {
+                        // Output failure is exactly when history matters most.
+                        crate::history::append(&final_text, "batch");
                         tracing::error!("Output failed: {}", e);
                     } else {
                         crate::history::append(&final_text, "batch");
@@ -2429,6 +2431,31 @@ impl Daemon {
         // notify-send pops up where the user is actually looking. See
         // #450 — the silent v0.6.x to v0.7.0 wrapper-flip incident.
         self.warn_on_variant_mismatch();
+
+        // Deferred streaming delivery drops Partial events without typing
+        // them. Engine configs that carry transcript text in partials
+        // (openai_realtime with type_partials=true, Parakeet's delta
+        // stream) WILL lose most of every utterance in that mode.
+        if self.config.output.streaming_delivery == crate::config::StreamingDelivery::End {
+            let partial_carrying = match self.config.engine {
+                crate::config::TranscriptionEngine::OpenaiRealtime => self
+                    .config
+                    .openai_realtime
+                    .as_ref()
+                    .map(|c| c.type_partials)
+                    .unwrap_or(true),
+                crate::config::TranscriptionEngine::Parakeet => true,
+                _ => false,
+            };
+            if partial_carrying {
+                tracing::warn!(
+                    "streaming_delivery = \"end\" discards partial deltas, but the \
+                     configured engine carries transcript text in partials — text WILL \
+                     be lost. Set openai_realtime.type_partials = false, or use \
+                     streaming_delivery = \"live\"."
+                );
+            }
+        }
 
         // Streaming dictation types characters at the cursor while the user is
         // still holding the PTT key. On Wayland compositors backed by libinput
@@ -3096,6 +3123,9 @@ impl Daemon {
                             } else if state.is_streaming() {
                                 tracing::info!("Toggle stop while streaming; closing capture");
                                 self.stop_streaming_capture(&mut audio_capture).await;
+                                // Match the SIGUSR2 stop path: the OSD/waybar
+                                // show the "finishing" face during the drain.
+                                self.update_state("transcribing");
                             } else if let State::Recording { model_override: current_model_override, .. } = &state {
                                 let transcriber = match self.get_transcriber_for_recording(
                                     current_model_override.as_deref(),
@@ -3266,6 +3296,25 @@ impl Daemon {
                 _ = tokio::time::sleep(Duration::from_millis(100)), if state.is_recording() => {
                     // Check for cancel request first
                     if check_cancel_requested() {
+                        // Streaming sessions need the full streaming teardown
+                        // (cancel WS task, rewind typed text, stop the drain
+                        // pump, drop session/chain) — falling through to the
+                        // batch-recording cleanup below leaves the session
+                        // locals populated, which keeps the OSD pill alive
+                        // and lets the shutdown salvage later "recover" an
+                        // explicitly cancelled transcript.
+                        if state.is_streaming() {
+                            tracing::info!("Streaming cancelled (external trigger)");
+                            self.cancel_streaming_to_idle(
+                                &mut state,
+                                &mut audio_capture,
+                                &mut streaming_handle,
+                                &mut streaming_session,
+                                &mut streaming_chain,
+                                "Recording discarded",
+                            ).await;
+                            continue;
+                        }
                         tracing::info!("Recording cancelled");
 
                         // Stop recording and discard audio
@@ -3474,9 +3523,23 @@ impl Daemon {
                     // (keeping its typed text) instead of eating the press.
                     if state.is_streaming() && audio_capture.is_none() {
                         tracing::info!("SIGUSR1 during drain; finalizing previous session early");
-                        if let Some(h) = streaming_handle.take() {
+                        if let Some(mut h) = streaming_handle.take() {
                             let _ = h.cancel.send(());
                             let _ = h.task.await;
+                            // Drain finals already queued in the events
+                            // channel — a quick re-press must not eat the
+                            // previous session's tail.
+                            if let Some(s) = streaming_session.as_mut() {
+                                while let Ok(ev) = h.events.try_recv() {
+                                    match ev {
+                                        StreamingEvent::Final { text, .. }
+                                        | StreamingEvent::Replace { text, .. } => {
+                                            s.accumulate_segment(&text);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                         }
                         self.end_streaming(
                             &mut state,
