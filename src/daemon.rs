@@ -632,6 +632,11 @@ pub struct Daemon {
     whisper_prepare_task: Option<tokio::task::JoinHandle<()>>,
     // Background task for transcription (allows cancel during transcription)
     transcription_task: Option<tokio::task::JoinHandle<TranscriptionResult>>,
+    // Set when the active streaming session was ended by the recording
+    // timeout rather than an explicit user stop. Deferred delivery then
+    // goes to the clipboard only — never a surprise paste into whatever
+    // window happens to have focus when the timeout fires.
+    streaming_timed_out: bool,
     // Transcriber Arc used for the in-flight transcription_task. Held so the
     // result handler can query language metadata (e.g. detected language for
     // keyboard-layout hints to eitype/dotool, see issue #180) after the task
@@ -753,6 +758,7 @@ impl Daemon {
             model_load_task: None,
             whisper_prepare_task: None,
             transcription_task: None,
+            streaming_timed_out: false,
             active_transcriber: None,
             eager_chunk_tasks: Vec::new(),
             vad,
@@ -913,6 +919,7 @@ impl Daemon {
         *streaming_handle = Some(handle);
         *streaming_session = Some(StreamingSession::new());
         *streaming_chain = Some(output::create_output_chain(&self.config.output));
+        self.streaming_timed_out = false;
         *state = State::Streaming {
             started_at: std::time::Instant::now(),
             model_override,
@@ -1021,23 +1028,51 @@ impl Daemon {
             if let Some(s) = streaming_session.as_ref() {
                 let text = s.finalized_text().to_string();
                 if !text.is_empty() {
-                    let output_chain = output::create_output_chain(&self.config.output);
-                    let opts = output::OutputOptions {
-                        pre_output_command: self.config.output.pre_output_command.as_deref(),
-                        post_output_command: self.config.output.post_output_command.as_deref(),
-                        wait_for_modifier_release: self.config.output.wait_for_modifier_release,
-                        modifier_release_timeout: std::time::Duration::from_millis(
-                            self.config.output.modifier_release_timeout_ms,
-                        ),
-                    };
-                    if let Err(e) =
-                        output::output_with_fallback(&output_chain, &text, opts).await
-                    {
-                        tracing::error!("Deferred streaming output failed: {}", e);
+                    if self.streaming_timed_out {
+                        // Timeout ending, not a user stop: the user may be
+                        // in a completely different window by now. Copy to
+                        // the clipboard and notify — never paste blind.
+                        let chain: Vec<Box<dyn TextOutput>> =
+                            vec![Box::new(output::clipboard::ClipboardOutput::new(None))];
+                        let opts = output::OutputOptions {
+                            pre_output_command: None,
+                            post_output_command: None,
+                            wait_for_modifier_release: false,
+                            modifier_release_timeout: std::time::Duration::from_millis(0),
+                        };
+                        if let Err(e) = output::output_with_fallback(&chain, &text, opts).await
+                        {
+                            tracing::error!("Timeout clipboard delivery failed: {}", e);
+                        }
+                        send_notification(
+                            "Dictation timed out",
+                            "Recording hit the time limit. Transcript copied to the \
+                             clipboard (not pasted).",
+                            self.config.output.notification.show_engine_icon,
+                            self.config.engine,
+                            "normal",
+                        )
+                        .await;
+                    } else {
+                        let output_chain = output::create_output_chain(&self.config.output);
+                        let opts = output::OutputOptions {
+                            pre_output_command: self.config.output.pre_output_command.as_deref(),
+                            post_output_command: self.config.output.post_output_command.as_deref(),
+                            wait_for_modifier_release: self.config.output.wait_for_modifier_release,
+                            modifier_release_timeout: std::time::Duration::from_millis(
+                                self.config.output.modifier_release_timeout_ms,
+                            ),
+                        };
+                        if let Err(e) =
+                            output::output_with_fallback(&output_chain, &text, opts).await
+                        {
+                            tracing::error!("Deferred streaming output failed: {}", e);
+                        }
                     }
                 }
             }
         }
+        self.streaming_timed_out = false;
 
         *streaming_session = None;
         *streaming_chain = None;
@@ -3342,7 +3377,9 @@ impl Daemon {
                                 "Recording timeout ({:.0}s limit) while streaming; closing capture",
                                 max_duration.as_secs_f32()
                             );
+                            self.streaming_timed_out = true;
                             self.stop_streaming_capture(&mut audio_capture).await;
+                            self.update_state("transcribing");
                             continue;
                         }
 
