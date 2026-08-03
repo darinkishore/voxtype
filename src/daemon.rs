@@ -4022,6 +4022,42 @@ impl Daemon {
             }
         }
 
+        // Shutdown salvage: if a streaming session was active (e.g. a nixos
+        // deploy restarted the daemon mid-dictation), deliver what the model
+        // had already finalized to the clipboard + history instead of
+        // dropping it on the floor.
+        if let Some(s) = streaming_session.as_ref() {
+            let text = s.finalized_text();
+            if !text.is_empty() {
+                crate::history::append(text, "shutdown");
+                let chain: Vec<Box<dyn TextOutput>> =
+                    vec![Box::new(output::clipboard::ClipboardOutput::new(None))];
+                let opts = output::OutputOptions {
+                    pre_output_command: None,
+                    post_output_command: None,
+                    wait_for_modifier_release: false,
+                    modifier_release_timeout: std::time::Duration::from_millis(0),
+                };
+                if let Err(e) = output::output_with_fallback(&chain, text, opts).await {
+                    tracing::error!("Shutdown transcript salvage failed: {}", e);
+                } else {
+                    tracing::warn!(
+                        "Shut down mid-dictation; transcript ({} chars) copied to clipboard",
+                        text.chars().count()
+                    );
+                }
+                send_notification(
+                    "Dictation interrupted",
+                    "voxtype restarted mid-recording. Partial transcript copied to the \
+                     clipboard (also in `voxtype history`).",
+                    self.config.output.notification.show_engine_icon,
+                    self.config.engine,
+                    "critical",
+                )
+                .await;
+            }
+        }
+
         // Cleanup hotkey listener
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(mut listener) = hotkey_listener {
