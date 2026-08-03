@@ -392,19 +392,28 @@ impl App {
             ..Default::default()
         };
 
-        // Live mic level → perceptual "voice" 0..1: map the 10ms window
-        // amplitude from dBFS (-45 quiet .. -15 loud speech) so bar
-        // response doesn't depend on absolute mic gain, then smooth with a
-        // calm one-pole. Raw linear amplitude sat almost entirely below
-        // the ×1 scale floor — bars looked dead.
+        // Live mic level → perceptual "voice" 0..1. Three stages, each
+        // fighting a specific artifact:
+        //  1. RMS over the last ~80ms of 10ms frames — a single frame's
+        //     peak is spiky and made the bars jitter at steady state.
+        //  2. dBFS map (-40 quiet .. -14 loud speech) so response doesn't
+        //     depend on absolute mic gain.
+        //  3. Smoothstep expander: squashes the bottom of the range so
+        //     room tone / mic self-noise sits still, while speech-level
+        //     input passes through nearly untouched.
+        // Then Wispr's calm one-pole (0.85 retain per frame).
         let target_voice = {
             let ring = self.shared.ring.lock().expect("ring poisoned");
-            let amp = ring
-                .latest()
-                .map(|f| f.max.abs().max(f.min.abs()))
-                .unwrap_or(0.0);
-            let amp_db = 20.0 * amp.max(1e-4).log10();
-            ((amp_db + 45.0) / 30.0).clamp(0.0, 1.0)
+            let amps: Vec<f32> = ring.iter().map(|f| f.max.abs().max(f.min.abs())).collect();
+            let tail = &amps[amps.len().saturating_sub(8)..];
+            let rms = if tail.is_empty() {
+                0.0
+            } else {
+                (tail.iter().map(|a| a * a).sum::<f32>() / tail.len() as f32).sqrt()
+            };
+            let amp_db = 20.0 * rms.max(1e-4).log10();
+            let x = ((amp_db + 40.0) / 26.0).clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
         };
         rs.level_smooth += (target_voice - rs.level_smooth) * 0.15;
         let voice = rs.level_smooth;
