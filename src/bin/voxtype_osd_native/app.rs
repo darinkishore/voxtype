@@ -414,8 +414,11 @@ impl App {
         // cubic-bezier(.05,.6,.4,.95)) into a compact capsule with three
         // bouncing dots until delivery. The daemon's state file lives on
         // tmpfs; a 60 Hz read is nothing.
+        // Streaming sessions write "streaming"; batch/hotkey paths write
+        // "recording". Both are the mic-hot waveform face; everything
+        // else ("transcribing", drain) is the dots face.
         let recording = std::fs::read_to_string(&self.shared.state_path)
-            .map(|s| s.trim() == "recording")
+            .map(|s| matches!(s.trim(), "recording" | "streaming"))
             .unwrap_or(true);
         let proc_target = if recording { 0.0 } else { 1.0 };
         rs.proc_blend += (proc_target - rs.proc_blend) * 0.30;
