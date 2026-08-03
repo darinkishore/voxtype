@@ -406,7 +406,7 @@ impl App {
             let amp_db = 20.0 * amp.max(1e-4).log10();
             ((amp_db + 45.0) / 30.0).clamp(0.0, 1.0)
         };
-        rs.level_smooth += (target_voice - rs.level_smooth) * 0.25;
+        rs.level_smooth += (target_voice - rs.level_smooth) * 0.15;
         let voice = rs.level_smooth;
 
         // Wispr's state signal is a SHAPE change, not a tint: recording is
@@ -593,20 +593,26 @@ fn draw_ui(
     // Wispr's mini-waveform per-bar level gains, extended to 10 bars:
     // center reacts hardest, edges sway.
     const BAR_GAIN: [f32; N] = [0.8, 0.9, 1.0, 1.1, 1.2, 1.2, 1.1, 1.0, 0.9, 0.8];
-    let bar_w = 2.5_f32;
-    let gap = 3.5_f32;
+    // Wispr bar geometry, 1:1: bars are 2px-wide DOTS with an intrinsic
+    // 2px height; ALL height comes from the scaleY-equivalent multiplier.
+    // At rest that's a subtle shimmering dotted line (~2-3px); speech
+    // stretches the dots into bars (their pill is 30px thick; ours 36 —
+    // near-1:1 scale, so the raw pixel values carry over).
+    let bar_w = 2.0_f32;
+    let gap = 2.5_f32;
     let total = N as f32 * bar_w + (N as f32 - 1.0) * gap;
     let x0 = pill.center().x - total * 0.5 + bar_w * 0.5;
-    let base_h = 6.0_f32 * appear;
+    let base_h = 2.0_f32 * appear;
     let max_h = pill.height() * 0.62;
     let center = (N as f32 - 1.0) / 2.0;
     let half = N.div_ceil(2);
 
-    // Wispr's scale shape `max(1, audio × bar_level_gain)` on the
-    // perceptual voice level: silence sits at ×1 (pure idle wave), normal
-    // speech lands mid-range (~×3), only loud voice approaches the ×5
-    // cap. `gain` ([osd] waveform_gain, default 10) is a trim: 10 → 1.0×.
-    let audio = voice * (gain / 10.0);
+    // Wispr's multiplicative scale: `max(1, gain × level × bar_gain)`,
+    // on the perceptual voice level. Silence sits at ×1 (dots + idle
+    // wave); speech ~×2-3.5; loud voice near the ×5.5 cap stretches a
+    // dot to ~15px, matching their proportions. `gain` ([osd]
+    // waveform_gain, default 10) is a trim: 10 → 1.0×.
+    let audio = 5.5 * voice * (gain / 10.0);
 
     // Waveform (recording face) — crossfades out as the pill morphs to
     // processing. Wispr `.micActive`: bars solid white while the mic is
@@ -622,15 +628,12 @@ fn draw_ui(
                 0.1 * (i as f32 - N as f32)
             };
             let wave = wave_multiplier(t - delay);
-            let audio_scale = (1.0 + 4.0 * audio * BAR_GAIN[i]).min(5.0);
-            let bar_h = (base_h * bulge * wave * audio_scale).clamp(bar_w, max_h);
+            let audio_scale = (audio * BAR_GAIN[i]).max(1.0).min(5.5);
+            let bar_h = (base_h * bulge * wave * audio_scale).clamp(base_h, max_h);
             let x = x0 + i as f32 * (bar_w + gap);
             let rect = Rect::from_center_size(pos2(x, pill.center().y), vec2(bar_w, bar_h));
-            painter.rect_filled(
-                rect,
-                bar_w * 0.5,
-                mul_alpha(Color32::WHITE, bars_alpha),
-            );
+            // Wispr: border-radius 0.5px on a 2px bar — near-square caps.
+            painter.rect_filled(rect, 0.5, mul_alpha(Color32::WHITE, bars_alpha));
         }
     }
 
