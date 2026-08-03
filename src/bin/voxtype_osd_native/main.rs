@@ -152,11 +152,17 @@ fn main() -> anyhow::Result<()> {
         osd_config.height_px
     );
 
+    let state_path = socket_path
+        .parent()
+        .map(|d| d.join("state"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/voxtype-state"));
+
     let shared = SharedState {
         ring: Arc::new(Mutex::new(FrameRing::new(DEFAULT_RING_DEPTH))),
         peak_hold: Arc::new(Mutex::new(PeakHold::new(osd_config.peak_decay_db_per_sec))),
         last_frame_at: Arc::new(Mutex::new(None)),
         config: osd_config,
+        state_path,
     };
 
     // Set up the wakeup channel so the IPC thread can ping the main loop on

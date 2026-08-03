@@ -52,6 +52,10 @@ pub struct SharedState {
     /// teardown when no frames have arrived for a while.
     pub last_frame_at: Arc<Mutex<Option<Instant>>>,
     pub config: OsdConfig,
+    /// Path to the daemon's state file (`recording` / `transcribing` / …).
+    /// Drives bar brightness: solid white while recording, dimmed while
+    /// the drain finishes transcription.
+    pub state_path: std::path::PathBuf,
 }
 
 /// How long to keep the surface alive after the last frame arrived, before
@@ -100,6 +104,9 @@ struct RenderSurface {
     shown_at: Instant,
     /// Smoothed mic level (linear 0..1), for calm bar attack/decay.
     level_smooth: f32,
+    /// Smoothed bar brightness (dim while transcribing, solid while
+    /// recording).
+    bright_smooth: f32,
 
     // wgpu plumbing.
     _instance: wgpu::Instance,
@@ -316,6 +323,7 @@ impl App {
             configured: false,
             shown_at: Instant::now(),
             level_smooth: 0.0,
+            bright_smooth: 1.0,
             _instance: instance,
             surface,
             device,
@@ -384,23 +392,27 @@ impl App {
             ..Default::default()
         };
 
-        // Live mic level: latest frame's peak (dBFS → linear), smoothed for
-        // a calm attack/decay like Wispr's CSS-transitioned bars.
+        // Live mic level: window amplitude of the latest 10ms frame,
+        // smoothed with Wispr's one-pole (0.85 retain per 60 Hz frame) so
+        // the bars move calmly instead of twitching.
         let target_level = {
             let ring = self.shared.ring.lock().expect("ring poisoned");
             ring.latest()
-                .map(|f| 10.0_f32.powf(f.peak_dbfs / 20.0))
+                .map(|f| f.max.abs().max(f.min.abs()))
                 .unwrap_or(0.0)
         };
-        // Fast attack, slow release: bars jump with your voice and settle
-        // gracefully, instead of symmetric low-pass mush.
-        let coeff = if target_level > rs.level_smooth {
-            0.55
-        } else {
-            0.10
-        };
-        rs.level_smooth += (target_level - rs.level_smooth) * coeff;
+        rs.level_smooth += (target_level - rs.level_smooth) * 0.15;
         let level = rs.level_smooth;
+
+        // Wispr's state signal: solid-white bars while recording, dimmed
+        // while the drain finishes transcription. The daemon's state file
+        // lives on tmpfs; a 60 Hz read is nothing.
+        let recording = std::fs::read_to_string(&self.shared.state_path)
+            .map(|s| s.trim() == "recording")
+            .unwrap_or(true);
+        let bright_target = if recording { 1.0 } else { 0.45 };
+        rs.bright_smooth += (bright_target - rs.bright_smooth) * 0.08;
+        let brightness = rs.bright_smooth;
 
         // Fade in on appear, fade out as the frame stream goes quiet before
         // idle teardown. 280ms, matching Wispr Flow's opacity transition.
@@ -425,7 +437,9 @@ impl App {
         let height_px = rs.height;
         let gain = self.shared.config.waveform_gain;
         let full_output = rs.egui_ctx.run_ui(raw_input, |ui| {
-            draw_ui(ui, width_px, height_px, level, gain, t, ui_alpha, appear);
+            draw_ui(
+                ui, width_px, height_px, level, gain, t, ui_alpha, appear, brightness,
+            );
         });
 
         let primitives = rs
@@ -538,6 +552,7 @@ fn draw_ui(
     t: f32,
     alpha: f32,
     appear: f32,
+    brightness: f32,
 ) {
     use egui::{pos2, vec2, Color32, Rect, StrokeKind};
     let painter = ui.painter().clone();
@@ -564,27 +579,23 @@ fn draw_ui(
     );
 
     const N: usize = 10;
-    // Per-bar audio gain, center-weighted, so speech makes the middle dance
-    // hardest and the edges sway — organic instead of uniform pumping.
-    const BAR_GAIN: [f32; N] = [0.75, 0.9, 1.05, 1.2, 1.3, 1.3, 1.2, 1.05, 0.9, 0.75];
-    let bar_w = 4.0_f32;
-    let gap = 4.0_f32;
+    // Wispr's mini-waveform per-bar level gains, extended to 10 bars:
+    // center reacts hardest, edges sway.
+    const BAR_GAIN: [f32; N] = [0.8, 0.9, 1.0, 1.1, 1.2, 1.2, 1.1, 1.0, 0.9, 0.8];
+    let bar_w = 3.0_f32;
+    let gap = 3.0_f32;
     let total = N as f32 * bar_w + (N as f32 - 1.0) * gap;
     let x0 = pill.center().x - total * 0.5 + bar_w * 0.5;
-    let base_h = 8.0_f32 * appear;
-    let max_h = pill.height() * 0.68;
+    let base_h = 6.0_f32 * appear;
+    let max_h = pill.height() * 0.66;
     let center = (N as f32 - 1.0) / 2.0;
     let half = N.div_ceil(2);
 
-    let presence = (level * 10.0).clamp(0.0, 1.0);
-    let bar_alpha = 0.42 + 0.55 * presence;
-
-    // Resting bars are a quiet lavender-white; voice blooms them into a
-    // purple→pink sweep across the pill (Dracula Pro accents on AMOLED
-    // black). Silence keeps the Wispr-style idle breathing wave.
-    const REST: (f32, f32, f32) = (244.0, 240.0, 255.0);
-    const PURPLE: (f32, f32, f32) = (189.0, 147.0, 249.0);
-    const PINK: (f32, f32, f32) = (255.0, 121.0, 198.0);
+    // Wispr's scale math: `max(1, audio_scale * bar_level_gain)`, where
+    // audio_scale ≈ 5 × smoothed level. `gain` is [osd] waveform_gain
+    // (default 10) halved so the default lands exactly on Wispr's 5×.
+    // Capped at 5 so shouting compresses instead of pinning every bar.
+    let audio = level * gain * 0.5;
 
     for i in 0..N {
         let p = (center - i as f32).abs();
@@ -595,49 +606,17 @@ fn draw_ui(
             0.1 * (i as f32 - N as f32)
         };
         let wave = wave_multiplier(t - delay);
-        // `max(1, …)` floor mirrors Wispr's `--bar-audio-scale` so silence
-        // still shows the idle breathing wave at resting size.
-        let audio_scale = (1.0 + level * gain * 3.0 * BAR_GAIN[i]).max(1.0);
+        let audio_scale = (audio * BAR_GAIN[i]).max(1.0).min(5.0);
         let bar_h = (base_h * bulge * wave * audio_scale).clamp(bar_w, max_h);
         let x = x0 + i as f32 * (bar_w + gap);
         let rect = Rect::from_center_size(pos2(x, pill.center().y), vec2(bar_w, bar_h));
 
-        let g = i as f32 / (N as f32 - 1.0);
-        let grad = lerp_rgb(PURPLE, PINK, g);
-        let (r, gr, b) = lerp_rgb(REST, grad, presence);
-        let color =
-            Color32::from_rgba_unmultiplied(r as u8, gr as u8, b as u8, (bar_alpha * 255.0) as u8);
-
-        // Soft halo behind the bar while speaking — a whisper of glow, not
-        // a lamp.
-        if presence > 0.05 {
-            let halo = Rect::from_center_size(rect.center(), rect.size() + vec2(4.0, 4.0));
-            let halo_alpha = 0.10 * presence;
-            painter.rect_filled(
-                halo,
-                (bar_w + 4.0) * 0.5,
-                mul_alpha(
-                    Color32::from_rgba_unmultiplied(
-                        r as u8,
-                        gr as u8,
-                        b as u8,
-                        (halo_alpha * 255.0) as u8,
-                    ),
-                    alpha,
-                ),
-            );
-        }
+        // Wispr's palette: white, full-strength while recording
+        // (`.micActive`), dimmed toward their resting 40% while the drain
+        // finishes transcription. No hue games.
+        let color = Color32::from_rgba_unmultiplied(255, 255, 255, (brightness * 255.0) as u8);
         painter.rect_filled(rect, bar_w * 0.5, mul_alpha(color, alpha));
     }
-}
-
-fn lerp_rgb(a: (f32, f32, f32), b: (f32, f32, f32), f: f32) -> (f32, f32, f32) {
-    let f = f.clamp(0.0, 1.0);
-    (
-        a.0 + (b.0 - a.0) * f,
-        a.1 + (b.1 - a.1) * f,
-        a.2 + (b.2 - a.2) * f,
-    )
 }
 
 /// Wispr Flow's `@keyframes wave`, as a phase function: stops at
