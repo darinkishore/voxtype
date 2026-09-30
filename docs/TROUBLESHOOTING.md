@@ -1021,7 +1021,7 @@ Network or DNS issue reaching `wss://stt-rt.soniox.com`. Check:
 - Firewall / corporate proxy blocking outbound 443
 - VPN that mangles WebSocket handshakes
 
-Voxtype emits one `Streaming Error` notification and returns to idle. Press the hotkey again to retry once the network is back.
+With `turn_detection = false` and `type_partials = false`, Voxtype reconnects up to three times and replays the buffered recording. Capture continues during connection attempts and backoff; you can keep speaking and stop normally. Replay retains at most 15 minutes of audio in memory and is disabled after any transcript text has been emitted, to avoid duplicate output. Authentication and configuration errors fail immediately. If recovery is exhausted or unsafe, Voxtype emits one `Streaming Error` notification and returns to idle.
 
 ### 401 Unauthorized / 403 Forbidden
 
@@ -1134,14 +1134,14 @@ api_key_file = "/run/secrets/openai_api_key"
 
 Resolution order is `api_key` > `api_key_file` > `OPENAI_API_KEY`. An `api_key_file` that's set but unreadable or empty is a hard startup error — it does not silently fall back to the env var.
 
-### "OpenAI Realtime: WS connect failed: ..." or "connect timeout"
+### OpenAI Realtime connection reset, handshake failure, or timeout
 
 Network or DNS issue reaching `wss://api.openai.com`. Check:
 - Internet connectivity (`curl https://api.openai.com`)
 - Firewall / corporate proxy blocking outbound 443
 - VPN that mangles WebSocket handshakes
 
-Voxtype emits one `Streaming Error` notification and returns to idle. Press the hotkey again to retry once the network is back.
+With `turn_detection = false` and `type_partials = false`, Voxtype reconnects up to three times and replays the buffered recording. Capture continues during connection attempts and backoff; you can keep speaking and stop normally. Replay retains at most 15 minutes of audio in memory and is disabled after any transcript text has been emitted, to avoid duplicate output. Authentication and configuration errors fail immediately. If recovery is exhausted or unsafe, Voxtype emits one `Streaming Error` notification and returns to idle.
 
 ### "OpenAI Realtime: fatal error during session configuration: ..."
 
@@ -1171,7 +1171,7 @@ To use OpenAI Realtime with **real** push-to-talk:
 
 ### Transcript seems cut off at the end of a long pause
 
-With `turn_detection = true` (server VAD, the default), the drain window after record-stop is a fixed ~3 seconds — there's no `finished:true`-equivalent terminal signal from OpenAI's protocol to wait on, unlike Soniox. If the server is slow to emit the final `completed` event for the last utterance, it can be dropped by the drain timeout. This is a known tradeoff of the bounded-drain design; there's no user-facing knob for it currently.
+With `turn_detection = false` (required for `gpt-live-transcribe`), Voxtype waits up to 30 seconds for the committed final transcript and finishes as soon as it arrives. A missing final triggers the same bounded recovery as a dropped connection. With server VAD enabled for a model that supports it, the trailing-silence drain remains bounded to three seconds.
 
 ---
 

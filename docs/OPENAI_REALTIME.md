@@ -159,4 +159,17 @@ See [TROUBLESHOOTING.md → OpenAI Realtime Backend Issues](TROUBLESHOOTING.md#o
 - **Internet dependency.** No fallback to a local engine if the network drops mid-session — voxtype surfaces a `Streaming Error` notification and returns to idle.
 - **No REST batch endpoint.** Unlike Soniox's async API, `streaming = false` still opens a WebSocket session (OpenAI doesn't offer a separate upload-and-poll transcription endpoint), so meeting mode's chunk-batching would pay per-chunk connect latency — meeting mode currently keeps its Soniox-specific async routing and does not special-case this engine.
 - **Completion order across turns is not guaranteed** by the protocol; voxtype reconciles per `item_id` rather than assuming turns complete in the order they started.
-- **Drain window on stop is a fixed ~3s.** There's no `finished:true`-equivalent terminal signal (unlike Soniox), so any transcript event arriving after the bounded drain window is lost by design.
+- **Manual turns wait for the final transcript.** On stop, the committed item has up to 30 seconds to complete; normal responses finish immediately. Server VAD retains its three-second trailing-silence drain.
+- **Connection recovery is bounded and avoids duplicate text.** With `turn_detection = false` and `type_partials = false`, transport failures reconnect up to three times (0.5, 1, and 2 second backoffs) and replay audio while capture continues. Replay retains up to 15 minutes in memory and stops being safe after any text has been emitted. Authentication/configuration errors fail immediately. Exhausted recovery reports an error; it does not claim an incomplete transcript succeeded.
+
+### Recovery verification
+
+The OpenAI Realtime unit tests use local WebSocket servers to reset connections during audio upload and after commit, verify exact audio replay and single delivery, delay finals beyond three seconds, and check cancellation and retry limits. Run `cargo test --features openai-realtime --lib transcribe::openai_realtime`.
+
+An optional live smoke test uses synthetic speech and the normal Voxtype configuration/API key, with a local proxy deliberately resetting the first connection. Supply a 16 kHz mono PCM16 WAV containing “This is a connection recovery test. The recording should survive a brief interruption and deliver the complete sentence.” and run:
+
+```bash
+VOXTYPE_SMOKE_WAV=/path/to/synthetic.wav cargo test --features openai-realtime --lib live_reconnect_smoke -- --ignored --nocapture
+```
+
+This opt-in test uses the configured paid transcription API; normal tests never contact it.

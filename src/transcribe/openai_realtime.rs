@@ -60,8 +60,8 @@
 //! On record stop: with VAD enabled, ~700 ms of zero-valued PCM samples is
 //! sent (nudges the server to finalize a turn ending exactly at stop),
 //! then events are drained for a bounded ~3 s. With VAD disabled, an
-//! explicit `input_audio_buffer.commit` is sent instead, then the same
-//! bounded drain.
+//! explicit `input_audio_buffer.commit` is sent instead; wait up to 30 s
+//! for its final transcript, returning immediately when it arrives.
 //!
 //! ## Sample rate
 //!
@@ -80,10 +80,11 @@
 //!
 //! ## Errors
 //!
-//! Connect timeouts, WS errors, and OpenAI `error` events surface as
-//! `StreamingEvent::Error` followed by `Ended`. The daemon disowns the
-//! session on `Error`/`Ended` so post-stop emissions are dropped (matches
-//! the v0.7.2 disown-on-stop fix, same as Soniox).
+//! Manual-turn sessions with partial typing disabled retain up to 15 minutes
+//! of audio and retry transport failures three times, while continuing to
+//! capture. Replay stops being safe once any text has been emitted. API
+//! configuration errors fail immediately. Exhausted/unsafe retries surface as
+//! `StreamingEvent::Error` followed by `Ended`.
 
 use super::streaming::{SegmentId, StreamHandle, StreamingEvent, StreamingTranscriber};
 use super::Transcriber;
@@ -92,7 +93,7 @@ use crate::error::TranscribeError;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -119,10 +120,73 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for `session.updated` after sending `session.update`.
 const SESSION_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bounded drain after signalling end-of-turn at record stop. OpenAI's
-/// protocol has no `finished:true`-equivalent terminal signal (unlike
-/// Soniox), so this timeout is the actual terminal condition on stop.
+/// Bounded trailing-silence drain for server VAD. Manual turns instead
+/// wait for their committed final transcript, bounded by BATCH_TIMEOUT.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Retry only before any text has escaped, with manual turns and no live
+/// partial typing. Capture keeps draining during connect, replay, and backoff.
+const MAX_RECONNECTS: usize = 3;
+const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+/// Bound retained audio independently of the daemon's recording limit (15 min).
+const MAX_REPLAY_SAMPLES: usize = SOURCE_SAMPLE_RATE as usize * 60 * 15;
+
+#[derive(Debug)]
+enum SessionFailure {
+    Retry(TranscribeError),
+    Fatal(TranscribeError),
+}
+
+impl SessionFailure {
+    fn retry(message: impl Into<String>) -> Self {
+        Self::Retry(TranscribeError::InferenceFailed(message.into()))
+    }
+
+    fn fatal(message: impl Into<String>) -> Self {
+        Self::Fatal(TranscribeError::InferenceFailed(message.into()))
+    }
+}
+
+impl From<TranscribeError> for SessionFailure {
+    fn from(error: TranscribeError) -> Self {
+        Self::Retry(error)
+    }
+}
+
+impl From<SessionFailure> for TranscribeError {
+    fn from(error: SessionFailure) -> Self {
+        match error {
+            SessionFailure::Retry(e) | SessionFailure::Fatal(e) => e,
+        }
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for SessionFailure {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        let permanent = match &error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                response.status().is_client_error() && response.status().as_u16() != 429
+            }
+            _ => false,
+        };
+        let message = format!("OpenAI Realtime: WebSocket failed: {error}");
+        if permanent {
+            Self::fatal(message)
+        } else {
+            Self::retry(message)
+        }
+    }
+}
+
+async fn send_message(
+    write: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    message: Message,
+) -> Result<(), SessionFailure> {
+    tokio::time::timeout(SESSION_UPDATE_TIMEOUT, write.send(message))
+        .await
+        .map_err(|_| SessionFailure::retry("OpenAI Realtime: WebSocket write timed out"))??;
+    Ok(())
+}
 
 /// Trailing silence sent (when server VAD is enabled) to nudge the server
 /// into finalizing a turn ending exactly at record-stop.
@@ -766,34 +830,34 @@ impl OpenaiRealtimeTranscriber {
 /// hand-parsing).
 async fn wait_for_session_updated(
     read: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
-) -> Result<(), TranscribeError> {
+) -> Result<(), SessionFailure> {
     let deadline = tokio::time::Instant::now() + SESSION_UPDATE_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(TranscribeError::InferenceFailed(
-                "OpenAI Realtime: timed out waiting for session.updated".into(),
+            return Err(SessionFailure::retry(
+                "OpenAI Realtime: timed out waiting for session.updated",
             ));
         }
         let msg = match tokio::time::timeout(remaining, read.next()).await {
             Ok(Some(Ok(m))) => m,
             Ok(Some(Err(e))) => {
-                return Err(TranscribeError::InferenceFailed(format!(
+                return Err(SessionFailure::retry(format!(
                     "OpenAI Realtime: WS error while awaiting session.updated: {}",
                     e
                 )))
             }
             Ok(None) | Err(_) => {
-                return Err(TranscribeError::InferenceFailed(
-                    "OpenAI Realtime: connection closed/timed out awaiting session.updated".into(),
+                return Err(SessionFailure::retry(
+                    "OpenAI Realtime: connection closed/timed out awaiting session.updated",
                 ))
             }
         };
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Close(_) => {
-                return Err(TranscribeError::InferenceFailed(
-                    "OpenAI Realtime: connection closed awaiting session.updated".into(),
+                return Err(SessionFailure::retry(
+                    "OpenAI Realtime: connection closed awaiting session.updated",
                 ))
             }
             _ => continue,
@@ -805,7 +869,7 @@ async fn wait_for_session_updated(
         match parsed.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "session.updated" => return Ok(()),
             "error" => {
-                return Err(TranscribeError::InferenceFailed(format!(
+                return Err(SessionFailure::fatal(format!(
                     "OpenAI Realtime: fatal error during session configuration: {}",
                     parsed.get("error").unwrap_or(&parsed)
                 )))
@@ -827,9 +891,9 @@ async fn send_append(
         "audio": BASE64.encode(bytes),
     })
     .to_string();
-    write.send(Message::Text(frame)).await.map_err(|e| {
-        TranscribeError::InferenceFailed(format!("OpenAI Realtime: send audio failed: {}", e))
-    })
+    send_message(write, Message::Text(frame))
+        .await
+        .map_err(Into::into)
 }
 
 impl StreamingTranscriber for OpenaiRealtimeTranscriber {
@@ -866,16 +930,9 @@ impl StreamingTranscriber for OpenaiRealtimeTranscriber {
     }
 }
 
-/// Emit an `Error` followed by `Ended` so the daemon surfaces a
-/// notification and cleanly resets to idle. Mirrors `soniox.rs::send_fatal`.
-async fn send_fatal(events_tx: &mpsc::Sender<StreamingEvent>, msg: String) {
-    tracing::error!("{}", msg);
-    let _ = events_tx
-        .send(StreamingEvent::Error(TranscribeError::InferenceFailed(msg)))
-        .await;
-    let _ = events_tx.send(StreamingEvent::Ended).await;
-}
-
+/// Keep accepting microphone chunks even while the network is stalled.
+/// Replay is safe only for manual turns before any output has escaped; VAD
+/// turns/live typing cannot be replayed without duplicating user-visible text.
 #[allow(clippy::too_many_arguments)]
 async fn run_streaming_session(
     request: tokio_tungstenite::tungstenite::http::Request<()>,
@@ -886,39 +943,120 @@ async fn run_streaming_session(
     events_tx: mpsc::Sender<StreamingEvent>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<(), TranscribeError> {
-    let ws_result =
-        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request)).await;
-    let ws_stream = match ws_result {
-        Ok(Ok((s, _))) => s,
-        Ok(Err(e)) => {
-            send_fatal(
-                &events_tx,
-                format!("OpenAI Realtime: WS connect failed: {}", e),
-            )
-            .await;
-            return Ok(());
+    let mut replayable = !turn_detection && !type_partials;
+    let mut audio = VecDeque::<Vec<f32>>::new();
+    let mut retained_samples = 0;
+    let mut capture_closed = false;
+    let mut cancel_open = true;
+    let mut emitted_text = false;
+    for attempt_number in 0..=MAX_RECONNECTS {
+        let (attempt_tx, attempt_rx) = mpsc::channel(4);
+        let mut attempt_tx = Some(attempt_tx);
+        let mut sent = 0;
+        let result = {
+            let attempt = async {
+                if attempt_number > 0 {
+                    tokio::time::sleep(RECONNECT_DELAY * (1 << (attempt_number - 1))).await;
+                }
+                run_streaming_attempt(
+                    request.clone(),
+                    session_update.clone(),
+                    turn_detection,
+                    type_partials,
+                    attempt_rx,
+                    events_tx.clone(),
+                    &mut emitted_text,
+                )
+                .await
+            };
+            tokio::pin!(attempt);
+            loop {
+                if capture_closed && sent == audio.len() {
+                    attempt_tx.take();
+                }
+                tokio::select! {
+                    biased;
+                    cancelled = &mut cancel_rx, if cancel_open => {
+                        cancel_open = false;
+                        if cancelled.is_ok() {
+                            break Ok(());
+                        }
+                    }
+                    result = &mut attempt => break result,
+                    chunk = samples_rx.recv(), if !capture_closed => {
+                        match chunk {
+                            Some(chunk) if !chunk.is_empty() => {
+                                retained_samples += chunk.len();
+                                audio.push_back(chunk);
+                                if replayable && retained_samples > MAX_REPLAY_SAMPLES {
+                                    tracing::warn!("OpenAI Realtime: replay audio limit reached; continuing without reconnect recovery");
+                                    replayable = false;
+                                    for chunk in audio.drain(..sent) {
+                                        retained_samples -= chunk.len();
+                                    }
+                                    sent = 0;
+                                }
+                            }
+                            Some(_) => {}
+                            None => capture_closed = true,
+                        }
+                    }
+                    permit = async { attempt_tx.as_ref().unwrap().clone().reserve_owned().await },
+                        if attempt_tx.is_some() && sent < audio.len() => {
+                        match permit {
+                            Ok(permit) => {
+                                if replayable {
+                                    permit.send(audio[sent].clone());
+                                    sent += 1;
+                                } else {
+                                    let chunk = audio.pop_front().unwrap();
+                                    retained_samples -= chunk.len();
+                                    permit.send(chunk);
+                                }
+                            }
+                            Err(_) => { attempt_tx.take(); }
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(()) => break,
+            Err(SessionFailure::Retry(ref error))
+                if replayable && !emitted_text && attempt_number < MAX_RECONNECTS =>
+            {
+                tracing::warn!(
+                    "OpenAI Realtime: connection interrupted ({error}); reconnecting {}/{} and replaying buffered audio",
+                    attempt_number + 1, MAX_RECONNECTS,
+                );
+            }
+            Err(error) => {
+                let _ = events_tx.send(StreamingEvent::Error(error.into())).await;
+                break;
+            }
         }
-        Err(_) => {
-            send_fatal(&events_tx, "OpenAI Realtime: connect timeout".into()).await;
-            return Ok(());
-        }
-    };
+    }
+    let _ = events_tx.send(StreamingEvent::Ended).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_streaming_attempt(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    session_update: String,
+    turn_detection: bool,
+    type_partials: bool,
+    mut samples_rx: mpsc::Receiver<Vec<f32>>,
+    events_tx: mpsc::Sender<StreamingEvent>,
+    emitted_text: &mut bool,
+) -> Result<(), SessionFailure> {
+    let (ws_stream, _) =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+            .await
+            .map_err(|_| SessionFailure::retry("OpenAI Realtime: connect timeout"))??;
     let (mut write, mut read) = ws_stream.split();
-
-    tracing::debug!(target: "voxtype::openai_realtime::wire", "-> session.update {}", session_update);
-    if let Err(e) = write.send(Message::Text(session_update)).await {
-        send_fatal(
-            &events_tx,
-            format!("OpenAI Realtime: send session.update failed: {}", e),
-        )
-        .await;
-        return Ok(());
-    }
-
-    if let Err(e) = wait_for_session_updated(&mut read).await {
-        send_fatal(&events_tx, e.to_string()).await;
-        return Ok(());
-    }
+    send_message(&mut write, Message::Text(session_update)).await?;
+    wait_for_session_updated(&mut read).await?;
     tracing::debug!("OpenAI Realtime: session.updated received, streaming audio");
 
     let mut reconciler = Reconciler::default();
@@ -942,24 +1080,12 @@ async fn run_streaming_session(
         };
 
         tokio::select! {
-            biased;
-
-            // Highest priority: cancel signal from daemon.
-            _ = &mut cancel_rx => {
-                tracing::debug!("OpenAI Realtime streaming session cancelled");
-                break;
-            }
-
-            // Bounded drain after end-of-turn. OpenAI has no
-            // finished:true-equivalent terminal event, so this timeout is
-            // the actual stop condition — trailing deltas/completions
-            // received after it fires are lost by design (documented
-            // ~3s budget from the protocol brief).
+            // Manual turns must receive the committed final, even if the
+            // model takes longer than the short VAD trailing-silence window.
             _ = drain_timer, if drain_deadline.is_some() => {
-                tracing::debug!(
-                    "OpenAI Realtime drain window ({}s) elapsed after end-of-turn",
-                    DRAIN_TIMEOUT.as_secs(),
-                );
+                if !turn_detection {
+                    return Err(SessionFailure::retry("OpenAI Realtime: timed out waiting for final transcript"));
+                }
                 break;
             }
 
@@ -969,21 +1095,9 @@ async fn run_streaming_session(
                     Some(c) if !c.is_empty() => {
                         let bytes = resampler.encode_chunk(&c);
                         pending.extend_from_slice(&bytes);
-                        let mut send_failed = false;
                         while pending.len() >= CHUNK_BYTES {
                             let frame_bytes: Vec<u8> = pending.drain(..CHUNK_BYTES).collect();
-                            if let Err(e) = send_append(&mut write, &frame_bytes).await {
-                                let _ = events_tx.send(StreamingEvent::Error(e)).await;
-                                send_failed = true;
-                                break;
-                            }
-                        }
-                        if send_failed {
-                            // The socket is dead; a session that can't ship
-                            // audio has nothing left to do. Ends the
-                            // session (Ended follows below) rather than
-                            // limping on emitting an Error per chunk.
-                            break;
+                            send_append(&mut write, &frame_bytes).await?;
                         }
                     }
                     Some(_) => { /* empty chunk, skip */ }
@@ -993,9 +1107,7 @@ async fn run_streaming_session(
                             // Flush whatever's left in the coalescing buffer.
                             if !pending.is_empty() {
                                 let tail = std::mem::take(&mut pending);
-                                if let Err(e) = send_append(&mut write, &tail).await {
-                                    tracing::warn!("OpenAI Realtime: flush-on-stop send failed: {}", e);
-                                }
+                                send_append(&mut write, &tail).await?;
                             }
                             if turn_detection {
                                 // Trailing silence nudges server VAD to finalize
@@ -1005,21 +1117,18 @@ async fn run_streaming_session(
                                     (TARGET_SAMPLE_RATE * TRAILING_SILENCE_MS / 1000) as usize
                                 ];
                                 let bytes = f32_to_s16le_bytes(&silence);
-                                if let Err(e) = send_append(&mut write, &bytes).await {
-                                    tracing::warn!("OpenAI Realtime: trailing-silence send failed: {}", e);
-                                }
+                                send_append(&mut write, &bytes).await?;
                             } else {
                                 let commit = r#"{"type":"input_audio_buffer.commit"}"#;
-                                if let Err(e) = write.send(Message::Text(commit.to_string())).await {
-                                    tracing::warn!("OpenAI Realtime: commit send failed: {}", e);
-                                }
+                                send_message(&mut write, Message::Text(commit.to_string())).await?;
                             }
                             sent_stop_sequence = true;
-                            drain_deadline = Some(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+                            let timeout = if turn_detection { DRAIN_TIMEOUT } else { BATCH_TIMEOUT };
+                            drain_deadline = Some(tokio::time::Instant::now() + timeout);
                             tracing::debug!(
                                 "OpenAI Realtime: end-of-turn signalled (turn_detection={}); draining (timeout {}s)",
                                 turn_detection,
-                                DRAIN_TIMEOUT.as_secs(),
+                                timeout.as_secs(),
                             );
                         }
                     }
@@ -1030,21 +1139,18 @@ async fn run_streaming_session(
             msg = read.next() => {
                 let msg = match msg {
                     Some(Ok(m)) => m,
-                    Some(Err(e)) => {
-                        let _ = events_tx.send(StreamingEvent::Error(
-                            TranscribeError::InferenceFailed(format!("OpenAI Realtime: WS error: {}", e))
-                        )).await;
-                        break;
-                    }
-                    None => break,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Err(SessionFailure::retry("OpenAI Realtime: connection ended before final transcript")),
                 };
                 let text = match msg {
                     Message::Text(t) => t.to_string(),
                     Message::Ping(payload) => {
-                        let _ = write.send(Message::Pong(payload)).await;
+                        send_message(&mut write, Message::Pong(payload)).await?;
                         continue;
                     }
-                    Message::Close(_) => break,
+                    Message::Close(frame) => return Err(SessionFailure::retry(format!(
+                        "OpenAI Realtime: connection closed before final transcript: {frame:?}"
+                    ))),
                     _ => continue,
                 };
                 tracing::debug!(target: "voxtype::openai_realtime::wire", "<- {}", text);
@@ -1072,11 +1178,14 @@ async fn run_streaming_session(
                         reconciler.process_completed(item_id, transcript)
                     }
                     "conversation.item.input_audio_transcription.failed" => {
-                        tracing::warn!("OpenAI Realtime: item {} failed", item_id);
-                        if committed_item.as_deref() == Some(item_id) {
-                            committed_item_done = true;
+                        // Retract an uncommitted typed partial before reporting
+                        // failure, preserving the live-typing contract.
+                        if let Some(event) = reconciler.process_failed(item_id) {
+                            let _ = events_tx.send(event).await;
                         }
-                        reconciler.process_failed(item_id)
+                        return Err(SessionFailure::fatal(format!(
+                            "OpenAI Realtime: transcription failed: {}", parsed.get("error").unwrap_or(&parsed)
+                        )));
                     }
                     "input_audio_buffer.committed" => {
                         committed_item = Some(item_id.to_string());
@@ -1087,14 +1196,9 @@ async fn run_streaming_session(
                         None
                     }
                     "error" => {
-                        // Fatal: mirrors soniox.rs's error_message handling.
-                        // Log verbatim (raw JSON value) — no fixed schema
-                        // worth hand-parsing.
-                        let err = parsed.get("error").unwrap_or(&parsed);
-                        let _ = events_tx.send(StreamingEvent::Error(
-                            TranscribeError::InferenceFailed(format!("OpenAI Realtime error: {}", err))
-                        )).await;
-                        break;
+                        return Err(SessionFailure::fatal(format!(
+                            "OpenAI Realtime error: {}", parsed.get("error").unwrap_or(&parsed)
+                        )));
                     }
                     // session.created, input_audio_buffer.speech_started/
                     // speech_stopped, response.*, etc. — informational only.
@@ -1102,6 +1206,7 @@ async fn run_streaming_session(
                 };
 
                 if let Some(ev) = event {
+                    *emitted_text = true;
                     if events_tx.send(ev).await.is_err() {
                         break;
                     }
@@ -1121,8 +1226,7 @@ async fn run_streaming_session(
         }
     }
 
-    let _ = write.send(Message::Close(None)).await;
-    let _ = events_tx.send(StreamingEvent::Ended).await;
+    let _ = send_message(&mut write, Message::Close(None)).await;
     Ok(())
 }
 
@@ -1665,5 +1769,359 @@ mod tests {
     fn common_prefix_counts_unicode_scalars_not_bytes() {
         assert_eq!(common_prefix_char_count("áb", "ác"), 1);
         assert_eq!(common_prefix_char_count("hello", "hellp"), 4);
+    }
+    // These exercise the actual WebSocket worker against a local server,
+    // including abrupt TCP resets, rather than mocking the retry decision.
+    type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    async fn mock_session(listener: &tokio::net::TcpListener) -> TestSocket {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let update = ws.next().await.unwrap().unwrap();
+        let update: serde_json::Value = serde_json::from_str(update.to_text().unwrap()).unwrap();
+        assert_eq!(update["type"], "session.update");
+        ws.send(Message::Text(r#"{"type":"session.updated"}"#.into()))
+            .await
+            .unwrap();
+        ws
+    }
+
+    async fn receive_audio(ws: &mut TestSocket) -> Vec<u8> {
+        let mut audio = Vec::new();
+        loop {
+            let message = ws.next().await.unwrap().unwrap();
+            let event: serde_json::Value =
+                serde_json::from_str(message.to_text().unwrap()).unwrap();
+            match event["type"].as_str().unwrap() {
+                "input_audio_buffer.append" => {
+                    audio.extend(BASE64.decode(event["audio"].as_str().unwrap()).unwrap())
+                }
+                "input_audio_buffer.commit" => return audio,
+                other => panic!("unexpected client event: {other}"),
+            }
+        }
+    }
+
+    async fn send_final(ws: &mut TestSocket) {
+        for event in [
+            serde_json::json!({"type":"input_audio_buffer.committed", "item_id":"turn-1"}),
+            serde_json::json!({"type":"conversation.item.input_audio_transcription.completed", "item_id":"turn-1", "transcript":"Recovered dictation."}),
+        ] {
+            ws.send(Message::Text(event.to_string())).await.unwrap();
+        }
+    }
+
+    fn local_stream(
+        listener: &tokio::net::TcpListener,
+        type_partials: bool,
+    ) -> (mpsc::Sender<Vec<f32>>, StreamHandle) {
+        let (samples_tx, samples_rx) = mpsc::channel(4);
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let request = format!("ws://{}/", listener.local_addr().unwrap())
+            .into_client_request()
+            .unwrap();
+        let mut config = cfg_with_key(Some("unused-local-key"));
+        config.turn_detection = false;
+        let update = OpenaiRealtimeTranscriber::new(config)
+            .unwrap()
+            .session_update(false)
+            .to_string();
+        let task = tokio::spawn(run_streaming_session(
+            request,
+            update,
+            false,
+            type_partials,
+            samples_rx,
+            events_tx,
+            cancel_rx,
+        ));
+        (
+            samples_tx,
+            StreamHandle {
+                events: events_rx,
+                cancel: cancel_tx,
+                task,
+            },
+        )
+    }
+
+    async fn successful_stream(mut handle: StreamHandle) {
+        let final_event = tokio::time::timeout(Duration::from_secs(12), handle.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(final_event, StreamingEvent::Final { ref text, .. } if text == "Recovered dictation."),
+            "{final_event:?}"
+        );
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(StreamingEvent::Ended)
+        ));
+        assert!(handle.events.recv().await.is_none());
+        handle.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_audio_and_captures_during_backoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (samples, handle) = local_stream(&listener, false);
+        let (reset_tx, reset_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = mock_session(&listener).await;
+            // Reset after the server has consumed some audio, without a
+            // WebSocket closing handshake (the production failure).
+            let message = first.next().await.unwrap().unwrap();
+            assert!(message
+                .to_text()
+                .unwrap()
+                .contains("input_audio_buffer.append"));
+            drop(first);
+            reset_tx.send(()).unwrap();
+            let mut second = mock_session(&listener).await;
+            let audio = receive_audio(&mut second).await;
+            send_final(&mut second).await;
+            audio
+        });
+        let mut source = vec![0.125; 1600];
+        samples.send(source.clone()).await.unwrap();
+        reset_rx.await.unwrap();
+        // More than the daemon's 64-slot channel can hold; the wrapper
+        // must consume this while connecting, not drop or block capture.
+        tokio::time::timeout(Duration::from_millis(400), async {
+            for n in 0..256 {
+                let chunk = vec![n as f32 / 512.0; 320];
+                source.extend_from_slice(&chunk);
+                samples.send(chunk).await.unwrap();
+            }
+        })
+        .await
+        .expect("capture blocked during reconnect");
+        drop(samples);
+        successful_stream(handle).await;
+        let expected = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE).encode_chunk(&source);
+        assert_eq!(server.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_commit_delivers_exactly_one_final() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (samples, handle) = local_stream(&listener, false);
+        let server = tokio::spawn(async move {
+            let mut first = mock_session(&listener).await;
+            let first_audio = receive_audio(&mut first).await;
+            drop(first);
+            let mut second = mock_session(&listener).await;
+            assert_eq!(receive_audio(&mut second).await, first_audio);
+            send_final(&mut second).await;
+        });
+        samples.send(vec![0.25; 3200]).await.unwrap();
+        drop(samples);
+        successful_stream(handle).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_later_than_three_seconds_is_not_discarded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (samples, handle) = local_stream(&listener, false);
+        let server = tokio::spawn(async move {
+            let mut ws = mock_session(&listener).await;
+            receive_audio(&mut ws).await;
+            tokio::time::sleep(Duration::from_millis(3200)).await;
+            send_final(&mut ws).await;
+        });
+        samples.send(vec![0.25; 3200]).await.unwrap();
+        drop(samples);
+        successful_stream(handle).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configuration_error_is_fatal_without_reconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_samples, mut handle) = local_stream(&listener, false);
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"error","error":{"message":"invalid configuration"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+        });
+        let error = tokio::time::timeout(Duration::from_secs(2), handle.events.recv())
+            .await
+            .unwrap();
+        assert!(matches!(error, Some(StreamingEvent::Error(_))));
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(StreamingEvent::Ended)
+        ));
+        handle.task.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_stalled_opening_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_samples, mut handle) = local_stream(&listener, false);
+        let (_tcp, _) = listener.accept().await.unwrap();
+        handle.cancel.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), handle.events.recv())
+                .await
+                .unwrap(),
+            Some(StreamingEvent::Ended)
+        ));
+        handle.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_handshake_resets_stop_after_three_reconnects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_samples, mut handle) = local_stream(&listener, false);
+        let server = tokio::spawn(async move {
+            for _ in 0..=MAX_RECONNECTS {
+                let (tcp, _) = listener.accept().await.unwrap();
+                drop(tcp);
+            }
+        });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(8), handle.events.recv())
+                .await
+                .unwrap(),
+            Some(StreamingEvent::Error(_))
+        ));
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(StreamingEvent::Ended)
+        ));
+        handle.task.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emitted_text_is_never_replayed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_samples, mut handle) = local_stream(&listener, false);
+        let server = tokio::spawn(async move {
+            let mut ws = mock_session(&listener).await;
+            send_final(&mut ws).await;
+            drop(ws);
+        });
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(StreamingEvent::Final { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), handle.events.recv())
+                .await
+                .unwrap(),
+            Some(StreamingEvent::Error(_))
+        ));
+        assert!(matches!(
+            handle.events.recv().await,
+            Some(StreamingEvent::Ended)
+        ));
+        handle.task.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+    /// Opt-in live check: VOXTYPE_SMOKE_WAV must name synthetic 16 kHz mono
+    /// PCM16 speech. Reads the normal user config/key without printing it.
+    /// Routes the real service through a local proxy that resets once.
+    #[tokio::test]
+    #[ignore = "uses the configured API and VOXTYPE_SMOKE_WAV synthetic speech"]
+    async fn live_reconnect_smoke() {
+        let path = std::env::var("VOXTYPE_SMOKE_WAV").expect("set VOXTYPE_SMOKE_WAV");
+        let mut wav = hound::WavReader::open(path).unwrap();
+        assert_eq!(wav.spec().sample_rate, SOURCE_SAMPLE_RATE);
+        assert_eq!(wav.spec().channels, 1);
+        let audio: Vec<f32> = wav
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let config_path = dirs::config_dir().unwrap().join("voxtype/config.toml");
+        let config: crate::config::Config =
+            toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        let backend = OpenaiRealtimeTranscriber::new(config.openai_realtime.unwrap()).unwrap();
+        assert!(!backend.config.turn_detection && !backend.config.type_partials);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request = format!("ws://{}/", listener.local_addr().unwrap())
+            .into_client_request()
+            .unwrap();
+        let upstream_request = backend.connect_request().unwrap();
+        let proxy = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut local = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (mut upstream, _) = tokio_tungstenite::connect_async(upstream_request.clone())
+                    .await
+                    .unwrap();
+                let mut append_count = 0;
+                loop {
+                    tokio::select! {
+                        message = local.next() => {
+                            let Some(Ok(message)) = message else { break };
+                            if message.is_close() { break; }
+                            if message.to_text().is_ok_and(|t| t.contains("input_audio_buffer.append")) {
+                                append_count += 1;
+                            }
+                            upstream.send(message).await.unwrap();
+                            if attempt == 0 && append_count == 8 {
+                                // Exact production failure, after some audio
+                                // has reached the real transcription service.
+                                break;
+                            }
+                        }
+                        message = upstream.next() => {
+                            let Some(Ok(message)) = message else { break };
+                            if local.send(message).await.is_err() { break; }
+                        }
+                    }
+                }
+            }
+        });
+        let (samples_tx, samples_rx) = mpsc::channel(4);
+        let (events_tx, mut events) = mpsc::channel(64);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let worker = tokio::spawn(run_streaming_session(
+            request,
+            backend.session_update(false).to_string(),
+            false,
+            false,
+            samples_rx,
+            events_tx,
+            cancel_rx,
+        ));
+        for chunk in audio.chunks(320) {
+            samples_tx.send(chunk.to_vec()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(samples_tx);
+        let event = tokio::time::timeout(Duration::from_secs(45), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let StreamingEvent::Final { text, .. } = event else {
+            panic!("expected final: {event:?}")
+        };
+        eprintln!("Live recovery transcript: {text}");
+        let text = text.to_lowercase();
+        assert!(
+            text.contains("connection")
+                && text.contains("recording")
+                && text.contains("recovery")
+                && text.contains("brief interruption")
+                && text.contains("complete sentence")
+        );
+        assert!(matches!(events.recv().await, Some(StreamingEvent::Ended)));
+        worker.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), proxy)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
