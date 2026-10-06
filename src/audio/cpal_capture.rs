@@ -20,9 +20,41 @@ enum CaptureCommand {
     GetSamples(oneshot::Sender<Vec<f32>>),
 }
 
+/// Preserve microphone samples across temporary queue backpressure. The
+/// real-time callback never blocks on the async receiver. Pending audio is
+/// retried with the next callback and flushed by the capture thread at stop.
+#[derive(Default)]
+struct CapturedAudio {
+    recorded: Vec<f32>,
+    pending: Vec<f32>,
+}
+
+impl CapturedAudio {
+    fn record_chunk(&mut self, chunk: Vec<f32>, tx: &mpsc::Sender<Vec<f32>>) {
+        self.recorded.extend_from_slice(&chunk);
+        let chunk = if self.pending.is_empty() {
+            chunk
+        } else {
+            self.pending.extend_from_slice(&chunk);
+            std::mem::take(&mut self.pending)
+        };
+        match tx.try_send(chunk) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(chunk)) => self.pending = chunk,
+        }
+    }
+
+    fn finish(&mut self) -> (Vec<f32>, Vec<f32>) {
+        (
+            std::mem::take(&mut self.recorded),
+            std::mem::take(&mut self.pending),
+        )
+    }
+}
+
 /// Parameters for building an audio input stream
 struct StreamBuildParams {
-    samples: Arc<Mutex<Vec<f32>>>,
+    samples: Arc<Mutex<CapturedAudio>>,
     tx: mpsc::Sender<Vec<f32>>,
     source_rate: u32,
     target_rate: u32,
@@ -186,7 +218,7 @@ impl AudioCapture for CpalCapture {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CaptureCommand>();
 
         // Shared state
-        let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let samples = Arc::new(Mutex::new(CapturedAudio::default()));
         let samples_clone = samples.clone();
 
         // Spawn audio capture thread
@@ -247,21 +279,22 @@ impl AudioCapture for CpalCapture {
                         // Stop the stream (drop it)
                         drop(stream);
 
-                        // Get collected samples
-                        let collected = {
-                            let guard = samples_clone.lock().unwrap();
-                            guard.clone()
-                        };
-
-                        // Send samples back
+                        // All callbacks have stopped. Flush queue overflow from
+                        // this non-real-time thread before closing the sender.
+                        let (collected, pending) = samples_clone.lock().unwrap().finish();
+                        // Acknowledge microphone shutdown before draining audio;
+                        // backend backpressure is not a microphone-stop timeout.
                         let _ = response_tx.send(collected);
+                        if !pending.is_empty() {
+                            let _ = chunk_tx.blocking_send(pending);
+                        }
                         break;
                     }
                     Ok(CaptureCommand::GetSamples(response_tx)) => {
                         // Get and clear current samples (for continuous recording)
                         let samples = {
                             let mut guard = samples_clone.lock().unwrap();
-                            std::mem::take(&mut *guard)
+                            std::mem::take(&mut guard.recorded)
                         };
                         let _ = response_tx.send(samples);
                     }
@@ -305,7 +338,9 @@ impl AudioCapture for CpalCapture {
 
         // Wait for thread to finish
         if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
+            // The capture thread may be flushing queue overflow. Keep async
+            // consumers running while waiting for that thread to finish.
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
 
         let duration_secs = samples.len() as f32 / self.config.sample_rate as f32;
@@ -389,13 +424,9 @@ where
                     mono_f32
                 };
 
-                // Store samples
                 if let Ok(mut guard) = samples.lock() {
-                    guard.extend_from_slice(&resampled);
+                    guard.record_chunk(resampled, &tx);
                 }
-
-                // Send chunk for streaming (ignore errors - receiver might be gone)
-                let _ = tx.try_send(resampled);
             },
             err_fn,
             None,
@@ -436,6 +467,77 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn full_capture_queue_retries_samples_in_order() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut audio = CapturedAudio::default();
+        for i in 1..=3 {
+            audio.record_chunk(vec![i as f32], &tx);
+        }
+        assert_eq!(rx.recv().await.unwrap(), vec![1.0]);
+        audio.record_chunk(vec![4.0], &tx);
+        assert_eq!(rx.recv().await.unwrap(), vec![2.0, 3.0, 4.0]);
+        let (recorded, pending) = audio.finish();
+        assert_eq!(recorded, vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_chunk_receiver_keeps_batch_recording_without_pending_audio() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut audio = CapturedAudio::default();
+        audio.record_chunk(vec![1.0, 2.0], &tx);
+        let (recorded, pending) = audio.finish();
+        assert_eq!(recorded, vec![1.0, 2.0]);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn draining_recorded_samples_preserves_pending_stream_audio() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut audio = CapturedAudio::default();
+        audio.record_chunk(vec![1.0], &tx);
+        audio.record_chunk(vec![2.0], &tx);
+        assert_eq!(std::mem::take(&mut audio.recorded), vec![1.0, 2.0]);
+        assert_eq!(rx.recv().await.unwrap(), vec![1.0]);
+        audio.record_chunk(vec![3.0], &tx);
+        assert_eq!(rx.recv().await.unwrap(), vec![2.0, 3.0]);
+        assert_eq!(audio.finish(), (vec![3.0], Vec::new()));
+    }
+
+    // No microphone is opened. Exercise the real async stop method with a
+    // capture-thread stand-in that must flush a full channel before exiting.
+    // A synchronous thread.join() here would deadlock this current-thread runtime.
+    #[tokio::test]
+    async fn stop_flushes_overflow_without_blocking_async_consumers() {
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(1);
+        chunk_tx.send(vec![1.0]).await.unwrap();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let CaptureCommand::Stop(response_tx) = cmd_rx.recv().unwrap() else {
+                panic!("expected stop command");
+            };
+            response_tx.send(vec![1.0, 2.0, 3.0]).unwrap();
+            chunk_tx.blocking_send(vec![2.0, 3.0]).unwrap();
+        });
+        let mut capture = CpalCapture::new(&AudioConfig::default()).unwrap();
+        capture.cmd_tx = Some(cmd_tx);
+        capture.thread_handle = Some(worker);
+        let consumer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut received = Vec::new();
+            while let Some(chunk) = chunk_rx.recv().await {
+                received.extend(chunk);
+            }
+            received
+        });
+        let recorded = capture.stop().await.unwrap();
+        assert_eq!(consumer.await.unwrap(), recorded);
+        assert_eq!(recorded, vec![1.0, 2.0, 3.0]);
+        assert!(capture.thread_handle.is_none());
+    }
 
     #[test]
     fn test_resample_same_rate() {

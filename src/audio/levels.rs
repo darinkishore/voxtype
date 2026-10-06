@@ -557,10 +557,10 @@ pub fn spawn_emitter(
 /// `streaming_tx`, used by the streaming transcription pipeline to feed
 /// audio into a backend without disturbing the OSD level emitter.
 ///
-/// When `streaming_tx` is `Some`, each chunk is cloned and `try_send`'d to
-/// it. Failure to send (closed receiver, full bounded channel) is logged at
-/// trace and never blocks the level emitter. When `streaming_tx` is `None`,
-/// behavior is identical to [`spawn_emitter`].
+/// When `streaming_tx` is `Some`, audio delivery waits for queue capacity.
+/// Visualizer frames remain best-effort; transcription audio must not be
+/// discarded just because its consumer is briefly slow. A closed backend
+/// ends the forwarder. With no tap, behavior matches [`spawn_emitter`].
 pub fn spawn_emitter_with_streaming_tap(
     mut chunk_rx: mpsc::Receiver<Vec<f32>>,
     sink: FrameSink,
@@ -580,8 +580,8 @@ pub fn spawn_emitter_with_streaming_tap(
             }
 
             if let Some(ref tx) = streaming_tx {
-                if let Err(e) = tx.try_send(chunk) {
-                    tracing::trace!("streaming sample tap try_send failed: {}", e);
+                if tx.send(chunk).await.is_err() {
+                    break;
                 }
             }
         }
@@ -729,6 +729,61 @@ mod tests {
         let dir = TempDir::new().expect("create tempdir");
         let path = dir.path().join("audio.sock");
         (dir, path)
+    }
+
+    // Construct only the best-effort frame sink; these forwarding tests need
+    // neither a real socket nor the listener watchdog's global panic state.
+    fn isolated_frame_sink() -> FrameSink {
+        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        FrameSink {
+            inner: Arc::new(HubInner {
+                state: RwLock::new(Arc::new(HubState {
+                    broadcast_tx,
+                    subscriber_count: Mutex::new(0),
+                })),
+                socket_path: PathBuf::new(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tap_preserves_audio_when_backend_queue_is_full() {
+        let (capture_tx, capture_rx) = mpsc::channel(64);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let pump =
+            spawn_emitter_with_streaming_tap(capture_rx, isolated_frame_sink(), Some(stream_tx));
+        for i in 1..=3 {
+            capture_tx.send(vec![i as f32]).await.unwrap();
+        }
+        drop(capture_tx);
+        // The pump encounters backpressure before the receiver starts.
+        tokio::task::yield_now().await;
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut received = Vec::new();
+            while let Some(chunk) = stream_rx.recv().await {
+                received.extend(chunk);
+            }
+            pump.await.unwrap();
+            received
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[tokio::test]
+    async fn streaming_tap_exits_when_backend_closes() {
+        let (capture_tx, capture_rx) = mpsc::channel(1);
+        let (stream_tx, stream_rx) = mpsc::channel(1);
+        drop(stream_rx);
+        let pump =
+            spawn_emitter_with_streaming_tap(capture_rx, isolated_frame_sink(), Some(stream_tx));
+        capture_tx.send(vec![1.0]).await.unwrap();
+        // Leave the capture sender alive: backend closure alone must unblock stop.
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     /// Smoke: starting the hub binds the socket and a client can connect.

@@ -969,18 +969,6 @@ impl Daemon {
         }
     }
 
-    /// Cut audio flow to the streaming backend immediately. Aborts the
-    /// chunk-rx → streaming_tx pump so any samples still in the audio
-    /// capture's buffer never reach the backend — without this, the
-    /// ~50–100ms of residual samples between the user's stop press and
-    /// the actual mic shutdown leak in as low-level noise and cause
-    /// hallucinated trailing tokens.
-    fn cut_streaming_audio(&mut self) {
-        if let Some(handle) = self.level_emitter_task.take() {
-            handle.abort();
-        }
-    }
-
     /// Abort the OSD draining pump (if running) so the visualizer can
     /// fade out on its idle timer once the session is fully closed.
     fn stop_streaming_drain_pump(&mut self) {
@@ -989,16 +977,20 @@ impl Daemon {
         }
     }
 
-    /// Early-stop the streaming capture: cut audio flow to the backend,
-    /// start the OSD silence pump so the visualizer stays alive during
-    /// drain, and stop the mic. Leaves `streaming_session`/`_chain` for
-    /// the caller to disown (or keep, to receive trailing finals).
+    /// Stop the microphone, then forward every already captured chunk before
+    /// closing the backend input. Aborting the pump here discards speech.
     async fn stop_streaming_capture(&mut self, audio_capture: &mut Option<Box<dyn AudioCapture>>) {
-        self.cut_streaming_audio();
         self.start_streaming_drain_pump();
         if let Some(mut c) = audio_capture.take() {
-            let _ = c.stop().await;
+            if let Err(e) = c.stop().await {
+                tracing::warn!("Failed to stop streaming capture cleanly: {}", e);
+            }
             self.restore_ducked_media_streams();
+        }
+        if let Some(handle) = self.level_emitter_task.take() {
+            if let Err(e) = handle.await {
+                tracing::warn!("Streaming audio forwarder failed: {}", e);
+            }
         }
     }
 
@@ -1040,8 +1032,7 @@ impl Daemon {
                             wait_for_modifier_release: false,
                             modifier_release_timeout: std::time::Duration::from_millis(0),
                         };
-                        if let Err(e) = output::output_with_fallback(&chain, &text, opts).await
-                        {
+                        if let Err(e) = output::output_with_fallback(&chain, &text, opts).await {
                             tracing::error!("Timeout clipboard delivery failed: {}", e);
                         }
                         send_notification(
@@ -1180,8 +1171,8 @@ impl Daemon {
         match audio::create_capture(&self.config.audio) {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
-                    // Bounded; backed-up streaming backend drops chunks
-                    // rather than back-pressuring the capture.
+                    // Backpressure the forwarder, never discard speech. The
+                    // capture thread retains any chunks it cannot enqueue.
                     let (streaming_tx, streaming_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(64);
 
                     if let Some(handle) = self.level_emitter_task.take() {
@@ -1198,8 +1189,8 @@ impl Daemon {
                         tokio::spawn(async move {
                             let mut rx = chunk_rx;
                             while let Some(chunk) = rx.recv().await {
-                                if streaming_tx.try_send(chunk).is_err() {
-                                    // Backend slow or gone; drop and keep going.
+                                if streaming_tx.send(chunk).await.is_err() {
+                                    break;
                                 }
                             }
                         })
@@ -4181,6 +4172,60 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    struct BufferedTestCapture {
+        tx: Option<tokio::sync::mpsc::Sender<Vec<f32>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AudioCapture for BufferedTestCapture {
+        async fn start(
+            &mut self,
+        ) -> std::result::Result<tokio::sync::mpsc::Receiver<Vec<f32>>, crate::error::AudioError>
+        {
+            panic!("regression test must never open the microphone");
+        }
+
+        async fn stop(&mut self) -> std::result::Result<Vec<f32>, crate::error::AudioError> {
+            self.tx.take();
+            Ok(vec![1.0, 2.0, 3.0])
+        }
+
+        async fn get_samples(&mut self) -> Vec<f32> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_stop_preserves_already_captured_tail() {
+        let mut config = Config::default();
+        config.audio.feedback.enabled = false;
+        config.vad.enabled = false;
+        let mut daemon = Daemon::new(config, None);
+        let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(64);
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(64);
+        daemon.level_emitter_task = Some(tokio::spawn(async move {
+            while let Some(chunk) = capture_rx.recv().await {
+                if stream_tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        }));
+        for i in 1..=3 {
+            capture_tx.send(vec![i as f32]).await.unwrap();
+        }
+        let mut capture: Option<Box<dyn AudioCapture>> = Some(Box::new(BufferedTestCapture {
+            tx: Some(capture_tx),
+        }));
+        daemon.stop_streaming_capture(&mut capture).await;
+        let mut received = Vec::new();
+        while let Some(chunk) = stream_rx.recv().await {
+            received.extend(chunk);
+        }
+        assert_eq!(received, vec![1.0, 2.0, 3.0]);
+        assert!(capture.is_none());
+        assert!(daemon.level_emitter_task.is_none());
+    }
 
     // Helper to create a test runtime directory and set it up
     fn with_test_runtime_dir<F, R>(f: F) -> R
