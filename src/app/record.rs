@@ -5,6 +5,10 @@
 //! would invent write-race surface that doesn't exist today (see
 //! `docs/REFACTORING.md`).
 
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use voxtype::daemon::result_sidecar_path;
 use voxtype::{config, daemon_status, RecordAction};
 
 /// Send a record command to the running daemon via Unix signals or file triggers
@@ -110,6 +114,15 @@ pub(crate) fn send_record_command(
             .map_err(|e| anyhow::anyhow!("Failed to write shift_enter override: {}", e))?;
     }
 
+    // Write the OSD suppression sentinel if --no-osd was passed. Only written,
+    // never cleared here: like the other overrides the daemon consumes and
+    // removes it, so a stale file cannot silence a later recording.
+    if action.suppress_osd() {
+        let override_file = config::Config::runtime_dir().join("no_osd_override");
+        std::fs::write(&override_file, "true")
+            .map_err(|e| anyhow::anyhow!("Failed to write no_osd override: {}", e))?;
+    }
+
     // For toggle, we need to read current state to decide which signal to send
     let signal: libc::c_int = match &action {
         RecordAction::Start { .. } => libc::SIGUSR1,
@@ -152,6 +165,26 @@ pub(crate) fn send_record_command(
         RecordAction::Cancel => unreachable!(), // Handled above
     };
 
+    // With --wait, clear a previous run's completion sidecar before signalling,
+    // so the wait below cannot mistake it for this recording's outcome.
+    let wait_target = match &action {
+        RecordAction::Stop {
+            wait: true,
+            wait_file,
+            ..
+        } => {
+            let path = resolve_wait_target(config, wait_file.as_deref()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--wait needs a transcript file: start the recording with --file, \
+                     set output.mode = \"file\", or pass --wait-file <PATH>"
+                )
+            })?;
+            let _ = std::fs::remove_file(result_sidecar_path(&path));
+            Some(path)
+        }
+        _ => None,
+    };
+
     let result = unsafe { libc::kill(pid, signal) };
     if result != 0 {
         return Err(anyhow::anyhow!(
@@ -160,5 +193,179 @@ pub(crate) fn send_record_command(
         ));
     }
 
+    if let Some(transcript) = wait_target {
+        let (as_json, timeout) = match &action {
+            RecordAction::Stop { json, timeout, .. } => (*json, *timeout),
+            _ => (false, 120),
+        };
+        let outcome = await_transcription(&transcript, Duration::from_secs(timeout));
+        report_outcome(&outcome, as_json);
+        std::process::exit(outcome.exit_code());
+    }
+
     Ok(())
+}
+
+/// Which transcript `--wait` should block on.
+///
+/// An explicit `--wait-file` wins. Otherwise the pending `--file` override this
+/// recording was started with is used, so the common case needs no repetition;
+/// failing that, a configured file-output path.
+fn resolve_wait_target(config: &config::Config, explicit: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    let pending =
+        std::fs::read_to_string(config::Config::runtime_dir().join("output_mode_override")).ok();
+    if let Some(value) = pending.as_deref().map(str::trim) {
+        if let Some(path) = value.strip_prefix("file:") {
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+
+    config.output.file_path.clone()
+}
+
+/// Outcome of a `--wait` stop, as reported to the caller.
+struct WaitOutcome {
+    status: String,
+    text: String,
+    message: Option<String>,
+}
+
+impl WaitOutcome {
+    fn exit_code(&self) -> i32 {
+        match self.status.as_str() {
+            "ok" => 0,
+            "empty" => 3,
+            "timeout" => 4,
+            _ => 1,
+        }
+    }
+}
+
+/// Block until the daemon publishes this recording's outcome.
+///
+/// The daemon writes the completion sidecar after the transcript itself, so
+/// seeing the sidecar means the transcript is complete. A state file that
+/// returns to idle without one is the backstop: that means the recording ended
+/// down a path that produced no transcript.
+fn await_transcription(transcript: &Path, timeout: Duration) -> WaitOutcome {
+    const POLL: Duration = Duration::from_millis(50);
+    // How long to keep looking for a sidecar after the daemon reports idle.
+    const SETTLE: Duration = Duration::from_millis(750);
+
+    let sidecar = result_sidecar_path(transcript);
+    let state_file = config::Config::runtime_dir().join("state");
+    let deadline = Instant::now() + timeout;
+    let mut idle_since: Option<Instant> = None;
+
+    loop {
+        if let Ok(body) = std::fs::read_to_string(&sidecar) {
+            let _ = std::fs::remove_file(&sidecar);
+            return finish(transcript, &body);
+        }
+
+        let state = std::fs::read_to_string(&state_file)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if state == "idle" {
+            match idle_since {
+                Some(since) if since.elapsed() >= SETTLE => {
+                    return WaitOutcome {
+                        status: "empty".to_string(),
+                        text: String::new(),
+                        message: Some(
+                            "the daemon returned to idle without producing a transcript"
+                                .to_string(),
+                        ),
+                    };
+                }
+                Some(_) => {}
+                None => idle_since = Some(Instant::now()),
+            }
+        } else {
+            idle_since = None;
+        }
+
+        if Instant::now() >= deadline {
+            return WaitOutcome {
+                status: "timeout".to_string(),
+                text: String::new(),
+                message: Some(format!(
+                    "no outcome within {}s (daemon state: {})",
+                    timeout.as_secs(),
+                    if state.is_empty() { "unknown" } else { &state }
+                )),
+            };
+        }
+
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Turn a sidecar body into an outcome, reading the transcript when there is one.
+fn finish(transcript: &Path, sidecar_body: &str) -> WaitOutcome {
+    let parsed: serde_json::Value = match serde_json::from_str(sidecar_body.trim()) {
+        Ok(value) => value,
+        Err(e) => {
+            return WaitOutcome {
+                status: "error".to_string(),
+                text: String::new(),
+                message: Some(format!("unreadable completion record: {}", e)),
+            }
+        }
+    };
+
+    let status = parsed
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("error")
+        .to_string();
+    let message = parsed
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let text = if status == "ok" {
+        std::fs::read_to_string(transcript)
+            .map(|t| t.trim_end_matches('\n').to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    WaitOutcome {
+        status,
+        text,
+        message,
+    }
+}
+
+/// Print the outcome: one JSON object, or the transcript on stdout.
+fn report_outcome(outcome: &WaitOutcome, as_json: bool) {
+    if as_json {
+        let body = serde_json::json!({
+            "status": outcome.status,
+            "text": outcome.text,
+            "chars": outcome.text.chars().count(),
+            "message": outcome.message,
+        });
+        println!("{}", body);
+        return;
+    }
+
+    if outcome.status == "ok" {
+        println!("{}", outcome.text);
+    } else if let Some(message) = &outcome.message {
+        eprintln!("{}: {}", outcome.status, message);
+    } else {
+        eprintln!("{}", outcome.status);
+    }
 }

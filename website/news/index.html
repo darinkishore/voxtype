@@ -45,7 +45,7 @@
                 <a href="../download/">Download</a>
                 <a href="../compare/">Compare</a>
                 <a href="./" class="active">News</a>
-                <a href="https://github.com/peteonrails/voxtype/tree/main/docs">Docs</a>
+                <a href="https://voxtype.io/docs">Docs</a>
                 <a href="https://github.com/peteonrails/voxtype" class="nav-github">
                     <svg viewBox="0 0 24 24" fill="currentColor">
                         <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
@@ -76,6 +76,133 @@
         <div class="container">
 
             <!-- v0.7.x Era Posts -->
+
+            <article class="news-article" id="v110">
+                <div class="article-meta">
+                    <time datetime="2026-09-23">September 23, 2026</time>
+                    <span class="article-tag">Release</span>
+                </div>
+                <h2>v1.1.0: Whisper on Intel NPUs, text rules everywhere, and an OSD that dresses itself</h2>
+                <div class="article-body">
+                    <p>voxtype 1.1.0 brings Whisper to Intel NPUs through a new OpenVINO engine, makes your text rules apply everywhere they should have all along, teaches the Quickshell OSD to follow your Omarchy theme and wear entirely different looks, and ships a binary for CPUs without AVX2. Everything in 1.0.1 is included.</p>
+
+                    <h3>Intel OpenVINO engine: Whisper on CPU, iGPU, and NPU (<a href="https://github.com/peteonrails/voxtype/issues/547">#547</a>)</h3>
+                    <p>A new <code>openvino</code> engine runs Whisper through Intel's OpenVINO GenAI runtime, including the NPU on Core Ultra laptops. 33 models are available through <code>voxtype setup --download</code>, served from models.voxtype.io with sha256-verified manifests.</p>
+                    <p><strong>Why use it:</strong> on a Meteor Lake NPU, dictation runs at a fraction of the power the CPU or iGPU would draw. On battery, that is the whole story.</p>
+                    <p>Two things to know. You need Intel's OpenVINO GenAI runtime installed; voxtype loads it only when this engine is selected, so nothing changes for anyone else. And the multi-minute first compile of a large model on NPU happens during <code>voxtype setup</code>, where you expect to wait, instead of silently stalling your first recording (<a href="https://github.com/peteonrails/voxtype/pull/698">#698</a>). A compile failure is a warning, not a broken setup: the runtime falls back NPU to GPU to CPU.</p>
+                    <p>Contributed by Jacob Mink, with testing, the device fallback chain, and a missing-file fix from tslove923.</p>
+
+                    <h3>Your [text] rules now run on every path that produces text (<a href="https://github.com/peteonrails/voxtype/issues/669">#669</a>, <a href="https://github.com/peteonrails/voxtype/issues/581">#581</a>)</h3>
+                    <p>Replacements and spoken punctuation only ever applied to hotkey dictation. Streaming output and <code>voxtype transcribe</code> silently skipped them: the daemon logged your rules as loaded, then never consulted them. Both paths now apply your rules when text is committed.</p>
+                    <p><strong>Why it matters:</strong> if you use replacements with a streaming engine, your output will change in this release without any config edit. That is the fix working. Reported by Marc Lavallee.</p>
+
+                    <h3>The Quickshell OSD follows your Omarchy theme live (<a href="https://github.com/peteonrails/voxtype/issues/705">#705</a>)</h3>
+                    <p>Switch your Omarchy theme and the OSD recolors itself in place, no restart. A small follower process watches the theme directory and rewrites the OSD's runtime palette when it changes; its lifetime is tied to the OSD itself, so it never outlives it and costs nothing when Omarchy is not installed.</p>
+                    <p><strong>Why use it:</strong> the OSD stops looking like a sticker from another desktop. It picks up your accent, foreground, and background colors the moment the rest of your desktop does.</p>
+
+                    <h3>OSD style packages and recipes</h3>
+                    <p>The OSD's look is now swappable. A style package is a directory of QML dropped into <code>~/.config/voxtype/osd/</code> (or shipped system-wide in <code>/usr/share/voxtype/osd/</code>), selected with one config key:</p>
+                    <div class="code-block">
+                        <div class="code-header"><span>config.toml</span></div>
+                        <pre><code>[osd]
+style = "aegis-hud"</code></pre>
+                    </div>
+                    <p>Recipes are lighter: preset <code>[osd]</code> configurations that restyle the built-in components without any QML. Styles are discoverable everywhere: <code>voxtype info styles</code> lists what is installed, the TUI has a style picker with descriptions, the Omarchy settings panel gets a working Style dropdown (<a href="https://github.com/peteonrails/voxtype/issues/710">#710</a>), and <code>voxtype config set osd.style</code> round-trips cleanly. A style that ships its own palette keeps it; styles without one follow the Omarchy theme like the default does.</p>
+                    <p>Built on the styling groundwork contributed by OldJobobo.</p>
+
+                    <h3>A binary for CPUs without AVX2 (<a href="https://github.com/peteonrails/voxtype/issues/612">#612</a>, <a href="https://github.com/peteonrails/voxtype/issues/740">#740</a>)</h3>
+                    <p>Every prebuilt x86-64 variant required AVX2, so pre-Haswell machines crashed with SIGILL, and the crash message told them to switch to the binary they were already running. There is now a <code>baseline</code> variant built for x86-64-v2 (Nehalem 2008 and later), shipped in the deb, the rpm, and the AUR packages. The OSD binaries are built to the same floor, so those machines get an OSD too.</p>
+                    <p>Getting this one honest took two tries. The release-candidate baseline builds passed every startup check and then SIGILLed at first inference, because the build flags meant to constrain the bundled whisper.cpp never reached its build system. ironbract diagnosed it on an Ivy Bridge i7-3520M, down to the faulting instruction, and confirmed the fix on the same machine. CI now runs real inference on every baseline artifact under a QEMU-modeled v2 CPU, so this failure class cannot ship silently again.</p>
+
+                    <h3>A panicked transcription no longer poisons the engine (<a href="https://github.com/peteonrails/voxtype/issues/643">#643</a>)</h3>
+                    <p>1.0.x only recovered Whisper. The cached transcriber is now dropped and re-created after a panic on every engine, including the new OpenVINO one. A hard abort inside a native runtime is still what <code>gpu_isolation</code> is for.</p>
+
+                    <h3>Config that survives one bad value (<a href="https://github.com/peteonrails/voxtype/issues/646">#646</a>)</h3>
+                    <p>One unreadable value used to stop the daemon and cost you every setting you had. The config now parses section by section: the bad section falls back to defaults and is named in the log, everything else survives. Section names only, never values, because those sections hold API keys.</p>
+
+                    <h3>Bug fixes</h3>
+                    <ul>
+                        <li>The GTK4 OSD sidesteps a GTK heap corruption in Wayland dmabuf-feedback handling that crashed it every few minutes to hours on AMD iGPUs (<a href="https://github.com/peteonrails/voxtype/issues/656">#656</a>)</li>
+                        <li><code>voxtype setup --download</code> can now fetch models for every engine, not just Whisper, Parakeet, and SenseVoice (<a href="https://github.com/peteonrails/voxtype/issues/687">#687</a>)</li>
+                        <li>Removed moonshine-tiny-ja and moonshine-tiny-zh: upstream never published a decoder these builds can run (<a href="https://github.com/peteonrails/voxtype/issues/694">#694</a>)</li>
+                        <li><code>--version</code> prints <code>1.1.0+g&lt;sha&gt;</code> on untagged source builds, so a development binary can no longer pass itself off as the release</li>
+                        <li><code>voxtype setup quickshell</code> fails loudly when the qmldir declares components the install did not ship (<a href="https://github.com/peteonrails/voxtype/issues/697">#697</a>)</li>
+                        <li>Feature probes use raw CPUID instead of a macro that statically evaluates to true in feature-compiled binaries</li>
+                        <li>The macOS build of the Quickshell launcher compiles again: the theme follower's lifetime pipe uses portable pipe+fcntl instead of Linux-only pipe2</li>
+                    </ul>
+
+                    <h3>Thanks</h3>
+                    <p>To Jacob Mink for the OpenVINO engine, tslove923 for NPU testing and fixes, OldJobobo for the OSD styling groundwork, ironbract for the pre-Haswell diagnosis and hardware verification, Marc Lavallee for the text-rules report, and everyone who ran the five release candidates on hardware we don't have.</p>
+                </div>
+            </article>
+
+            <article class="news-article" id="v101">
+                <div class="article-meta">
+                    <time datetime="2026-08-30">August 30, 2026</time>
+                    <span class="article-tag">Release</span>
+                </div>
+                <h2>v1.0.1: Cleaner audio, resumable downloads, and the first-week fixes</h2>
+                <div class="article-body">
+                    <p>The first patch release after 1.0.0, covering everything reported in the days after it shipped. Four of these change what the audio pipeline actually produces, so this is worth installing even if none of the individual bugs bit you.</p>
+
+                    <h3>Band-limited resampling (<a href="https://github.com/peteonrails/voxtype/issues/641">#641</a>)</h3>
+                    <p>The resampler that converts your microphone's rate to the 16kHz the models expect was doing linear interpolation with no anti-aliasing filter. Downsampling 48kHz to 16kHz folded every frequency above 8kHz back down into the speech band, so on the most common capture configuration there is, the model was handed audio dirtier than the microphone produced.</p>
+                    <p>Two smaller faults came with it. The old function started fresh on every audio callback, so the fractional read position reset roughly a hundred times a second and left a discontinuity each time. And whatever sat in the buffer when you released the key was discarded, losing up to 21ms off the end of every recording.</p>
+                    <p><strong>Why it matters:</strong> better transcription accuracy on any machine whose microphone does not natively run at 16kHz, which is most of them, and your last word no longer gets clipped.</p>
+
+                    <h3>Media ducking fades</h3>
+                    <p>Ducking now ramps the volume down and back rather than jumping, and the fade runs without delaying the microphone. Configurable in milliseconds, and reachable from <code>voxtype configure</code> as well as the config file, the flag, and the environment variable.</p>
+
+                    <div class="code-block">
+                        <div class="code-header"><span>config.toml</span></div>
+                        <pre><code>[audio]
+duck_media = true
+duck_media_volume_percent = 34
+duck_media_fade_ms = 150      # 0 for the old instant behavior</code></pre>
+                    </div>
+
+                    <p><strong>Why use it:</strong> the old jump was jarring when dictating over music, and a slow fade that held up the microphone would have been worse. This does neither.</p>
+
+                    <h3>Model downloads resume (<a href="https://github.com/peteonrails/voxtype/issues/645">#645</a>)</h3>
+                    <p>An interrupted download used to start over from zero, and a stalled one would hang indefinitely. Downloads now resume from where they stopped and abort when the transfer goes quiet. A partial file is never left at the final path, so a failed download cannot masquerade as a complete model.</p>
+                    <p><strong>Why it matters:</strong> the large ONNX models are a slow download on a domestic connection, and losing an hour of progress to a dropped connection was a genuine reason to give up.</p>
+
+                    <h3>Hotkeys that stay unstuck</h3>
+                    <p>Three separate faults, all of which left push-to-talk in a bad state. Plugging in a keyboard mid-press left the daemon believing the key was still held, so recording never stopped (<a href="https://github.com/peteonrails/voxtype/issues/556">#556</a>). After voxtype typed through dotool, the listener kept the file descriptor of the tool's short-lived virtual keyboard; once the tool tore it down, the daemon spun a CPU core at 100 percent (<a href="https://github.com/peteonrails/voxtype/issues/445">#445</a>). And dropped evdev events could desynchronize the pressed-key state.</p>
+
+                    <h3>Idle model eviction actually runs (<a href="https://github.com/peteonrails/voxtype/issues/644">#644</a>)</h3>
+                    <p>The code to unload an idle model was written, correct, and had never once executed. It sat on a 500ms timer arm that a 100ms arm beside it starved: in a <code>tokio::select!</code> loop, an uncompleted timer future is recreated on every iteration, so a timer that never gets to complete never fires. Moved onto an arm that does.</p>
+                    <p><strong>Why it matters:</strong> long-running daemons on laptops now release model memory when idle, as the setting always claimed.</p>
+
+                    <h3>Bug fixes</h3>
+                    <ul>
+                        <li>Audio stream errors are reported instead of silently returning a truncated recording when a device disconnects mid-recording (<a href="https://github.com/peteonrails/voxtype/issues/642">#642</a>)</li>
+                        <li><code>voxtype configure</code> honors <code>-c</code> / <code>--config</code> instead of always writing the default config (<a href="https://github.com/peteonrails/voxtype/issues/595">#595</a>)</li>
+                        <li>The configure TUI no longer freezes when opening the Audio section on ALSA <code>dsnoop</code> devices (<a href="https://github.com/peteonrails/voxtype/issues/541">#541</a>), thanks to Jan van Winsen</li>
+                        <li>The configure TUI no longer reports an installed sensevoice or moonshine model as missing (<a href="https://github.com/peteonrails/voxtype/issues/662">#662</a>), from a diagnosis by xzedx</li>
+                        <li>Remote mode uses <code>remote_model</code> instead of falling back to the local model name and 404ing against OpenAI-compatible APIs (<a href="https://github.com/peteonrails/voxtype/issues/496">#496</a>), thanks to poommmes-del</li>
+                        <li>Remote Whisper honors <code>language = "auto"</code> (<a href="https://github.com/peteonrails/voxtype/issues/619">#619</a>), thanks to musingfox</li>
+                        <li>Filler-word filtering no longer strips "um" in Portuguese and German, where it is an article and a preposition rather than a disfluency (<a href="https://github.com/peteonrails/voxtype/issues/566">#566</a>), thanks to robertvbs</li>
+                        <li>Zero-delay eitype output no longer truncates long dictation on KDE (<a href="https://github.com/peteonrails/voxtype/issues/552">#552</a>), thanks to Vaspyyy</li>
+                        <li>Eager processing no longer transcribes chunks with Whisper when a non-Whisper engine uses on-demand loading (<a href="https://github.com/peteonrails/voxtype/issues/618">#618</a>), thanks to yusuke8h</li>
+                        <li><code>setup variant --to</code> refuses to activate a binary that cannot run on the host instead of reporting success (<a href="https://github.com/peteonrails/voxtype/issues/633">#633</a>)</li>
+                        <li><code>setup model --set</code> routes by engine instead of rewriting the engine to Whisper and crash-looping the daemon (<a href="https://github.com/peteonrails/voxtype/issues/610">#610</a>)</li>
+                        <li>Notifications replace the previous notification instead of stacking up (<a href="https://github.com/peteonrails/voxtype/issues/532">#532</a>), thanks to Hoeze</li>
+                        <li>aarch64 OSD binaries are published, having been built by CI but never shipped (<a href="https://github.com/peteonrails/voxtype/issues/579">#579</a>)</li>
+                        <li>Homebrew macOS dependency syntax updated for the current cask format, thanks to erodriguezh</li>
+                        <li>Documentation fixes for the Cohere engine, the docs links, and the audio device listing command (<a href="https://github.com/peteonrails/voxtype/issues/528">#528</a>, <a href="https://github.com/peteonrails/voxtype/issues/526">#526</a>, <a href="https://github.com/peteonrails/voxtype/issues/564">#564</a>)</li>
+                    </ul>
+
+                    <h3>New</h3>
+                    <ul>
+                        <li><code>--no-osd</code> suppresses the on-screen display for a single recording without changing your config (<a href="https://github.com/peteonrails/voxtype/issues/636">#636</a>)</li>
+                        <li>Programs can wait for a dictation to complete rather than polling for it</li>
+                    </ul>
+
+                    <h3>Thanks</h3>
+                    <p>To Zeus-Deus for the evdev hotkey work, to Hoeze for the notification-stacking fix, and to kaizenagentdev, lunetics, robertvbs, poommmes-del, musingfox, Vaspyyy, yusuke8h, Jan van Winsen, Matthias Breddin, erodriguezh and xzedx for reports, diagnoses and fixes that went into this release.</p>
+                </div>
+            </article>
 
             <article class="news-article" id="v075">
                 <div class="article-meta">

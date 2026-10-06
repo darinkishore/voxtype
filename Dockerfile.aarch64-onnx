@@ -91,14 +91,20 @@ RUN cargo build --release --features parakeet,moonshine,sensevoice,paraformer,do
     --config 'profile.release.codegen-units=8' \
     && cp target/release/voxtype /tmp/voxtype-aarch64-onnx
 
-# Build the OSD launcher and gtk4 frontend in a separate cargo invocation
-# so the daemon binary stays clean of GTK4 / layer-shell baggage.
+# Build the OSD launcher and frontends in a separate cargo invocation so the
+# daemon binary stays clean of GTK4 / layer-shell baggage. Matches the binary
+# set Dockerfile.onnx produces for x86_64: the quickshell launcher and the
+# audio bridge are engine- and arch-agnostic, and an Asahi user running the
+# Quickshell OSD needs both (#579).
 RUN cargo build --release --features osd-gtk4 \
     --bin voxtype-osd --bin voxtype-osd-gtk4 \
+    --bin voxtype-osd-quickshell --bin voxtype-audio-bridge \
     --config 'profile.release.lto=false' \
     --config 'profile.release.codegen-units=8' \
     && cp target/release/voxtype-osd /tmp/voxtype-osd \
-    && cp target/release/voxtype-osd-gtk4 /tmp/voxtype-osd-gtk4
+    && cp target/release/voxtype-osd-gtk4 /tmp/voxtype-osd-gtk4 \
+    && cp target/release/voxtype-osd-quickshell /tmp/voxtype-osd-quickshell \
+    && cp target/release/voxtype-audio-bridge /tmp/voxtype-audio-bridge
 
 # Verify binary
 RUN echo "=== Verifying aarch64 ONNX binary ===" \
@@ -111,5 +117,7 @@ CMD mkdir -p /output \
     && cp /tmp/voxtype-aarch64-onnx /output/voxtype-${VERSION}-linux-aarch64-onnx \
     && cp /tmp/voxtype-osd /output/voxtype-${VERSION}-linux-aarch64-osd \
     && cp /tmp/voxtype-osd-gtk4 /output/voxtype-${VERSION}-linux-aarch64-osd-gtk4 \
+    && cp /tmp/voxtype-osd-quickshell /output/voxtype-${VERSION}-linux-aarch64-osd-quickshell \
+    && cp /tmp/voxtype-audio-bridge /output/voxtype-${VERSION}-linux-aarch64-audio-bridge \
     && echo "Binaries copied to /output:" \
     && ls -la /output/voxtype-*

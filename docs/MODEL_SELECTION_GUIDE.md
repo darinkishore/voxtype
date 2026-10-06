@@ -2,7 +2,7 @@
 
 This guide helps you choose the right transcription engine and model for voxtype v0.6.0. The choice depends on your language, hardware, and how you use dictation.
 
-Voxtype has seven transcription engines. Two are bundled with the standard binary (Whisper and Remote Whisper). The other five require the ONNX binary variant.
+Voxtype has eight transcription engines. Three ship in every binary — Whisper (local), Remote Whisper (HTTP API), and Soniox (cloud streaming). The other five require the ONNX binary variant.
 
 ---
 
@@ -17,10 +17,11 @@ Voxtype has seven transcription engines. Two are bundled with the standard binar
 | **Paraformer** | zh, en | Encoder-predictor-decoder | 220 - 487 MB | Fast | No | ONNX |
 | **Dolphin** | 40+ langs, 22 Chinese dialects | CTC E-Branchformer | 198 MB | Fast | No | ONNX |
 | **Omnilingual** | 1600+ | CTC wav2vec2 | 3.9 GB | Moderate | No | ONNX |
-| **Soniox** (cloud) | 60+ | Cloud (WebSocket / REST) | n/a (no local model) | Cloud-bound | Yes | Soniox feature |
+| **Cohere** | 14 | Encoder-decoder | 1.5 - 3.9 GB | Slow (CPU) | Yes | ONNX |
+| **Soniox** (cloud) | 60+ | Cloud (WebSocket / REST) | n/a (no local model) | Cloud-bound | Yes | Built-in |
 | **OpenAI Realtime** (cloud) | Multilingual | Cloud (WebSocket) | n/a (no local model) | Cloud-bound | Yes | openai-realtime feature |
 
-**Soniox** is different from the others — it's a paid cloud service over WebSocket / REST. No local model, no GPU. Sub-second partial latency. Strong for non-English languages where local Whisper-based engines struggle on lower-end hardware. Requires `cargo build --features soniox` and a `SONIOX_API_KEY`. See [SONIOX.md](SONIOX.md) for the full story.
+**Soniox** is different from the others — it's a paid cloud service over WebSocket / REST. No local model, no GPU. Sub-second partial latency. Strong for non-English languages where local Whisper-based engines struggle on lower-end hardware. Ships in every release binary; you only need a `SONIOX_API_KEY`. See [SONIOX.md](SONIOX.md) for the full story.
 
 **OpenAI Realtime** is likewise a paid cloud service, over WebSocket only (no separate REST batch endpoint). No local model, no GPU. Server-side VAD gives progressive per-utterance finals while dictating. Requires `cargo build --features openai-realtime` and an `OPENAI_API_KEY`. See [OPENAI_REALTIME.md](OPENAI_REALTIME.md) for the full story.
 
@@ -46,7 +47,7 @@ What language(s) do you speak?
 │   └─ Chinese dialects?                 → Dolphin
 │
 ├─ Japanese or Korean
-│   ├─ Want a small, fast model?         → Moonshine (tiny-ja/tiny-ko) or SenseVoice
+│   ├─ Want a small, fast model?         → Moonshine (base-ja/tiny-ko) or SenseVoice
 │   └─ Want best quality?                → Whisper large-v3-turbo or SenseVoice
 │
 ├─ European languages (German, French, Spanish, etc.)
@@ -232,8 +233,6 @@ Encoder-decoder transformer optimized for edge devices. Processes variable-lengt
 | tiny | 100 MB | English | MIT |
 | base-ja | 237 MB | Japanese | Community (non-commercial) |
 | base-zh | 237 MB | Chinese | Community (non-commercial) |
-| tiny-ja | 100 MB | Japanese | Community (non-commercial) |
-| tiny-zh | 100 MB | Chinese | Community (non-commercial) |
 | tiny-ko | 100 MB | Korean | Community (non-commercial) |
 | tiny-ar | 100 MB | Arabic | Community (non-commercial) |
 
@@ -412,6 +411,47 @@ model = "omnilingual-large"
 - Character-level output (no word boundaries for many languages)
 - No built-in punctuation
 - Accuracy varies by language; less accurate than specialized models for common languages
+- Requires ONNX binary
+
+---
+
+### 8. Cohere
+
+Cohere's encoder-decoder ASR model. The largest local option here, and the only one whose decoder currently runs on CPU even when the encoder is on a GPU.
+
+**Languages:** 14 — `ar`, `de`, `en`, `es`, `fr`, `hi`, `it`, `ja`, `ko`, `nl`, `pt`, `ru`, `tr`, `zh`.
+
+**Available models:**
+
+| Model | Size | Description |
+|-------|------|-------------|
+| cohere-transcribe-q4f16 | 1.5 GB | q4 weights, fp16 activations. Smallest, GPU-friendly |
+| cohere-transcribe-q4 | 2.0 GB | 4-bit weights. MIGraphX-compatible on AMD |
+| cohere-transcribe-int8 | 2.9 GB | 8-bit weights |
+| cohere-transcribe-fp16 | 3.9 GB | FP16 weights. Highest accuracy, GPU-friendly |
+
+**Config example:**
+
+```toml
+engine = "cohere"
+
+[cohere]
+model = "cohere-transcribe-int8"
+language = "en"
+# threads = 4
+```
+
+Unsupported language codes are rejected at startup with a clear error rather than silently transcribing as English.
+
+**Pros:**
+- Strong accuracy across its 14 languages
+- Punctuation without a post-processing step
+- Four quantizations, so it fits from 1.5 GB up
+
+**Cons:**
+- Largest local models here
+- Slow on CPU; wants a GPU to be comfortable
+- On CUDA the encoder runs on the GPU but the decoder stays on CPU, pending an ONNX Runtime kernel gap
 - Requires ONNX binary
 
 ---

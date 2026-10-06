@@ -77,6 +77,21 @@ const RENDER_TICK_MS: u32 = 16;
 /// hiding the surface. Matches the BRIEF's "Idle: surface destroyed" rule.
 const IDLE_TIMEOUT_SECS: f32 = 0.15;
 
+/// True while the daemon has marked the in-flight recording as OSD-suppressed
+/// (`voxtype record start --no-osd`).
+///
+/// Frames stop flowing for a suppressed recording too, so the idle timeout
+/// alone would hide the surface. This is checked anyway so suppression is
+/// immediate rather than waiting out IDLE_TIMEOUT_SECS, and so the behaviour
+/// matches the Quickshell frontend exactly.
+fn osd_suppressed() -> bool {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+    std::path::Path::new(&base)
+        .join("voxtype/osd_suppressed")
+        .exists()
+}
+
 /// Number of segments in the vertical peak meter.
 const METER_SEGMENTS: usize = 10;
 
@@ -151,6 +166,17 @@ impl SharedState {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Keep GDK off the Wayland linux-dmabuf path. GTK4's dmabuf-feedback
+    // handling corrupts its own heap under long-running sessions (GPtrArray
+    // refcount garbage inside the feedback listener), which SIGSEGVs this
+    // process every few minutes-to-hours on AMD iGPUs (#656). The OSD is a
+    // small overlay; shared-memory buffers cost nothing here. Respect an
+    // explicit GDK_DISABLE from the user (they may be working around
+    // something else, or testing the dmabuf path deliberately).
+    if std::env::var_os("GDK_DISABLE").is_none() {
+        std::env::set_var("GDK_DISABLE", "dmabuf");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -430,7 +456,7 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
             .lock()
             .map(|t| *t)
             .unwrap_or_else(|_| Instant::now() - Duration::from_secs(3600));
-        let idle = last_at.elapsed().as_secs_f32() > IDLE_TIMEOUT_SECS;
+        let idle = last_at.elapsed().as_secs_f32() > IDLE_TIMEOUT_SECS || osd_suppressed();
 
         if idle {
             if visible.get() {
@@ -527,20 +553,42 @@ fn draw(
     let gap = (w * 0.01).max(2.0);
     let wave_width = (w - meter_width - gap).max(0.0);
 
-    draw_waveform(cr, 0.0, 0.0, wave_width, h, palette, state, gain);
-    draw_peak_meter(cr, wave_width + gap, 0.0, meter_width, h, palette, state);
+    draw_waveform(
+        cr,
+        &Rect {
+            x: 0.0,
+            y: 0.0,
+            w: wave_width,
+            h,
+        },
+        palette,
+        state,
+        gain,
+    );
+    draw_peak_meter(
+        cr,
+        &Rect {
+            x: wave_width + gap,
+            y: 0.0,
+            w: meter_width,
+            h,
+        },
+        palette,
+        state,
+    );
 }
 
-fn draw_waveform(
-    cr: &Context,
+/// Pixel-space rectangle for the draw helpers, so geometry travels as one
+/// argument instead of four loose floats.
+struct Rect {
     x: f64,
     y: f64,
     w: f64,
     h: f64,
-    palette: &Palette,
-    state: &Arc<SharedState>,
-    gain: f64,
-) {
+}
+
+fn draw_waveform(cr: &Context, r: &Rect, palette: &Palette, state: &Arc<SharedState>, gain: f64) {
+    let Rect { x, y, w, h } = *r;
     if w < 1.0 {
         return;
     }
@@ -607,15 +655,8 @@ fn sample_to_pixels(sample: f32, half_height: f64, gain: f64) -> f64 {
     s * half_height
 }
 
-fn draw_peak_meter(
-    cr: &Context,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    palette: &Palette,
-    state: &Arc<SharedState>,
-) {
+fn draw_peak_meter(cr: &Context, r: &Rect, palette: &Palette, state: &Arc<SharedState>) {
+    let Rect { x, y, w, h } = *r;
     if w < 1.0 || h < 1.0 {
         return;
     }

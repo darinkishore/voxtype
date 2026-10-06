@@ -66,11 +66,98 @@ fn variant_subdir(basename: &str) -> Option<&'static str> {
 /// they ran — e.g. `setup gpu --enable` for a Vulkan switch, or `setup onnx
 /// --enable` for a Parakeet switch. The function emits the full retry as
 /// `Try: sudo voxtype <retry_hint>`.
+/// Highest `GLIBC_x.y` version named in a dynamic-linker failure, if any.
+///
+/// The loader prints one line per unmet symbol version, so the largest is the
+/// one the user actually needs.
+fn required_glibc_from_stderr(stderr: &str) -> Option<String> {
+    let mut best: Option<(u32, u32, String)> = None;
+    for token in stderr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_')) {
+        let Some(rest) = token.strip_prefix("GLIBC_") else {
+            continue;
+        };
+        let mut parts = rest.split('.');
+        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(bm, bn, _)| (major, minor) > (*bm, *bn))
+        {
+            best = Some((major, minor, rest.to_string()));
+        }
+    }
+    best.map(|(_, _, v)| v)
+}
+
+/// Verify a variant can actually execute here before pointing the active
+/// binary at it.
+///
+/// A packaged variant can be present and still unrunnable: the ONNX variants
+/// are built against glibc 2.39 while the Whisper ones need 2.34, so on
+/// Debian 12 (2.36) switching to an ONNX variant used to report success and
+/// leave the CLI bricked with a raw linker error. That includes
+/// `setup variant --to` itself, so the user could not switch back with the
+/// tool that broke it. See #633.
+fn verify_binary_runs(binary_path: &Path) -> anyhow::Result<()> {
+    let output = match std::process::Command::new(binary_path)
+        .arg("--version")
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => anyhow::bail!(
+            "Cannot run {}: {}\n\
+             Leaving the current binary active.",
+            binary_path.display(),
+            e
+        ),
+    };
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(needed) = required_glibc_from_stderr(&stderr) {
+        anyhow::bail!(
+            "{} needs glibc {} but this system is older, so it cannot run here.\n\
+             Leaving the current binary active.\n\
+             \n\
+             The ONNX variants are built on a newer base image than the Whisper\n\
+             ones. Use a Whisper variant, or upgrade the distribution.",
+            binary_path.display(),
+            needed
+        );
+    }
+
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no error output");
+    anyhow::bail!(
+        "{} exited {} when asked for its version, so it cannot run here.\n\
+         Leaving the current binary active.\n\
+         \n\
+         {}",
+        binary_path.display(),
+        output.status.code().unwrap_or(-1),
+        detail
+    );
+}
+
 pub fn install_active_binary(
     active_bin: &str,
     binary_path: &Path,
     retry_hint: &str,
 ) -> anyhow::Result<()> {
+    // Refuse to activate a binary that cannot run here. Checked before any
+    // write so a failure leaves the previous target in place (#633).
+    verify_binary_runs(binary_path)?;
+
     // Decide whether this variant needs a wrapper script (vs a plain symlink)
     // from the BASENAME, not from the canonicalized parent dir. The previous
     // implementation looked at `fs::canonicalize(binary_path).parent()`,
@@ -198,6 +285,9 @@ pub enum EngineFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Acceleration {
+    /// Runs on any x86-64-v2 CPU. The floor variant, for machines without
+    /// AVX2 where every other x86_64 binary SIGILLs (#612).
+    Baseline,
     Avx2,
     Avx512,
     Vulkan,
@@ -215,6 +305,8 @@ pub enum Acceleration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Variant {
+    /// Whisper built for x86-64-v2, no AVX2. See Dockerfile.baseline.
+    WhisperBaseline,
     WhisperAvx2,
     WhisperAvx512,
     WhisperVulkan,
@@ -247,10 +339,12 @@ impl Variant {
         Variant::OnnxCuda13,
         Variant::OnnxMigraphx,
         Variant::OnnxNative,
+        Variant::WhisperBaseline,
     ];
 
     pub const fn binary_name(self) -> &'static str {
         match self {
+            Variant::WhisperBaseline => "voxtype-baseline",
             Variant::WhisperAvx2 => "voxtype-avx2",
             Variant::WhisperAvx512 => "voxtype-avx512",
             Variant::WhisperVulkan => "voxtype-vulkan",
@@ -267,7 +361,8 @@ impl Variant {
 
     pub const fn family(self) -> EngineFamily {
         match self {
-            Variant::WhisperAvx2
+            Variant::WhisperBaseline
+            | Variant::WhisperAvx2
             | Variant::WhisperAvx512
             | Variant::WhisperVulkan
             | Variant::WhisperNative => EngineFamily::Whisper,
@@ -283,6 +378,7 @@ impl Variant {
 
     pub const fn acceleration(self) -> Acceleration {
         match self {
+            Variant::WhisperBaseline => Acceleration::Baseline,
             Variant::WhisperAvx2 | Variant::OnnxAvx2 => Acceleration::Avx2,
             Variant::WhisperAvx512 | Variant::OnnxAvx512 => Acceleration::Avx512,
             Variant::WhisperVulkan => Acceleration::Vulkan,
@@ -294,6 +390,7 @@ impl Variant {
 
     pub const fn display(self) -> &'static str {
         match self {
+            Variant::WhisperBaseline => "Whisper (baseline x86-64-v2)",
             Variant::WhisperAvx2 => "Whisper (AVX2)",
             Variant::WhisperAvx512 => "Whisper (AVX-512)",
             Variant::WhisperVulkan => "Whisper (Vulkan)",
@@ -311,7 +408,8 @@ impl Variant {
     /// True if this variant's binary was compiled with the feature for the
     /// given engine. Whisper variants only support `whisper`; ONNX variants
     /// support every ONNX-based engine the project ships (parakeet,
-    /// moonshine, sensevoice, paraformer, dolphin, omnilingual, cohere).
+    /// moonshine, sensevoice, paraformer, dolphin, omnilingual, cohere,
+    /// OpenVINO).
     pub const fn supports_engine(self, engine: &str) -> bool {
         match self.family() {
             EngineFamily::Whisper => matches_str(engine, "whisper"),
@@ -323,6 +421,7 @@ impl Variant {
                     || matches_str(engine, "dolphin")
                     || matches_str(engine, "omnilingual")
                     || matches_str(engine, "cohere")
+                    || matches_str(engine, "openvino")
             }
         }
     }
@@ -331,6 +430,7 @@ impl Variant {
     /// names from before the ONNX rename.
     pub fn from_binary_name(name: &str) -> Option<Self> {
         match name {
+            "voxtype-baseline" => Some(Variant::WhisperBaseline),
             "voxtype-avx2" => Some(Variant::WhisperAvx2),
             "voxtype-avx512" => Some(Variant::WhisperAvx512),
             "voxtype-vulkan" => Some(Variant::WhisperVulkan),
@@ -478,7 +578,16 @@ pub struct Inventory {
     pub install_kind: InstallKind,
     pub binary_path: PathBuf,
     pub package_lib_dir: Option<PathBuf>,
+    /// What `/usr/bin/voxtype` would launch next. Not necessarily what is
+    /// running: see `running_variant`.
     pub active_variant: Option<Variant>,
+    /// What the live daemon is actually executing, when one is running and
+    /// `/proc` is readable. Differs from `active_variant` after a variant
+    /// switch that has not been followed by a restart, or when something other
+    /// than `/usr/bin/voxtype` launched the daemon.
+    pub running_variant: Option<Variant>,
+    /// PID of the live daemon `running_variant` was read from.
+    pub daemon_pid: Option<i32>,
     /// Empty for `InstallKind::Source`.
     pub variants: Vec<VariantStatus>,
     pub cpu: Cpu,
@@ -638,6 +747,31 @@ pub fn detect_install_kind(binary_path: &Path) -> InstallKind {
 /// Read the `/usr/bin/voxtype` symlink to learn which packaged variant is
 /// active. Returns `None` for source installs, missing symlinks, or unknown
 /// targets.
+/// Path of the binary a live process is actually executing.
+///
+/// `None` when `/proc/<pid>/exe` cannot be read: another user's process, or a
+/// platform without `/proc`.
+pub fn running_binary_path(pid: i32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{}/exe", pid)).ok()
+}
+
+/// The packaged variant a live process is actually executing.
+///
+/// This is the honest answer to "which backend is in use". `active_variant`
+/// resolves `/usr/bin/voxtype`, which describes the *next* process to start:
+/// a daemon launched before a variant switch keeps running the old binary, and
+/// a systemd drop-in or a `/usr/local/bin` shadow can point somewhere else
+/// entirely. Reporting the symlink as "active" in either case states the
+/// opposite of what is running.
+///
+/// `None` when `/proc` is unreadable, or when the running binary is not a
+/// packaged variant (a source build, for instance).
+pub fn running_variant(pid: i32) -> Option<Variant> {
+    let path = running_binary_path(pid)?;
+    let name = path.file_name()?.to_str()?;
+    Variant::from_binary_name(name)
+}
+
 pub fn active_variant() -> Option<Variant> {
     // Handle both shapes /usr/bin/voxtype can take: a symlink (CPU
     // variants) or a wrapper script (GPU/ONNX variants whose binary
@@ -661,6 +795,9 @@ pub fn enumerate_installed() -> Vec<Variant> {
 
 fn variant_runs_on_cpu(v: Variant, cpu: &Cpu) -> bool {
     match v.acceleration() {
+        // The floor variant: it exists precisely so there is something to run
+        // when nothing else will, so it never disqualifies itself.
+        Acceleration::Baseline => true,
         Acceleration::Avx512 => cpu.avx512,
         // ONNX GPU binaries bundle an ONNX Runtime built with AVX-512.
         // Runtime CPU dispatch in ORT mostly handles fallback, but the
@@ -720,6 +857,9 @@ pub fn compiled_features() -> Vec<&'static str> {
     if cfg!(feature = "openai-realtime") {
         f.push("openai-realtime");
     }
+    if cfg!(feature = "openvino-whisper") {
+        f.push("openvino");
+    }
     // Meeting-mode capability: ML-based speaker diarization (ECAPA-TDNN).
     // When absent, meeting mode falls back to source-based attribution.
     if cfg!(feature = "ml-diarization") {
@@ -756,6 +896,8 @@ pub fn inventory() -> Inventory {
     let binary_path = current_binary_path();
     let install_kind = detect_install_kind(&binary_path);
     let active = active_variant();
+    let daemon_pid = crate::daemon_status::read_pid_if_alive();
+    let running = daemon_pid.and_then(running_variant);
 
     let variants = if install_kind == InstallKind::Package {
         Variant::ALL
@@ -786,6 +928,8 @@ pub fn inventory() -> Inventory {
         binary_path,
         package_lib_dir,
         active_variant: active,
+        running_variant: running,
+        daemon_pid,
         variants,
         cpu,
         gpus,
@@ -873,7 +1017,7 @@ mod tests {
             .iter()
             .filter(|v| v.family() == EngineFamily::Onnx)
             .count();
-        assert_eq!(whisper, 4);
+        assert_eq!(whisper, 5);
         assert_eq!(onnx, 7);
         assert_eq!(whisper + onnx, Variant::ALL.len());
     }
@@ -885,6 +1029,14 @@ mod tests {
             avx512: false,
         };
         assert!(variant_runs_on_cpu(Variant::WhisperAvx2, &no_avx512));
+        // The floor variant exists to run when nothing else will, so it must
+        // never gate itself out (#612).
+        let pre_haswell = Cpu {
+            avx2: false,
+            avx512: false,
+        };
+        assert!(variant_runs_on_cpu(Variant::WhisperBaseline, &pre_haswell));
+        assert!(!variant_runs_on_cpu(Variant::WhisperAvx2, &pre_haswell));
         assert!(!variant_runs_on_cpu(Variant::WhisperAvx512, &no_avx512));
         assert!(!variant_runs_on_cpu(Variant::OnnxCuda, &no_avx512));
         assert!(variant_runs_on_cpu(Variant::WhisperVulkan, &no_avx512));
@@ -1023,6 +1175,13 @@ mod tests {
         let _ = inv.recommendation;
     }
 
+    #[test]
+    fn packaged_onnx_variants_include_openvino_engine() {
+        assert!(Variant::OnnxAvx2.supports_engine("openvino"));
+        assert!(Variant::OnnxAvx512.supports_engine("openvino"));
+        assert!(!Variant::WhisperAvx2.supports_engine("openvino"));
+    }
+
     /// Regression test for #383: `compiled_features()` previously omitted
     /// the six ONNX engines and `ml-diarization`. The bug was visible to
     /// users in `voxtype info variants` and the TUI inventory panes, and
@@ -1056,6 +1215,9 @@ mod tests {
         require_feature_listed!("dolphin");
         require_feature_listed!("omnilingual");
         require_feature_listed!("cohere");
+        if cfg!(feature = "openvino-whisper") {
+            assert!(f.contains(&"openvino"));
+        }
         require_feature_listed!("ml-diarization");
         require_feature_listed!("gpu-vulkan");
         require_feature_listed!("gpu-cuda");
@@ -1064,6 +1226,66 @@ mod tests {
         require_feature_listed!("osd-native");
         require_feature_listed!("osd-gtk4");
         require_feature_listed!("openai-realtime");
+    }
+
+    /// #633: the loader names every unmet symbol version; the highest is the
+    /// one the user actually needs, and that is what the error should quote.
+    #[test]
+    fn required_glibc_picks_the_highest_version() {
+        let stderr = "voxtype: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by voxtype)\n\
+                      voxtype: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by voxtype)\n";
+        assert_eq!(required_glibc_from_stderr(stderr).as_deref(), Some("2.39"));
+    }
+
+    #[test]
+    fn required_glibc_compares_numerically_not_lexically() {
+        // 2.9 must not beat 2.34 the way string ordering would.
+        let stderr = "version `GLIBC_2.9' not found\nversion `GLIBC_2.34' not found\n";
+        assert_eq!(required_glibc_from_stderr(stderr).as_deref(), Some("2.34"));
+    }
+
+    #[test]
+    fn required_glibc_absent_for_unrelated_failures() {
+        assert_eq!(required_glibc_from_stderr("Segmentation fault"), None);
+        assert_eq!(required_glibc_from_stderr(""), None);
+    }
+
+    /// A binary that cannot execute must be refused, and the refusal must say
+    /// the current binary is untouched — the old behaviour reported success
+    /// and left the CLI unusable.
+    #[test]
+    fn verify_binary_runs_rejects_a_non_executable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("voxtype-broken");
+        std::fs::write(&path, b"not a binary").unwrap();
+        let err = verify_binary_runs(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("Leaving the current binary active"),
+            "refusal must state the active binary is unchanged, got: {err}"
+        );
+    }
+
+    /// The happy path must stay cheap and quiet: anything that runs and exits
+    /// zero is accepted.
+    ///
+    /// The probe target is written here rather than borrowed from the system
+    /// (`/bin/true` and friends): the Nix build sandbox has almost no
+    /// filesystem, and a test that assumes one fails there for reasons that
+    /// have nothing to do with the code under test. The script ignores its
+    /// arguments, so it works under any `/bin/sh`, dash included.
+    #[test]
+    fn verify_binary_runs_accepts_a_working_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("voxtype-fake");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            verify_binary_runs(&path).is_ok(),
+            "a binary that exits zero must be accepted"
+        );
     }
 
     /// Regression test for #443: when `install_active_binary` is called
@@ -1148,5 +1370,40 @@ mod tests {
         assert_eq!(variant_subdir("voxtype-avx2"), None);
         assert_eq!(variant_subdir("voxtype-vulkan"), None);
         assert_eq!(variant_subdir(""), None);
+    }
+
+    #[test]
+    fn running_variant_reads_the_live_process_not_the_symlink() {
+        // Our own pid: /proc/self/exe is the test harness, which is not a
+        // packaged variant, so this must be None rather than falling back to
+        // whatever /usr/bin/voxtype happens to point at.
+        let me = std::process::id() as i32;
+        assert!(
+            running_binary_path(me).is_some(),
+            "/proc should be readable"
+        );
+        assert_eq!(running_variant(me), None);
+    }
+
+    #[test]
+    fn running_variant_is_none_for_a_dead_pid() {
+        // Reserved-but-unused pid space: no /proc entry, so no answer. The
+        // point is that it declines rather than guessing from the symlink.
+        assert_eq!(running_binary_path(-1), None);
+        assert_eq!(running_variant(-1), None);
+    }
+
+    #[test]
+    fn variant_names_round_trip_through_from_binary_name() {
+        // running_variant maps a /proc basename back to a Variant, so every
+        // variant's own binary name has to resolve.
+        for v in Variant::ALL {
+            assert_eq!(
+                Variant::from_binary_name(v.binary_name()),
+                Some(*v),
+                "{} did not round-trip",
+                v.binary_name()
+            );
+        }
     }
 }

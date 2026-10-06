@@ -61,7 +61,7 @@ Older distros (Ubuntu 22.04, Debian Bookworm, Fedora 39) can [build from source]
 | `ydotool` | Fallback (X11/TTY) | Requires a daemon |
 | `wl-clipboard` | Recommended | Clipboard fallback |
 | `libnotify` | Optional | Desktop notifications |
-| `playerctl` | Optional | Pause MPRIS players while recording |
+| `playerctl` | Not needed | Media pausing talks D-Bus directly since v1.0.0; earlier versions shelled out to it |
 | `gtk4-layer-shell` | Optional | Runtime for the GTK4 OSD visualizer |
 
 > **PipeWire users:** install `pipewire-alsa` so ALSA-based apps like Voxtype can capture audio. Without it you get "device not available" errors.
@@ -85,9 +85,9 @@ For the GTK4 OSD frontend, additionally install `gtk4` + `gtk4-layer-shell`.
 Pick your distro from the list below. The fastest path on each:
 
 - **Arch:** `paru -S voxtype-bin`
-- **Debian/Ubuntu:** `sudo apt install ./voxtype_0.7.5-1_amd64.deb`
-- **Fedora:** `sudo dnf install ./voxtype-0.7.5-1.x86_64.rpm`
-- **macOS:** `brew install --cask voxtype`
+- **Debian/Ubuntu:** `sudo apt install ./voxtype_1.0.1-1_amd64.deb`
+- **Fedora:** `sudo dnf install ./voxtype-1.0.1-1.x86_64.rpm`
+- **macOS:** `brew install --cask peteonrails/voxtype/voxtype`
 - **NixOS:** `nix profile install github:peteonrails/voxtype#vulkan`
 - **AppImage:** download, `chmod +x`, run.
 
@@ -143,44 +143,45 @@ The post-install hook auto-picks the right CUDA variant (`cuda-12` vs `cuda-13`)
 Requires Ubuntu 24.04+ or Debian Trixie+ (glibc 2.39+). Older versions: [build from source](#build-from-source).
 
 ```bash
-wget https://github.com/peteonrails/voxtype/releases/download/v0.7.5/voxtype_0.7.5-1_amd64.deb
-sudo apt install ./voxtype_0.7.5-1_amd64.deb
+wget https://github.com/peteonrails/voxtype/releases/download/v1.0.1/voxtype_1.0.1-1_amd64.deb
+sudo apt install ./voxtype_1.0.1-1_amd64.deb
 ```
 
 Recommended optional packages:
 
 ```bash
-sudo apt install wtype wl-clipboard libnotify-bin playerctl pipewire-alsa
+sudo apt install wtype wl-clipboard libnotify-bin pipewire-alsa
 ```
 
-The .deb ships every Linux binary variant (avx2, avx512, vulkan, plus ONNX CPU/CUDA/MIGraphX) under `/usr/lib/voxtype/`. Run `sudo voxtype setup gpu --enable` after install to pick a GPU binary.
+The .deb ships every Linux binary variant (baseline for pre-AVX2 CPUs, avx2, avx512, vulkan, plus ONNX CPU/CUDA/MIGraphX) under `/usr/lib/voxtype/`. Run `sudo voxtype setup gpu --enable` after install to pick a GPU binary.
 
 ### Fedora / RHEL
 
 Requires Fedora 40+ (glibc 2.39+).
 
 ```bash
-wget https://github.com/peteonrails/voxtype/releases/download/v0.7.5/voxtype-0.7.5-1.x86_64.rpm
-sudo dnf install ./voxtype-0.7.5-1.x86_64.rpm
+wget https://github.com/peteonrails/voxtype/releases/download/v1.0.1/voxtype-1.0.1-1.x86_64.rpm
+sudo dnf install ./voxtype-1.0.1-1.x86_64.rpm
 ```
 
 Recommended optional packages:
 
 ```bash
-sudo dnf install wtype wl-clipboard libnotify playerctl pipewire-alsa
+sudo dnf install wtype wl-clipboard libnotify pipewire-alsa
 ```
 
 Fedora's ydotool ships as a system service that needs extra setup. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#ydotool-daemon-not-running) if you need ydotool specifically; otherwise `wtype` (Wayland) or `dotool` (KDE/GNOME Wayland) is the better default.
 
 ### macOS
 
-Apple Silicon only. Uses Microsoft ONNX Runtime so every engine is available, including Parakeet on the Neural Engine path.
+Universal binary: Apple Silicon and Intel. Uses Microsoft ONNX Runtime so every engine is available, including Parakeet on the Neural Engine path.
 
 ```bash
-brew install --cask voxtype
+brew install --cask peteonrails/voxtype/voxtype
+voxtype configure
 ```
 
-Or download `voxtype-0.7.5-macOS-arm64.dmg` from the [latest release](https://github.com/peteonrails/voxtype/releases/latest). First launch opens a setup wizard that walks you through accessibility permissions, model download, and the FN-key hotkey.
+Or download `voxtype-1.0.1-macos-universal.dmg` from the [latest release](https://github.com/peteonrails/voxtype/releases/latest). First launch opens a setup wizard that walks you through accessibility permissions, model download, and the FN-key hotkey.
 
 ### NixOS
 
@@ -188,13 +189,13 @@ A flake ships every variant:
 
 ```bash
 # Imperative install
-nix profile install github:peteonrails/voxtype/v0.7.5#vulkan
+nix profile install github:peteonrails/voxtype/v1.0.1#vulkan
 
 # Available outputs: default, vulkan, cuda, rocm, osdGtk4, osdNative
-nix build github:peteonrails/voxtype/v0.7.5#osdGtk4
+nix build github:peteonrails/voxtype/v1.0.1#osdGtk4
 
 # Or pin in your flake inputs
-inputs.voxtype.url = "github:peteonrails/voxtype/v0.7.5";
+inputs.voxtype.url = "github:peteonrails/voxtype/v1.0.1";
 ```
 
 ### Linux arm64 (aarch64) — manual install

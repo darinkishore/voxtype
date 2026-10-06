@@ -134,6 +134,10 @@ mod tests {
             binary_path: "/usr/bin/voxtype".into(),
             package_lib_dir: Some("/usr/lib/voxtype".into()),
             active_variant: Some(active_variant),
+            // This fixture drives the variant-mismatch banner, which reads the
+            // symlink's variant; the running-daemon fields are not part of it.
+            running_variant: None,
+            daemon_pid: None,
             variants: vec![],
             cpu: Cpu {
                 avx2: true,

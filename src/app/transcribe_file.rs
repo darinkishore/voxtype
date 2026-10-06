@@ -50,7 +50,7 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow
     // Resample to 16kHz if needed
     let final_samples = if spec.sample_rate != 16000 {
         println!("Resampling from {} Hz to 16000 Hz...", spec.sample_rate);
-        resample(&mono_samples, spec.sample_rate, 16000)
+        voxtype::audio::resampler::resample_buffer(&mono_samples, spec.sample_rate, 16000)
     } else {
         mono_samples
     };
@@ -86,33 +86,38 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow
     let transcriber = transcribe::create_transcriber(config)?;
     let text = transcriber.transcribe(&final_samples)?;
 
-    println!("\n{}", text);
+    println!("\n{}", process_transcript(config, &text));
     Ok(())
 }
 
-/// Simple linear resampling
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
-        return samples.to_vec();
+/// Apply the configured text pipeline (replacements, spoken punctuation,
+/// filler filtering) to the finished transcript — the same treatment the
+/// daemon gives a batch dictation before output. `voxtype transcribe`
+/// shipped without this, so a config that worked for dictation silently
+/// did nothing here (#581).
+fn process_transcript(config: &config::Config, text: &str) -> String {
+    voxtype::text::TextProcessor::new_for_language(&config.text, config.active_language())
+        .process(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #581: `voxtype transcribe <file>` must honor [text] replacements and
+    /// spoken punctuation like the daemon does.
+    #[test]
+    fn transcript_gets_replacements_and_spoken_punctuation() {
+        let mut config = config::Config::default();
+        config
+            .text
+            .replacements
+            .insert("vox type".to_string(), "voxtype".to_string());
+        config.text.spoken_punctuation = true;
+
+        assert_eq!(
+            process_transcript(&config, "I use vox type period"),
+            "I use voxtype."
+        );
     }
-
-    let ratio = to_rate as f64 / from_rate as f64;
-    let new_len = (samples.len() as f64 * ratio).ceil() as usize;
-    let mut output = Vec::with_capacity(new_len);
-
-    for i in 0..new_len {
-        let src_idx = i as f64 / ratio;
-        let idx = src_idx.floor() as usize;
-        let frac = (src_idx - idx as f64) as f32;
-
-        let sample = if idx + 1 < samples.len() {
-            samples[idx] * (1.0 - frac) + samples[idx + 1] * frac
-        } else {
-            samples.get(idx).copied().unwrap_or(0.0)
-        };
-
-        output.push(sample);
-    }
-
-    output
 }

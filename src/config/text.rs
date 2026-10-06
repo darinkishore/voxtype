@@ -49,7 +49,7 @@ impl Default for TextConfig {
 /// Default filler-word list. Conservative: single-syllable disfluencies only.
 /// Multi-word phrases like "you know" or "sort of" are too aggressive for a
 /// default and can be added via the `filler_words` config.
-fn default_filler_words() -> Vec<String> {
+pub(crate) fn default_filler_words() -> Vec<String> {
     vec![
         "uh".to_string(),
         "um".to_string(),

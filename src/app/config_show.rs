@@ -4,6 +4,26 @@
 use std::path::PathBuf;
 use voxtype::{config, setup};
 
+/// Print the models of `engine` that are installed and usable.
+///
+/// Goes through the same installed-model detection as `voxtype info models`
+/// and the TUI picker. The three hand-rolled directory probes this replaced
+/// each matched a different hardcoded set of fp32 filenames, so quantized
+/// models were invisible here: an installed `parakeet-tdt-0.6b-v3-int8` ships
+/// `encoder-model.int8.onnx`, which the parakeet probe's
+/// `encoder-model.onnx` test never matched.
+///
+/// Names printed are the values the matching `model` config field takes, so
+/// they can be copied straight into `voxtype config set <engine>.model`.
+fn print_available_models(engine: &str) {
+    let installed = voxtype::model_catalog::installed_models_for(engine);
+    if installed.is_empty() {
+        println!("  available models: (none found)");
+    } else {
+        println!("  available models: {}", installed.join(", "));
+    }
+}
+
 /// Format the `[meeting]` config sections for display in `voxtype config`.
 ///
 /// Extracted so the regression test `config_displays_meeting_section`
@@ -103,31 +123,7 @@ pub(crate) async fn show_config(config: &config::Config) -> anyhow::Result<()> {
         println!("  (not configured)");
     }
 
-    // Check for available Parakeet models
-    let models_dir = config::Config::models_dir();
-    let mut parakeet_models: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&models_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.contains("parakeet") {
-                    // Check if it has the required ONNX files
-                    let has_encoder = path.join("encoder-model.onnx").exists();
-                    let has_decoder = path.join("decoder_joint-model.onnx").exists()
-                        || path.join("model.onnx").exists();
-                    if has_encoder || has_decoder {
-                        parakeet_models.push(name);
-                    }
-                }
-            }
-        }
-    }
-    if parakeet_models.is_empty() {
-        println!("  available models: (none found)");
-    } else {
-        println!("  available models: {}", parakeet_models.join(", "));
-    }
+    print_available_models("parakeet");
 
     // Show Moonshine status (experimental)
     println!("\n[moonshine] (EXPERIMENTAL)");
@@ -145,30 +141,7 @@ pub(crate) async fn show_config(config: &config::Config) -> anyhow::Result<()> {
         println!("  (not configured)");
     }
 
-    // Check for available Moonshine models
-    let mut moonshine_models: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&models_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.contains("moonshine") {
-                    let has_encoder = path.join("encoder_model.onnx").exists()
-                        || path.join("encoder_model_quantized.onnx").exists();
-                    let has_decoder = path.join("decoder_model_merged.onnx").exists()
-                        || path.join("decoder_model_merged_quantized.onnx").exists();
-                    if has_encoder || has_decoder {
-                        moonshine_models.push(name);
-                    }
-                }
-            }
-        }
-    }
-    if moonshine_models.is_empty() {
-        println!("  available models: (none found)");
-    } else {
-        println!("  available models: {}", moonshine_models.join(", "));
-    }
+    print_available_models("moonshine");
 
     // Show SenseVoice status (experimental)
     println!("\n[sensevoice] (EXPERIMENTAL)");
@@ -187,29 +160,7 @@ pub(crate) async fn show_config(config: &config::Config) -> anyhow::Result<()> {
         println!("  (not configured)");
     }
 
-    // Check for available SenseVoice models
-    let mut sensevoice_models: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&models_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.contains("sensevoice") {
-                    let has_model =
-                        path.join("model.int8.onnx").exists() || path.join("model.onnx").exists();
-                    let has_tokens = path.join("tokens.txt").exists();
-                    if has_model && has_tokens {
-                        sensevoice_models.push(name);
-                    }
-                }
-            }
-        }
-    }
-    if sensevoice_models.is_empty() {
-        println!("  available models: (none found)");
-    } else {
-        println!("  available models: {}", sensevoice_models.join(", "));
-    }
+    print_available_models("sensevoice");
 
     println!("\n[output]");
     println!("  mode = {:?}", config.output.mode);

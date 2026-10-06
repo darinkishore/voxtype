@@ -83,9 +83,10 @@ impl ModelManager {
             return self.get_transcriber(None);
         }
 
-        // For remote backend, create transcriber with model override
+        // For remote backend, preserve configured remote_model unless the
+        // caller supplied an explicit runtime model override.
         if self.config.effective_mode() == WhisperMode::Remote {
-            return self.create_remote_transcriber(&model_name);
+            return self.create_remote_transcriber(model);
         }
 
         // For CLI backend, create transcriber each time (no caching needed)
@@ -102,14 +103,15 @@ impl ModelManager {
         self.get_or_load_cached(&model_name)
     }
 
-    /// Create a remote transcriber with model override
+    /// Create a remote transcriber with optional runtime model override
     fn create_remote_transcriber(
         &self,
-        model: &str,
+        model_override: Option<&str>,
     ) -> Result<Arc<dyn Transcriber>, TranscribeError> {
         let mut config = self.config.clone();
-        // Override remote_model with requested model
-        config.remote_model = Some(model.to_string());
+        if let Some(model) = model_override {
+            config.remote_model = Some(model.to_string());
+        }
         let transcriber = transcribe::remote::RemoteTranscriber::new(&config)?;
         Ok(Arc::new(transcriber))
     }
@@ -191,6 +193,19 @@ impl ModelManager {
     ///
     /// Call this periodically (e.g., every 60 seconds) to free memory
     /// from models that are no longer being actively used.
+    /// Drop every cached model, returning how many were released.
+    ///
+    /// Used after a transcription task panics: the engine may hold state the
+    /// panic left inconsistent, and reusing it risks compounding the fault.
+    /// Unlike `evict_idle_models` this ignores both the idle timeout and the
+    /// is_primary flag, because the point is to discard a suspect instance
+    /// rather than to reclaim memory (#643).
+    pub fn drop_loaded_models(&mut self) -> usize {
+        let count = self.loaded_models.len();
+        self.loaded_models.clear();
+        count
+    }
+
     pub fn evict_idle_models(&mut self) {
         if self.cold_timeout.is_zero() {
             return; // Auto-eviction disabled
@@ -310,8 +325,29 @@ impl ModelManager {
             return Ok(prepared.transcriber);
         }
 
-        // No prepared transcriber, get normally
-        self.get_transcriber(Some(&model_name))
+        // No prepared transcriber, get normally. Preserve None so remote mode
+        // can use whisper.remote_model instead of the local default model.
+        self.get_transcriber(model)
+    }
+
+    /// Register an already-constructed transcriber as a cached model, so
+    /// tests can exercise cache lifecycle paths without a real model file
+    /// on disk.
+    #[cfg(test)]
+    fn insert_loaded_model_for_test(
+        &mut self,
+        name: &str,
+        transcriber: Arc<dyn Transcriber>,
+        is_primary: bool,
+    ) {
+        self.loaded_models.insert(
+            name.to_string(),
+            LoadedModel {
+                transcriber,
+                last_used: Instant::now(),
+                is_primary,
+            },
+        );
     }
 
     /// Get the list of currently loaded models (for debugging/status)
@@ -328,6 +364,41 @@ impl ModelManager {
 mod tests {
     use super::*;
 
+    /// Stand-in engine for cache tests: cheap to construct, never touches
+    /// a model file.
+    struct StubTranscriber;
+
+    impl Transcriber for StubTranscriber {
+        fn transcribe(&self, _samples: &[f32]) -> Result<String, TranscribeError> {
+            Ok(String::new())
+        }
+    }
+
+    /// #643: after a panicked transcription the cached engine is suspect, so
+    /// it is dropped wholesale — including the primary, which normal idle
+    /// eviction deliberately keeps.
+    #[test]
+    fn drop_loaded_models_clears_everything_and_reports_the_count() {
+        let mut mm = ModelManager::new(&test_config(), None);
+        assert_eq!(mm.drop_loaded_models(), 0, "nothing cached yet");
+
+        mm.insert_loaded_model_for_test("base.en", Arc::new(StubTranscriber), true);
+        mm.insert_loaded_model_for_test("large-v3-turbo", Arc::new(StubTranscriber), false);
+        assert_eq!(mm.loaded_model_names().len(), 2);
+
+        assert_eq!(
+            mm.drop_loaded_models(),
+            2,
+            "the primary is dropped too, unlike idle eviction"
+        );
+        assert!(mm.loaded_models.is_empty());
+        assert!(mm.loaded_model_names().is_empty());
+    }
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::JoinHandle;
+
     fn test_config() -> WhisperConfig {
         WhisperConfig {
             mode: Some(WhisperMode::Local),
@@ -339,6 +410,54 @@ mod tests {
             cold_model_timeout_secs: 300,
             ..Default::default()
         }
+    }
+
+    fn spawn_remote_transcription_server() -> (String, Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            let mut header_end = None;
+            let mut content_length = None;
+
+            while header_end.is_none()
+                || request.len() < header_end.unwrap() + content_length.unwrap_or(0)
+            {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+
+                if header_end.is_none() {
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        header_end = Some(end);
+                    }
+                }
+            }
+
+            let body = header_end
+                .map(|end| String::from_utf8_lossy(&request[end..]).to_string())
+                .unwrap_or_default();
+            tx.send(body).unwrap();
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"text\":\"ok\"}";
+            stream.write_all(response).unwrap();
+        });
+
+        (endpoint, rx, handle)
     }
 
     #[test]
@@ -367,5 +486,26 @@ mod tests {
         assert_eq!(manager.max_loaded, 2);
         assert_eq!(manager.cold_timeout, Duration::from_secs(300));
         assert!(manager.loaded_models.is_empty());
+    }
+
+    #[test]
+    fn test_remote_prepared_transcriber_uses_remote_model_without_override() {
+        let (endpoint, body_rx, server) = spawn_remote_transcription_server();
+        let config = WhisperConfig {
+            mode: Some(WhisperMode::Remote),
+            model: "large-v3-turbo".to_string(),
+            remote_endpoint: Some(endpoint),
+            remote_model: Some("whisper-large-v3-turbo".to_string()),
+            ..Default::default()
+        };
+        let mut manager = ModelManager::new(&config, None);
+
+        let transcriber = manager.get_prepared_transcriber(None).unwrap();
+        assert_eq!(transcriber.transcribe(&[0.0; 160]).unwrap(), "ok");
+
+        let body = body_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(body.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"));
+        assert!(!body.contains("name=\"model\"\r\n\r\nlarge-v3-turbo\r\n"));
+        server.join().unwrap();
     }
 }

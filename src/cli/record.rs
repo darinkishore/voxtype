@@ -57,6 +57,14 @@ pub enum RecordAction {
         #[arg(long, conflicts_with = "shift_enter_newlines")]
         no_shift_enter_newlines: bool,
 
+        /// Suppress the on-screen display for this recording only
+        ///
+        /// Leaves `osd.enabled` in config.toml untouched. Intended for external
+        /// tools that draw their own dictation UI and do not want voxtype's
+        /// overlay on top of it.
+        #[arg(long)]
+        no_osd: bool,
+
         /// Enable smart auto-submit for this recording (say "submit" to press Enter)
         #[arg(long, conflicts_with = "no_smart_auto_submit")]
         smart_auto_submit: bool,
@@ -78,6 +86,30 @@ pub enum RecordAction {
         /// Override output mode to paste (clipboard + Ctrl+V)
         #[arg(long, group = "output_mode")]
         paste: bool,
+
+        /// Block until the transcription is final instead of returning as soon
+        /// as the daemon has been signalled
+        ///
+        /// Requires the recording to be writing to a file (started with
+        /// --file, or output.mode = "file"). Exit code reports the outcome:
+        /// 0 transcribed, 3 nothing to transcribe, 4 timed out, 1 failed.
+        #[arg(long)]
+        wait: bool,
+
+        /// With --wait, print one JSON object describing the outcome
+        #[arg(long, requires = "wait")]
+        json: bool,
+
+        /// With --wait, give up after this many seconds
+        #[arg(long, value_name = "SECS", default_value_t = 120, requires = "wait")]
+        timeout: u64,
+
+        /// With --wait, the transcript path to wait on
+        ///
+        /// Defaults to the path the pending recording is already writing to,
+        /// so a caller that passed --file to `record start` need not repeat it.
+        #[arg(long, value_name = "FILE", requires = "wait")]
+        wait_file: Option<String>,
     },
     /// Toggle recording state
     Toggle {
@@ -122,6 +154,14 @@ pub enum RecordAction {
         /// Disable Shift+Enter newlines for this transcription (overrides config)
         #[arg(long, conflicts_with = "shift_enter_newlines")]
         no_shift_enter_newlines: bool,
+
+        /// Suppress the on-screen display for this recording only
+        ///
+        /// Leaves `osd.enabled` in config.toml untouched. Intended for external
+        /// tools that draw their own dictation UI and do not want voxtype's
+        /// overlay on top of it.
+        #[arg(long)]
+        no_osd: bool,
 
         /// Enable smart auto-submit for this recording (say "submit" to press Enter)
         #[arg(long, conflicts_with = "no_smart_auto_submit")]
@@ -171,6 +211,7 @@ impl RecordAction {
                 type_mode,
                 clipboard,
                 paste,
+                ..
             } => (*type_mode, *clipboard, *paste, None),
             RecordAction::Cancel => return None,
         };
@@ -236,6 +277,18 @@ impl RecordAction {
                 ..
             } => override_from_flags(*auto_submit, *no_auto_submit),
             RecordAction::Stop { .. } | RecordAction::Cancel => None,
+        }
+    }
+
+    /// Get the OSD suppression request from --no-osd.
+    ///
+    /// Returns true only when the flag is present; there is deliberately no
+    /// `--osd` counterpart, because "show the OSD" is already the config
+    /// default and a per-recording opt-in has no caller.
+    pub fn suppress_osd(&self) -> bool {
+        match self {
+            RecordAction::Start { no_osd, .. } | RecordAction::Toggle { no_osd, .. } => *no_osd,
+            RecordAction::Stop { .. } | RecordAction::Cancel => false,
         }
     }
 
@@ -342,6 +395,93 @@ mod tests {
                 assert_eq!(
                     action.output_mode_override(),
                     Some(OutputModeOverride::Type)
+                );
+            }
+            _ => panic!("Expected Record command"),
+        }
+    }
+
+    #[test]
+    fn stop_defaults_to_not_waiting() {
+        let cli = Cli::parse_from(["voxtype", "record", "stop"]);
+        match cli.command {
+            Some(Commands::Record {
+                action:
+                    RecordAction::Stop {
+                        wait,
+                        json,
+                        wait_file,
+                        ..
+                    },
+            }) => {
+                assert!(!wait, "waiting must stay opt-in");
+                assert!(!json);
+                assert_eq!(wait_file, None);
+            }
+            _ => panic!("Expected Record Stop command"),
+        }
+    }
+
+    #[test]
+    fn stop_accepts_the_waiting_interface() {
+        let cli = Cli::parse_from([
+            "voxtype",
+            "record",
+            "stop",
+            "--wait",
+            "--json",
+            "--timeout",
+            "30",
+            "--wait-file",
+            "/tmp/dictation.txt",
+        ]);
+        match cli.command {
+            Some(Commands::Record {
+                action:
+                    RecordAction::Stop {
+                        wait,
+                        json,
+                        timeout,
+                        wait_file,
+                        ..
+                    },
+            }) => {
+                assert!(wait);
+                assert!(json);
+                assert_eq!(timeout, 30);
+                assert_eq!(wait_file.as_deref(), Some("/tmp/dictation.txt"));
+            }
+            _ => panic!("Expected Record Stop command"),
+        }
+    }
+
+    #[test]
+    fn waiting_flags_require_wait() {
+        // --json and friends are meaningless without --wait, and clap should
+        // say so rather than silently ignoring them.
+        for extra in [
+            vec!["--json"],
+            vec!["--timeout", "5"],
+            vec!["--wait-file", "/tmp/x"],
+        ] {
+            let mut argv = vec!["voxtype", "record", "stop"];
+            argv.extend(extra.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{:?} should require --wait",
+                extra
+            );
+        }
+    }
+
+    #[test]
+    fn stop_wait_still_takes_an_output_mode() {
+        let cli = Cli::parse_from(["voxtype", "record", "stop", "--wait", "--paste"]);
+        match cli.command {
+            Some(Commands::Record { action }) => {
+                assert_eq!(
+                    action.output_mode_override(),
+                    Some(OutputModeOverride::Paste)
                 );
             }
             _ => panic!("Expected Record command"),
@@ -640,6 +780,65 @@ mod tests {
         match cli.command {
             Some(Commands::Record { action }) => {
                 assert_eq!(action.auto_submit_override(), Some(true));
+            }
+            _ => panic!("Expected Record command"),
+        }
+    }
+
+    /// #636: --no-osd suppresses the OSD for one recording. Parsed on both
+    /// start and toggle, absent by default, and never claimed by stop/cancel
+    /// (the OSD decision belongs to the recording that opens the surface).
+    #[test]
+    fn test_record_no_osd_flag() {
+        for sub in ["start", "toggle"] {
+            let cli = Cli::parse_from(["voxtype", "record", sub, "--no-osd"]);
+            match cli.command {
+                Some(Commands::Record { action }) => {
+                    assert!(action.suppress_osd(), "--no-osd not honored on {}", sub);
+                }
+                _ => panic!("Expected Record command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_record_no_osd_defaults_off() {
+        for args in [
+            vec!["voxtype", "record", "start"],
+            vec!["voxtype", "record", "toggle"],
+            vec!["voxtype", "record", "stop"],
+            vec!["voxtype", "record", "cancel"],
+        ] {
+            let cli = Cli::parse_from(args.clone());
+            match cli.command {
+                Some(Commands::Record { action }) => {
+                    assert!(
+                        !action.suppress_osd(),
+                        "unexpected suppression for {:?}",
+                        args
+                    );
+                }
+                _ => panic!("Expected Record command"),
+            }
+        }
+    }
+
+    /// The flag is orthogonal to the other per-recording overrides; combining
+    /// them must not disturb either.
+    #[test]
+    fn test_record_no_osd_composes_with_other_overrides() {
+        let cli = Cli::parse_from([
+            "voxtype",
+            "record",
+            "start",
+            "--no-osd",
+            "--no-auto-submit",
+            "--file",
+        ]);
+        match cli.command {
+            Some(Commands::Record { action }) => {
+                assert!(action.suppress_osd());
+                assert_eq!(action.auto_submit_override(), Some(false));
             }
             _ => panic!("Expected Record command"),
         }

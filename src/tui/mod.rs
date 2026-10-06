@@ -23,8 +23,11 @@ mod text_section;
 mod vad_section;
 mod waybar_section;
 
+// Exported beyond the crate so the binary's `voxtype config` handlers write
+// through the same atomic-save-and-validate path the TUI uses, rather than
+// growing a second config writer.
 #[allow(unused_imports)]
-pub(crate) use config_editor::{ConfigEditor, EditorError};
+pub use config_editor::{ConfigEditor, EditorError};
 
 use crossterm::{
     event::{
@@ -50,11 +53,33 @@ use section::Section;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-pub fn run(force_package_mode: bool) -> anyhow::Result<()> {
+/// Entry point for the hidden `voxtype configure --probe-audio-devices`
+/// flag: print detected input devices and exit. See
+/// `audio::start_device_scan` for why this runs in its own process.
+pub fn probe_audio_devices() {
+    audio::print_input_devices();
+}
+
+/// Launch the TUI.
+///
+/// `config_path` is the `-c/--config` value; when set, every section reads and
+/// writes that file instead of the default. Installed before the first section
+/// loads, because a section that has already read the default would save back
+/// to it (#595).
+pub fn run(
+    force_package_mode: bool,
+    config_path: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    config_editor::set_tui_config_path(config_path);
     let mut terminal = enter_terminal()?;
     let result = event_loop(&mut terminal, force_package_mode);
     leave_terminal(&mut terminal)?;
-    result
+    if result? {
+        // Printed after the alternate screen is torn down so it lands in
+        // the user's shell, not the vanished TUI.
+        println!("Restarted the voxtype daemon to apply saved config changes.");
+    }
+    Ok(())
 }
 
 fn enter_terminal() -> anyhow::Result<Tui> {
@@ -75,12 +100,15 @@ fn leave_terminal(terminal: &mut Tui) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn event_loop(terminal: &mut Tui, force_package_mode: bool) -> anyhow::Result<()> {
+/// Returns `true` when the daemon was restarted on the way out so `run()`
+/// can tell the user once the terminal is back to normal.
+fn event_loop(terminal: &mut Tui, force_package_mode: bool) -> anyhow::Result<bool> {
     let mut app = App::new(force_package_mode);
     let mut last_general_refresh = std::time::Instant::now();
     let general_refresh_interval = Duration::from_secs(2);
 
     loop {
+        app.poll_background();
         terminal.draw(|f| draw(f, &app))?;
 
         if !event::poll(Duration::from_millis(250))? {
@@ -108,7 +136,7 @@ fn event_loop(terminal: &mut Tui, force_package_mode: bool) -> anyhow::Result<()
                 if let Some(action) = handle_global_key(&mut app, key) {
                     match dispatch_action(terminal, &mut app, action)? {
                         LoopControl::Continue => continue,
-                        LoopControl::Quit => return Ok(()),
+                        LoopControl::Quit => return Ok(restart_if_config_newer(&app)),
                     }
                 }
 
@@ -120,7 +148,7 @@ fn event_loop(terminal: &mut Tui, force_package_mode: bool) -> anyhow::Result<()
 
                 match dispatch_action(terminal, &mut app, action)? {
                     LoopControl::Continue => {}
-                    LoopControl::Quit => return Ok(()),
+                    LoopControl::Quit => return Ok(restart_if_config_newer(&app)),
                 }
             }
             Event::Mouse(mouse) => {
@@ -198,20 +226,25 @@ fn dispatch_action(
     }
 }
 
-/// Run `voxtype setup model <name>` in the parent shell so the user sees the
-/// download progress. We invoke whichever voxtype is on PATH because that's
-/// the user's installed binary; the TUI's own image might be an
-/// uninstalled host build that doesn't have the engine feature flags.
+/// Download a model in the parent shell so the user sees the progress. We
+/// invoke whichever voxtype is on PATH because that's the user's installed
+/// binary; the TUI's own image might be an uninstalled host build that
+/// doesn't have the engine feature flags.
+///
+/// `setup model` takes no positional argument (see `SetupAction::Model` in
+/// `src/cli/setup.rs`) — the download entry point is the top-level
+/// `setup --download --model <NAME>`. Passing the name positionally made
+/// clap reject the command before it did anything.
 fn run_setup_model(engine: &str, model: &str) -> Result<(), String> {
     let _ = engine;
     let status = std::process::Command::new("voxtype")
-        .args(["setup", "model", model])
+        .args(["setup", "--download", "--model", model])
         .status()
-        .map_err(|e| format!("could not invoke `voxtype setup model`: {}", e))?;
+        .map_err(|e| format!("could not invoke `voxtype setup --download`: {}", e))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("voxtype setup model exited with {}", status))
+        Err(format!("voxtype setup --download exited with {}", status))
     }
 }
 
@@ -222,7 +255,29 @@ fn restart_voxtype_daemon(app: &mut App) {
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "restart", "voxtype"])
         .status();
+    // The freshly (re)started daemon has read the config as it stands now,
+    // so quitting doesn't need another restart unless a later save lands.
+    app.config_synced_mtime = app::config_file_mtime();
     app.refresh_inventory();
+}
+
+/// Restart the daemon on the way out of the TUI when a save landed after
+/// the daemon's last known (re)start, so config-only changes (an engine
+/// switch on a binary that supports both, a hotkey edit, ...) take effect
+/// without a manual `systemctl --user restart voxtype`. The decision logic
+/// lives in `app::should_restart_on_quit`; see its doc for the cases.
+fn restart_if_config_newer(app: &App) -> bool {
+    let restart = app::should_restart_on_quit(
+        crate::daemon_status::is_daemon_running(),
+        app.config_synced_mtime,
+        app::config_file_mtime(),
+    );
+    if restart {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "voxtype"])
+            .status();
+    }
+    restart
 }
 
 /// Routes keypresses while the save-on-exit prompt is showing.
@@ -524,6 +579,31 @@ fn render_help_overlay(f: &mut Frame) {
 }
 
 fn render_title(f: &mut Frame, area: Rect) {
+    // The version shown is the *daemon's*, not this TUI's. Someone editing
+    // settings wants to know what will act on them, and after an upgrade
+    // that was installed but never restarted those are different numbers.
+    // Showing the TUI's own build here would quietly answer the wrong
+    // question.
+    let daemon = crate::daemon_status::running_version();
+    let (version_text, version_style) = match &daemon {
+        crate::daemon_status::DaemonVersion::Running(v) if daemon.differs_from_caller() => (
+            format!("daemon {} · this TUI {}", v, crate::cli::VERSION),
+            Style::default().fg(Color::Yellow),
+        ),
+        crate::daemon_status::DaemonVersion::Running(v) => (
+            format!("daemon {}", v),
+            Style::default().fg(Color::DarkGray),
+        ),
+        crate::daemon_status::DaemonVersion::NotRunning => (
+            "daemon not running".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+        crate::daemon_status::DaemonVersion::Unknown => (
+            "daemon running, version unknown".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+
     let line = Line::from(vec![
         Span::raw(" Voxtype Configuration"),
         Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
@@ -531,6 +611,8 @@ fn render_title(f: &mut Frame, area: Rect) {
             "edit settings without leaving the terminal",
             Style::default().fg(Color::DarkGray),
         ),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(version_text, version_style),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }

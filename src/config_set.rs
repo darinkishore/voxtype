@@ -1,45 +1,39 @@
 //! Programmatic mutation of the on-disk config file from the CLI.
 //!
-//! Backs `voxtype config set engine <NAME>`. This is the same operation the
-//! TUI engine section performs (see `src/tui/engine.rs`), exposed as a
-//! non-interactive command so external tools (Quickshell engine picker,
-//! shell scripts, etc.) can switch engines without rendering a TUI.
+//! Backs `voxtype config set <KEY> <VALUE>` and `voxtype config unset <KEY>`.
+//! These are the same operations the TUI sections perform (see `src/tui/`),
+//! exposed non-interactively so external tools (the Quickshell engine picker,
+//! an Omarchy settings panel, shell scripts) can change settings without
+//! rendering a TUI.
+//!
+//! `engine` keeps its own entry point, [`set_engine`], because it predates
+//! the generic path and its error messages and exit codes are part of the
+//! published CLI contract.
 //!
 //! Validation rules mirror the TUI:
-//!   1. The engine name must be a known variant of [`TranscriptionEngine`].
-//!   2. For non-whisper engines, the binary must have been compiled with the
-//!      matching Cargo feature. The TUI surfaces this as a warning; the CLI
-//!      treats it as a hard error since there's no interactive escape hatch.
+//!   1. The key must be in the [`crate::config::schema`] allowlist.
+//!   2. The value must type-check and be in range for that key.
+//!   3. For keys belonging to an optionally-compiled engine, the binary must
+//!      have been built with the matching Cargo feature. The TUI surfaces
+//!      this as a warning; the CLI treats it as a hard error since there's
+//!      no interactive escape hatch.
 //!
 //! Comments and unrelated fields are preserved via `toml_edit` (through
 //! `ConfigEditor`). Saves go through the same atomic write + validation
-//! pipeline as the TUI.
+//! pipeline as the TUI, so a change that would stop the daemon loading is
+//! rolled back instead of written.
 
 use std::path::PathBuf;
 
+use crate::config::schema::{self, Found, TypedValue, ValueError};
 use crate::config::TranscriptionEngine;
 use crate::tui::{ConfigEditor, EditorError};
-
-/// All engine identifiers accepted by `voxtype config set engine`.
-///
-/// Kept in sync with [`TranscriptionEngine`] and with `ENGINE_CHOICES` in
-/// `src/tui/engine.rs`. If a new engine is added there, add it here too.
-pub const ENGINE_NAMES: &[&str] = &[
-    "whisper",
-    "parakeet",
-    "moonshine",
-    "sensevoice",
-    "paraformer",
-    "dolphin",
-    "omnilingual",
-    "cohere",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigSetError {
     #[error(
-        "unknown engine '{0}'. Valid engines: whisper, parakeet, moonshine, \
-         sensevoice, paraformer, dolphin, omnilingual, cohere"
+        "unknown engine '{0}'. Valid engines: {}",
+        TranscriptionEngine::names_csv()
     )]
     UnknownEngine(String),
 
@@ -52,49 +46,103 @@ pub enum ConfigSetError {
     )]
     FeatureNotCompiled(String),
 
+    #[error(
+        "unknown config key '{0}'.\n  \
+         Run `voxtype config schema` to list every settable key."
+    )]
+    UnknownKey(String),
+
+    #[error("{0}")]
+    BadValue(#[from] ValueError),
+
+    #[error(
+        "'{key}' belongs to the '{feature}' engine, which is not compiled into \
+         this binary.\n  Install a variant that includes it (see \
+         `voxtype info variants`) or rebuild with --features {feature}."
+    )]
+    KeyFeatureNotCompiled {
+        key: &'static str,
+        feature: &'static str,
+    },
+
     #[error("config editor: {0}")]
     Editor(#[from] EditorError),
 }
 
+impl ConfigSetError {
+    /// Process exit code for this failure, matching the contract in
+    /// `voxtype config set --help`: 2 for anything the user can fix by
+    /// changing the command, 1 for filesystem and validation failures.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            ConfigSetError::UnknownEngine(_)
+            | ConfigSetError::FeatureNotCompiled(_)
+            | ConfigSetError::UnknownKey(_)
+            | ConfigSetError::BadValue(_)
+            | ConfigSetError::KeyFeatureNotCompiled { .. } => 2,
+            ConfigSetError::Editor(_) => 1,
+        }
+    }
+}
+
+/// Engines `config set engine` and the settings UIs offer, in
+/// [`TranscriptionEngine`] declaration order. Deliberately narrower than the
+/// enum: the cloud engines `soniox` and `openairealtime` require credentials
+/// in their own config tables and are not offered by the settings picker.
+/// The `engine_names_track_the_enum` test pins this list against the enum so
+/// a new variant can't be silently forgotten.
+pub const ENGINE_NAMES: &[&str] = &[
+    "whisper",
+    "parakeet",
+    "moonshine",
+    "sensevoice",
+    "paraformer",
+    "dolphin",
+    "omnilingual",
+    "cohere",
+    "openvino",
+];
+
 /// Is the engine name one we recognize at all?
 ///
-/// Equivalent to parsing through [`TranscriptionEngine`]'s serde
-/// representation but avoids deserializing a whole config to check one
-/// field.
+/// Iterates the [`TranscriptionEngine`] variants and matches the exact
+/// canonical lowercase name. Case-sensitive (so callers can detect typos
+/// like `"Whisper"` before applying them to config). New engine variants
+/// are picked up automatically via `strum::EnumIter`.
 pub fn parse_engine(name: &str) -> Option<TranscriptionEngine> {
-    match name {
-        "whisper" => Some(TranscriptionEngine::Whisper),
-        "parakeet" => Some(TranscriptionEngine::Parakeet),
-        "moonshine" => Some(TranscriptionEngine::Moonshine),
-        "sensevoice" => Some(TranscriptionEngine::SenseVoice),
-        "paraformer" => Some(TranscriptionEngine::Paraformer),
-        "dolphin" => Some(TranscriptionEngine::Dolphin),
-        "omnilingual" => Some(TranscriptionEngine::Omnilingual),
-        "cohere" => Some(TranscriptionEngine::Cohere),
-        _ => None,
-    }
+    use strum::IntoEnumIterator;
+    TranscriptionEngine::iter().find(|e| e.name() == name)
 }
 
 /// Was this binary compiled with the feature needed to run the given engine?
 ///
-/// Whisper is always available; everything else is gated on the
-/// corresponding Cargo feature flag. This is the source-of-truth check that
-/// matches what the TUI shows on source builds (see
-/// `EngineState::refresh_binary_match` in `src/tui/engine.rs`). The TUI's
-/// `compiled_features()` list in `src/setup/binary.rs` is incomplete (it
-/// only enumerates parakeet + GPU features), so we evaluate `cfg!` directly
-/// here rather than going through that helper.
+/// Whisper and Soniox are unconditional (Soniox was un-feature-gated in
+/// #441); every other engine is gated on the corresponding Cargo feature.
+/// This is the source-of-truth check that matches what the TUI shows on
+/// source builds (see `EngineState::refresh_binary_match` in
+/// `src/tui/engine.rs`). The TUI's `compiled_features()` list in
+/// `src/setup/binary.rs`, so we evaluate `cfg!` directly here rather than
+/// coupling validation to its user-facing labels.
+///
+/// Matches `TranscriptionEngine` exhaustively so adding a new variant
+/// produces a compile error here, not a silent `false` at runtime. The
+/// previous wildcard arm hid `soniox` from this check for several months.
 pub fn engine_feature_compiled(name: &str) -> bool {
-    match name {
-        "whisper" => true,
-        "parakeet" => cfg!(feature = "parakeet"),
-        "moonshine" => cfg!(feature = "moonshine"),
-        "sensevoice" => cfg!(feature = "sensevoice"),
-        "paraformer" => cfg!(feature = "paraformer"),
-        "dolphin" => cfg!(feature = "dolphin"),
-        "omnilingual" => cfg!(feature = "omnilingual"),
-        "cohere" => cfg!(feature = "cohere"),
-        _ => false,
+    let Some(engine) = parse_engine(name) else {
+        return false;
+    };
+    match engine {
+        TranscriptionEngine::Whisper => true,
+        TranscriptionEngine::Soniox => true,
+        TranscriptionEngine::OpenaiRealtime => cfg!(feature = "openai-realtime"),
+        TranscriptionEngine::Parakeet => cfg!(feature = "parakeet"),
+        TranscriptionEngine::Moonshine => cfg!(feature = "moonshine"),
+        TranscriptionEngine::SenseVoice => cfg!(feature = "sensevoice"),
+        TranscriptionEngine::Paraformer => cfg!(feature = "paraformer"),
+        TranscriptionEngine::Dolphin => cfg!(feature = "dolphin"),
+        TranscriptionEngine::Omnilingual => cfg!(feature = "omnilingual"),
+        TranscriptionEngine::Cohere => cfg!(feature = "cohere"),
+        TranscriptionEngine::OpenVino => cfg!(feature = "openvino-whisper"),
     }
 }
 
@@ -118,11 +166,111 @@ pub fn set_engine(path: PathBuf, name: &str) -> Result<PathBuf, ConfigSetError> 
     Ok(editor.path().to_path_buf())
 }
 
+/// Outcome of a successful generic set: what was written and where.
+#[derive(Debug, Clone)]
+pub struct SetOutcome {
+    /// The dotted key as the user would type it — for a map entry that's the
+    /// concrete path (`text.replacements.btw`), not the schema placeholder.
+    pub key: String,
+    pub value: TypedValue,
+    pub path: PathBuf,
+    pub restart_required: bool,
+}
+
+/// Look up `key` in the allowlist and reject it if its engine feature is
+/// missing from this build.
+fn lookup(key: &str) -> Result<Found, ConfigSetError> {
+    let found = schema::find_key(key).ok_or_else(|| ConfigSetError::UnknownKey(key.to_string()))?;
+    let spec = found.spec();
+    if let Some(feature) = spec.requires_feature {
+        if !schema::feature_compiled(feature) {
+            return Err(ConfigSetError::KeyFeatureNotCompiled {
+                key: spec.key,
+                feature,
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// Set any allowlisted key in the config file at `path`.
+///
+/// `engine` is routed to [`set_engine`] so its long-standing error messages
+/// and exit codes are unchanged.
+pub fn set_key(path: PathBuf, key: &str, raw: &str) -> Result<SetOutcome, ConfigSetError> {
+    if key == "engine" {
+        let written = set_engine(path, raw)?;
+        return Ok(SetOutcome {
+            key: "engine".to_string(),
+            value: TypedValue::Str(raw.to_string()),
+            path: written,
+            restart_required: true,
+        });
+    }
+
+    let found = lookup(key)?;
+    let spec = found.spec();
+    let value = schema::validate_value(spec, raw)?;
+
+    let mut editor = ConfigEditor::load_from_path(path)?;
+    schema::apply(&mut editor, &found, &value);
+    editor.save()?;
+
+    Ok(SetOutcome {
+        key: found.dotted_key(),
+        value,
+        path: editor.path().to_path_buf(),
+        restart_required: spec.restart_required,
+    })
+}
+
+/// Remove an allowlisted key from the config file, falling back to its
+/// built-in default. Removing a key that isn't present succeeds.
+pub fn unset_key(path: PathBuf, key: &str) -> Result<SetOutcome, ConfigSetError> {
+    let found = lookup(key)?;
+    let spec = found.spec();
+    let (table, field) = found.target();
+
+    let mut editor = ConfigEditor::load_from_path(path)?;
+    editor.unset(table, field);
+    editor.save()?;
+
+    Ok(SetOutcome {
+        key: found.dotted_key(),
+        value: TypedValue::Str(String::new()),
+        path: editor.path().to_path_buf(),
+        restart_required: spec.restart_required,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+    use strum::IntoEnumIterator;
+
+    /// ENGINE_NAMES is a deliberate subset of the enum; this pins both
+    /// directions so a new TranscriptionEngine variant must either be added
+    /// to the list or join the documented exclusions below.
+    #[test]
+    fn engine_names_track_the_enum() {
+        for name in ENGINE_NAMES {
+            assert!(
+                parse_engine(name).is_some(),
+                "{name} in ENGINE_NAMES is not a TranscriptionEngine variant"
+            );
+        }
+        let excluded: Vec<&&str> = TranscriptionEngine::names()
+            .iter()
+            .filter(|n| !ENGINE_NAMES.contains(n))
+            .collect();
+        assert_eq!(
+            excluded,
+            [&"soniox", &"openairealtime"],
+            "new engine variants must be added to ENGINE_NAMES or documented as excluded"
+        );
+    }
 
     fn temp_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -134,8 +282,25 @@ mod tests {
 
     #[test]
     fn parse_engine_accepts_known_names() {
-        for name in ENGINE_NAMES {
+        for engine in TranscriptionEngine::iter() {
+            let name = engine.name();
             assert!(parse_engine(name).is_some(), "should accept '{}'", name);
+        }
+    }
+
+    /// Pins the user-facing error message to the enum so a new variant can't
+    /// land without showing up in `voxtype config set engine <bogus>` output.
+    /// Caught the post-#476 drift where `soniox` was missing from this list.
+    #[test]
+    fn unknown_engine_error_lists_every_variant() {
+        let display = format!("{}", ConfigSetError::UnknownEngine("bogus".to_string()));
+        for engine in TranscriptionEngine::iter() {
+            assert!(
+                display.contains(engine.name()),
+                "ConfigSetError::UnknownEngine display is missing variant '{}': {}",
+                engine.name(),
+                display
+            );
         }
     }
 
@@ -245,9 +410,9 @@ mod tests {
         // Pick the first non-whisper engine whose feature is NOT compiled
         // into this test binary. Skip the test entirely if every engine is
         // compiled in (e.g. a maximalist CI build).
-        let target = ENGINE_NAMES
-            .iter()
-            .find(|n| **n != "whisper" && !engine_feature_compiled(n));
+        let target = TranscriptionEngine::iter()
+            .map(|e| e.name())
+            .find(|n| *n != "whisper" && !engine_feature_compiled(n));
         let Some(name) = target else {
             eprintln!("skipping: all engine features are compiled in this build");
             return;
@@ -255,8 +420,255 @@ mod tests {
         let (_dir, path) = temp_config("");
         let err = set_engine(path, name).unwrap_err();
         match err {
-            ConfigSetError::FeatureNotCompiled(n) => assert_eq!(&n, *name),
+            ConfigSetError::FeatureNotCompiled(n) => assert_eq!(n, name),
             other => panic!("expected FeatureNotCompiled, got {:?}", other),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Generic set/unset
+    // ---------------------------------------------------------------------
+
+    fn full_config() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, crate::config::default_config_content()).unwrap();
+        (dir, path)
+    }
+
+    fn reload(path: &std::path::Path) -> crate::config::Config {
+        crate::config::load_config(Some(path)).expect("reload")
+    }
+
+    #[test]
+    fn set_key_writes_each_scalar_type() {
+        let (_dir, path) = full_config();
+
+        set_key(path.clone(), "hotkey.enabled", "false").unwrap();
+        set_key(path.clone(), "audio.max_duration_secs", "120").unwrap();
+        set_key(path.clone(), "audio.feedback.volume", "0.25").unwrap();
+        set_key(path.clone(), "output.mode", "clipboard").unwrap();
+        set_key(path.clone(), "whisper.initial_prompt", "Voxtype, Omarchy").unwrap();
+
+        let cfg = reload(&path);
+        assert!(!cfg.hotkey.enabled);
+        assert_eq!(cfg.audio.max_duration_secs, 120);
+        assert_eq!(cfg.audio.feedback.volume, 0.25);
+        assert_eq!(cfg.output.mode, crate::config::OutputMode::Clipboard);
+        assert_eq!(
+            cfg.whisper.initial_prompt.as_deref(),
+            Some("Voxtype, Omarchy")
+        );
+    }
+
+    /// The OSD styling keys (#501) must be reachable through `config set`,
+    /// not just by hand-editing the TOML: a style package path, the
+    /// development plugin_path (set and unset), and the nested [osd.frame]
+    /// table.
+    #[test]
+    fn set_key_covers_the_osd_styling_keys() {
+        let (_dir, path) = full_config();
+
+        set_key(path.clone(), "osd.style", "~/.config/voxtype/osd/aegis-hud").unwrap();
+        set_key(path.clone(), "osd.plugin_path", "~/dev/my-style").unwrap();
+        set_key(path.clone(), "osd.frame.border", "accent").unwrap();
+        set_key(path.clone(), "osd.frame.glow", "false").unwrap();
+
+        let cfg = reload(&path);
+        assert_eq!(cfg.osd.style, "~/.config/voxtype/osd/aegis-hud");
+        assert_eq!(
+            cfg.osd.plugin_path.as_deref(),
+            Some(std::path::Path::new("~/dev/my-style"))
+        );
+        assert_eq!(cfg.osd.frame.border, "accent");
+        assert!(!cfg.osd.frame.glow);
+
+        unset_key(path.clone(), "osd.plugin_path").unwrap();
+        let cfg = reload(&path);
+        assert_eq!(
+            cfg.osd.plugin_path, None,
+            "unset must fall back to the serde default"
+        );
+    }
+
+    #[test]
+    fn set_key_reports_the_canonical_key_and_path() {
+        let (_dir, path) = full_config();
+        let out = set_key(path.clone(), "vad.threshold", "0.75").unwrap();
+        assert_eq!(out.key, "vad.threshold");
+        assert_eq!(out.path, path);
+        assert!(out.restart_required);
+        assert_eq!(out.value, TypedValue::Float(0.75));
+    }
+
+    /// Floats must not be written as quoted strings (#451) — the daemon
+    /// refuses to load its own output if they are.
+    #[test]
+    fn set_key_writes_floats_as_toml_numbers() {
+        let (_dir, path) = full_config();
+        set_key(path.clone(), "vad.threshold", "0.25").unwrap();
+        set_key(path.clone(), "audio.feedback.volume", "0.5").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("threshold = 0.25"), "{}", text);
+        assert!(text.contains("volume = 0.5"), "{}", text);
+        assert!(!text.contains("threshold = \"0.25\""));
+        assert!(!text.contains("volume = \"0.5\""));
+    }
+
+    #[test]
+    fn set_key_rejects_unknown_keys() {
+        let (_dir, path) = full_config();
+        let err = set_key(path, "hotkey.nonexistent", "x").unwrap_err();
+        assert!(matches!(err, ConfigSetError::UnknownKey(_)));
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn set_key_rejects_bad_values() {
+        let (_dir, path) = full_config();
+        for (key, value) in [
+            ("hotkey.enabled", "maybe"),
+            ("audio.feedback.volume", "11"),
+            ("output.mode", "telepathy"),
+            ("audio.max_duration_secs", "notanumber"),
+        ] {
+            let err = set_key(path.clone(), key, value).unwrap_err();
+            assert!(
+                matches!(err, ConfigSetError::BadValue(_)),
+                "{} = {} gave {:?}",
+                key,
+                value,
+                err
+            );
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    /// A rejected set must not touch the file.
+    #[test]
+    fn rejected_set_leaves_the_file_alone() {
+        let (_dir, path) = full_config();
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(set_key(path.clone(), "output.mode", "telepathy").is_err());
+        assert!(set_key(path.clone(), "no.such.key", "1").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn set_key_rejects_keys_of_uncompiled_engines() {
+        let target = ENGINE_NAMES
+            .iter()
+            .find(|n| **n != "whisper" && !engine_feature_compiled(n));
+        let Some(engine) = target else {
+            eprintln!("skipping: all engine features are compiled in this build");
+            return;
+        };
+        let (_dir, path) = full_config();
+        let key = format!("{}.on_demand_loading", engine);
+        let err = set_key(path, &key, "true").unwrap_err();
+        match err {
+            ConfigSetError::KeyFeatureNotCompiled { feature, .. } => {
+                assert_eq!(feature, *engine)
+            }
+            other => panic!("expected KeyFeatureNotCompiled, got {:?}", other),
+        }
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn set_key_routes_engine_through_set_engine() {
+        let (_dir, path) = full_config();
+        let out = set_key(path.clone(), "engine", "whisper").unwrap();
+        assert_eq!(out.key, "engine");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("engine = \"whisper\""));
+
+        // Same errors as the dedicated subcommand used to produce.
+        let err = set_key(path.clone(), "engine", "fakeengine").unwrap_err();
+        assert!(matches!(err, ConfigSetError::UnknownEngine(_)));
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn unset_key_restores_the_default() {
+        let (_dir, path) = full_config();
+        set_key(path.clone(), "hotkey.mode", "toggle").unwrap();
+        assert_eq!(
+            reload(&path).hotkey.mode,
+            crate::config::ActivationMode::Toggle
+        );
+
+        unset_key(path.clone(), "hotkey.mode").unwrap();
+        assert_eq!(
+            reload(&path).hotkey.mode,
+            crate::config::ActivationMode::PushToTalk,
+            "unset should fall back to the built-in default"
+        );
+    }
+
+    #[test]
+    fn unset_key_is_idempotent() {
+        let (_dir, path) = full_config();
+        unset_key(path.clone(), "whisper.initial_prompt").unwrap();
+        unset_key(path.clone(), "whisper.initial_prompt").unwrap();
+        assert!(reload(&path).whisper.initial_prompt.is_none());
+    }
+
+    #[test]
+    fn unset_key_rejects_unknown_keys() {
+        let (_dir, path) = full_config();
+        let err = unset_key(path, "nope.nope").unwrap_err();
+        assert!(matches!(err, ConfigSetError::UnknownKey(_)));
+    }
+
+    #[test]
+    fn replacements_map_entries_set_and_unset() {
+        let (_dir, path) = full_config();
+        set_key(path.clone(), "text.replacements.btw", "by the way").unwrap();
+        set_key(path.clone(), "text.replacements.omw", "on my way").unwrap();
+
+        let cfg = reload(&path);
+        assert_eq!(
+            cfg.text.replacements.get("btw").map(String::as_str),
+            Some("by the way")
+        );
+        assert_eq!(
+            cfg.text.replacements.get("omw").map(String::as_str),
+            Some("on my way")
+        );
+
+        unset_key(path.clone(), "text.replacements.btw").unwrap();
+        let cfg = reload(&path);
+        assert!(!cfg.text.replacements.contains_key("btw"));
+        assert!(
+            cfg.text.replacements.contains_key("omw"),
+            "unsetting one entry must not disturb the others"
+        );
+    }
+
+    #[test]
+    fn set_key_preserves_comments() {
+        let mut base = crate::config::default_config_content();
+        let marker = "\n# VOXTYPE-TEST-MARKER: keep this comment\n";
+        let at = base.find('\n').map(|i| i + 1).unwrap_or(0);
+        base.insert_str(at, marker);
+        let (_dir, path) = temp_config(&base);
+
+        set_key(path.clone(), "osd.position", "top-right").unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("# VOXTYPE-TEST-MARKER: keep this comment"));
+        assert!(after.contains("position = \"top-right\""));
+    }
+
+    #[test]
+    fn set_key_creates_missing_tables() {
+        // A user config with only [hotkey] must still accept a key in a
+        // table that isn't there yet.
+        let (_dir, path) = temp_config("[hotkey]\nkey = \"HOME\"\n");
+        set_key(path.clone(), "osd.opacity", "0.5").unwrap();
+        let cfg = reload(&path);
+        assert_eq!(cfg.osd.opacity, 0.5);
+        assert_eq!(cfg.hotkey.key, "HOME", "existing settings must survive");
     }
 }

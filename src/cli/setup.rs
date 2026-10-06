@@ -135,6 +135,21 @@ pub enum SetupAction {
         status: bool,
     },
 
+    /// Manage Intel NPU acceleration through OpenVINO
+    Npu {
+        /// Enable NPU acceleration and configure OpenVINO
+        #[arg(long)]
+        enable: bool,
+
+        /// Disable NPU acceleration and revert to Whisper
+        #[arg(long)]
+        disable: bool,
+
+        /// Show NPU hardware and configuration status
+        #[arg(long)]
+        status: bool,
+    },
+
     /// Switch the active binary variant (used by `voxtype configure` via pkexec)
     #[command(hide = true)]
     Variant {
@@ -300,6 +315,48 @@ mod tests {
             }
             _ => panic!("Expected Setup command"),
         }
+    }
+
+    #[test]
+    fn test_setup_progress_format() {
+        let cli = Cli::parse_from([
+            "voxtype",
+            "setup",
+            "--download",
+            "--model",
+            "tiny.en",
+            "--progress-format",
+            "json",
+        ]);
+        match cli.command {
+            Some(Commands::Setup {
+                progress_format,
+                download,
+                model,
+                ..
+            }) => {
+                assert_eq!(progress_format, "json");
+                assert!(download);
+                assert_eq!(model.as_deref(), Some("tiny.en"));
+            }
+            _ => panic!("Expected Setup command"),
+        }
+
+        let cli = Cli::parse_from(["voxtype", "setup"]);
+        match cli.command {
+            Some(Commands::Setup {
+                progress_format, ..
+            }) => assert_eq!(
+                progress_format, "human",
+                "human output must stay the default"
+            ),
+            _ => panic!("Expected Setup command"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["voxtype", "setup", "--progress-format", "ndjson"]).is_err(),
+            "unknown formats should be rejected at parse time"
+        );
     }
 
     #[test]

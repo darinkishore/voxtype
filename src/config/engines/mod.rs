@@ -7,6 +7,7 @@ mod dolphin;
 mod moonshine;
 mod omnilingual;
 mod openai_realtime;
+mod openvino;
 mod paraformer;
 mod parakeet;
 mod sensevoice;
@@ -17,6 +18,7 @@ pub use dolphin::DolphinConfig;
 pub use moonshine::MoonshineConfig;
 pub use omnilingual::OmnilingualConfig;
 pub use openai_realtime::OpenaiRealtimeConfig;
+pub use openvino::OpenVinoConfig;
 pub use paraformer::ParaformerConfig;
 pub use parakeet::{ParakeetConfig, ParakeetModelType};
 pub use sensevoice::SenseVoiceConfig;
@@ -65,8 +67,10 @@ pub enum TranscriptionEngine {
     /// task tokens). Top of the Open ASR Leaderboard.
     /// Requires: cargo build --features cohere
     Cohere,
+    /// Use OpenVINO Whisper (Intel NPU/CPU/GPU via OpenVINO Runtime).
+    /// Requires: cargo build --features openvino-whisper
+    OpenVino,
     /// Use Soniox (cloud streaming WebSocket STT).
-    /// Requires: cargo build --features soniox
     Soniox,
     /// Use OpenAI Realtime (cloud streaming WebSocket STT, GA
     /// `gpt-live-transcribe`).
@@ -83,6 +87,36 @@ impl TranscriptionEngine {
     /// rather than the less-obvious `(*engine).into()`.
     pub fn name(self) -> &'static str {
         self.into()
+    }
+
+    /// Comma-separated list of every variant's canonical name. Cached behind
+    /// a `OnceLock` so callers get a `&'static str` without rebuilding it
+    /// each time. Use this in any user-facing string that lists engines so
+    /// a new variant added to the enum automatically appears everywhere
+    /// without a manual table to keep in sync.
+    ///
+    /// The `crate::cli::ENGINE_NAMES_CSV` constant intentionally duplicates
+    /// this value as a string literal because `build.rs` includes the CLI
+    /// module via `#[path]` and cannot reach into `crate::config`; a test
+    /// pins that constant against this method's output.
+    /// Every variant's canonical name, in declaration order. Cached like
+    /// [`Self::names_csv`] so callers can hold a `&'static [&'static str]`
+    /// instead of re-iterating the enum.
+    pub fn names() -> &'static [&'static str] {
+        use strum::IntoEnumIterator;
+        static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        NAMES.get_or_init(|| Self::iter().map(Self::name).collect())
+    }
+
+    pub fn names_csv() -> &'static str {
+        use strum::IntoEnumIterator;
+        static NAMES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NAMES.get_or_init(|| {
+            Self::iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
     }
 }
 

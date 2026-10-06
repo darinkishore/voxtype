@@ -52,6 +52,7 @@ ShellRoot {
     OsdSurface {
         id: osd
         daemonState: stateReader.state
+        osdSuppressed: stateReader.osdSuppressed
         audio: audio
         style: osdStyle
     }

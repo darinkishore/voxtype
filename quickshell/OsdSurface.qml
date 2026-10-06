@@ -11,7 +11,8 @@
 // `audio` property so the OsdSurface, EnginePicker, and MeetingControls
 // share one sidecar process rather than each spawning their own.
 //
-// Visibility follows `daemonState`: hidden when idle/empty, shown
+// Visibility follows `daemonState` unless `osdSuppressed` is set:
+// hidden when suppressed or idle/empty, shown
 // otherwise. The component is layered as a WlrLayer.Overlay surface so
 // it floats above all other windows without taking input focus.
 
@@ -28,6 +29,12 @@ PanelWindow {
     /// Wired by the parent (typically from VT.StateReader.state).
     property string daemonState: "idle"
 
+    /// Set while the in-flight recording was started with `--no-osd`. Wired by
+    /// the parent from VT.StateReader.osdSuppressed. Keeps the surface hidden
+    /// for tools that draw their own dictation UI, without touching the
+    /// daemon's reported state.
+    property bool osdSuppressed: false
+
     /// The audio bridge instance whose frameReceived signal drives the
     /// waveform. Passed in by the parent so it's shared with sibling
     /// widgets that also want VAD / peak data.
@@ -37,7 +44,7 @@ PanelWindow {
     /// visual recipe layers, and optional custom QML package entry.
     property var style: null
 
-    visible: daemonState !== "idle" && daemonState !== ""
+    visible: !osdSuppressed && daemonState !== "idle" && daemonState !== ""
     anchors {
         top: true
         bottom: true

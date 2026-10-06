@@ -1,9 +1,9 @@
 //! VAD model download and status
 
+use super::model;
 use super::{print_info, print_success, print_warning};
 use crate::config::Config;
 use crate::vad::{get_whisper_vad_model_filename, get_whisper_vad_model_url};
-use std::process::Command;
 
 /// Download the Silero VAD model
 pub fn download_model() -> anyhow::Result<()> {
@@ -24,38 +24,18 @@ pub fn download_model() -> anyhow::Result<()> {
     println!("Downloading Silero VAD model...");
     println!("URL: {}", url);
 
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            "--progress-bar",
-            "-o",
-            model_path.to_str().unwrap_or("model.bin"),
-            url,
-        ])
-        .status();
+    // Atomic like every other model download: this function treats "the file
+    // exists" as "installed" and returns early, so a partial file left at the
+    // final path would never be retried.
+    model::download_atomically(url, &model_path, "silero-vad", model::ContentCheck::Ggml)?;
 
-    match status {
-        Ok(exit_status) if exit_status.success() => {
-            print_success(&format!("Saved to {:?}", model_path));
-            println!();
-            print_info("Enable in config.toml:");
-            println!("  [vad]");
-            println!("  enabled = true");
-            println!("  backend = \"whisper\"");
-            Ok(())
-        }
-        Ok(exit_status) => {
-            let _ = std::fs::remove_file(&model_path);
-            anyhow::bail!(
-                "Download failed: curl exited with code {}",
-                exit_status.code().unwrap_or(-1)
-            )
-        }
-        Err(e) => {
-            print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-            anyhow::bail!("curl not available: {}", e)
-        }
-    }
+    print_success(&format!("Saved to {:?}", model_path));
+    println!();
+    print_info("Enable in config.toml:");
+    println!("  [vad]");
+    println!("  enabled = true");
+    println!("  backend = \"whisper\"");
+    Ok(())
 }
 
 /// Show VAD model status

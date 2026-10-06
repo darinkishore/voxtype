@@ -14,12 +14,30 @@ mod root;
 mod setup;
 
 pub use commands::Commands;
-pub use config::{ConfigAction, ConfigSetKey};
+pub use config::ConfigAction;
 pub use info::InfoAction;
 pub use meeting::MeetingAction;
 pub use record::{OutputModeOverride, RecordAction};
 pub use root::Cli;
 pub use setup::{CompositorType, SetupAction};
+
+/// The version string every user-facing surface prints.
+///
+/// `build.rs` stamps `VOXTYPE_BUILD_VERSION` with the crate version when HEAD
+/// sits exactly on the matching release tag, and `{version}+g{sha}` for any
+/// other commit, so a build made between the Cargo.toml bump and the tag no
+/// longer claims to be the release (see `expose_build_version` in build.rs
+/// for the incident behind this). When the env var is absent — builds without
+/// git such as the AUR source tarball, and this module's inclusion in the
+/// build script itself — this degrades to the bare crate version.
+///
+/// This constant lives in the CLI module for the same reason as
+/// `ENGINE_NAMES_CSV` below: `build.rs` includes this module standalone for
+/// man-page generation and cannot reach into the rest of the crate.
+pub const VERSION: &str = match option_env!("VOXTYPE_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// Comma-separated list of every transcription engine name as it appears in
 /// CLI help text.
@@ -31,7 +49,8 @@ pub use setup::{CompositorType, SetupAction};
 /// context. The constant is pinned to the enum by a test in
 /// `src/config/engines/mod.rs` so a new engine variant forces this string
 /// to update or the build breaks.
-pub const ENGINE_NAMES_CSV: &str = "whisper, parakeet, moonshine, sensevoice, paraformer, dolphin, omnilingual, cohere, soniox, openairealtime";
+pub const ENGINE_NAMES_CSV: &str =
+    "whisper, parakeet, moonshine, sensevoice, paraformer, dolphin, omnilingual, cohere, openvino, soniox, openairealtime";
 
 /// Diarization backends the daemon dispatches on. Used by the CLI's
 /// `value_parser` for `--diarization` so unknown values are rejected at
@@ -41,3 +60,13 @@ pub const ENGINE_NAMES_CSV: &str = "whisper, parakeet, moonshine, sensevoice, pa
 /// `match backend.as_str()` block; a test in `src/config/meeting.rs` pins
 /// this list against those arms.
 pub(crate) const DIARIZATION_BACKENDS: &[&str] = &["simple", "ml"];
+
+/// Values `voxtype setup --progress-format` accepts. `human` is curl's
+/// progress bar and the usual status lines; `json` emits one NDJSON event per
+/// update on stdout for a GUI to render.
+///
+/// Declared here rather than derived from
+/// `crate::setup::progress::ProgressFormat` because `build.rs` includes this
+/// module standalone for man-page generation and can't reach into the rest of
+/// the crate. A test in `src/setup/progress.rs` pins the two together.
+pub const PROGRESS_FORMATS: &[&str] = &["human", "json"];

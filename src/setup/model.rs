@@ -1,8 +1,9 @@
 //! Interactive model selection and download
 
 use super::manifest::{ExpectedFile, ModelArtifact};
+use super::progress::{self, FileProgress};
 use super::{print_failure, print_info, print_success, print_warning};
-use crate::config::{Config, TranscriptionEngine};
+use crate::config::{Config, OpenVinoConfig, TranscriptionEngine};
 use crate::transcribe::whisper::{get_model_filename, get_model_url};
 use std::io::{self, Write};
 use std::path::Path;
@@ -308,40 +309,15 @@ const MOONSHINE_MODELS: &[MoonshineModelInfo] = &[
         ],
         huggingface_repo: "onnx-community/moonshine-base-zh-ONNX",
     },
-    MoonshineModelInfo {
-        name: "tiny-ja",
-        dir_name: "moonshine-tiny-ja",
-        size_mb: 100,
-        description: "Japanese (tiny)",
-        language: "ja",
-        license: "Community",
-        files: &[
-            ("onnx/encoder_model.onnx", "encoder_model.onnx"),
-            (
-                "onnx/decoder_model_merged.onnx",
-                "decoder_model_merged.onnx",
-            ),
-            ("tokenizer.json", "tokenizer.json"),
-        ],
-        huggingface_repo: "onnx-community/moonshine-tiny-ja-ONNX",
-    },
-    MoonshineModelInfo {
-        name: "tiny-zh",
-        dir_name: "moonshine-tiny-zh",
-        size_mb: 100,
-        description: "Mandarin Chinese (tiny)",
-        language: "zh",
-        license: "Community",
-        files: &[
-            ("onnx/encoder_model.onnx", "encoder_model.onnx"),
-            (
-                "onnx/decoder_model_merged.onnx",
-                "decoder_model_merged.onnx",
-            ),
-            ("tokenizer.json", "tokenizer.json"),
-        ],
-        huggingface_repo: "onnx-community/moonshine-tiny-zh-ONNX",
-    },
+    // tiny-ja and tiny-zh are deliberately absent (#694). Their upstream
+    // repos (onnx-community/moonshine-tiny-{ja,zh}-ONNX) were published
+    // without a decoder_model_merged.onnx export — only the plain no-past
+    // decoder, in any revision — and the transcriber drives the merged
+    // graph's use_cache_branch/past_key_values contract, so there is no
+    // upstream file it can run. They were also never mirrored to R2, so
+    // every download of them 404ed on the manifest. Restore them only if
+    // upstream adds a merged export (compare moonshine-base-ja-ONNX, which
+    // has one).
     MoonshineModelInfo {
         name: "tiny-ko",
         dir_name: "moonshine-tiny-ko",
@@ -830,6 +806,33 @@ impl ModelArtifact for OmnilingualModelInfo {
     }
 }
 
+impl ModelArtifact for OpenVinoModelInfo {
+    // Intentional: the trait method is `name()` but the struct field that
+    // serves as the canonical identifier is `dir_name`. Clippy's
+    // misnamed_getters lint fires on the mismatch; it's not a bug.
+    #[allow(clippy::misnamed_getters)]
+    fn name(&self) -> &str {
+        self.dir_name
+    }
+    fn engine_prefix(&self) -> &'static str {
+        "openvino"
+    }
+    fn upstream_repo(&self) -> &str {
+        self.huggingface_repo
+    }
+    fn expected_files(&self) -> Vec<ExpectedFile> {
+        // Every OpenVINO Whisper repo ships the same file set; the manifest
+        // is authoritative for sizes, so size 0 here like the other engines.
+        OPENVINO_MODEL_FILES
+            .iter()
+            .map(|f| ExpectedFile {
+                path: (*f).to_string(),
+                size: 0,
+            })
+            .collect()
+    }
+}
+
 impl ModelArtifact for CohereModelInfo {
     // Intentional: the trait method is `name()` but the struct field that
     // serves as the canonical identifier is `dir_name`. Clippy's
@@ -878,6 +881,25 @@ pub struct RegistryEntry {
 pub struct RegistryFile {
     pub upstream_path: String,
     pub local_path: String,
+}
+
+/// Files an ONNX model is expected to have on disk, by engine and model name.
+///
+/// Only the file *names* come from here. The compiled-in sizes in the model
+/// tables are not usable as an integrity signal: upstream re-uploads have
+/// moved on from several of them (`parakeet-tdt-0.6b-v3-int8`'s encoder is
+/// listed as 683,671,552 bytes and is actually 652,183,999), and
+/// `validate_manifest` only ever compared paths, so the drift went unnoticed.
+/// Names are trustworthy precisely because that check pins them against the
+/// published manifest on every download.
+///
+/// Empty for whisper, whose models are single files with no registry entry.
+pub(crate) fn expected_file_names(engine: &str, model: &str) -> Vec<String> {
+    registry_snapshot()
+        .into_iter()
+        .find(|e| e.engine_prefix == engine && e.name == model)
+        .map(|e| e.files.into_iter().map(|f| f.local_path).collect())
+        .unwrap_or_default()
 }
 
 /// Snapshot the full ONNX-engine model registry (Parakeet, Moonshine,
@@ -993,6 +1015,27 @@ pub fn registry_snapshot() -> Vec<RegistryEntry> {
                 .collect(),
         });
     }
+    // OpenVINO Whisper conversions (Intel's official HF org). Keyed by
+    // dir_name like moonshine/sensevoice, since that is the on-disk layout
+    // download_artifact writes and the R2 tree must mirror byte-for-byte.
+    // Every repo ships the same file set; preprocessor_config.json differs
+    // per model (mel bin count) so it is fetched per-repo, never shared.
+    // Licenses verified 2026-09-01: whisper-* are Apache-2.0,
+    // distil-whisper-* are MIT (#692).
+    for m in OPENVINO_MODELS {
+        out.push(RegistryEntry {
+            engine_prefix: "openvino",
+            name: m.dir_name.to_string(),
+            upstream_repo: m.huggingface_repo.to_string(),
+            files: OPENVINO_MODEL_FILES
+                .iter()
+                .map(|f| RegistryFile {
+                    upstream_path: (*f).to_string(),
+                    local_path: (*f).to_string(),
+                })
+                .collect(),
+        });
+    }
     out
 }
 
@@ -1038,12 +1081,15 @@ pub fn download_artifact<T: ModelArtifact + ?Sized>(
     })?;
     validate_manifest(&manifest, artifact)?;
 
-    println!(
-        "\nDownloading {} ({} files via {})...\n",
-        artifact.name(),
-        manifest.files.len(),
-        manifest_url_str,
-    );
+    let human = !progress::is_json();
+    if human {
+        println!(
+            "\nDownloading {} ({} files via {})...\n",
+            artifact.name(),
+            manifest.files.len(),
+            manifest_url_str,
+        );
+    }
 
     for file in &manifest.files {
         let dest = model_dir.join(&file.path);
@@ -1054,11 +1100,18 @@ pub fn download_artifact<T: ModelArtifact + ?Sized>(
             // otherwise treat as missing and re-download.
             match sha256_file(&dest) {
                 Ok(hash) if hash == file.sha256.to_lowercase() => {
-                    println!("  {} already verified, skipping", file.path);
+                    if human {
+                        println!("  {} already verified, skipping", file.path);
+                    }
+                    // A panel summing per-file progress still needs to see
+                    // this file reach 100%.
+                    progress::file_already_complete(artifact.name(), &file.path, file.size);
                     continue;
                 }
                 _ => {
-                    println!("  {} present but unverified, re-downloading", file.path);
+                    if human {
+                        println!("  {} present but unverified, re-downloading", file.path);
+                    }
                     let _ = std::fs::remove_file(&dest);
                 }
             }
@@ -1069,16 +1122,20 @@ pub fn download_artifact<T: ModelArtifact + ?Sized>(
         }
 
         let url = file_url(artifact, &file.path);
-        println!("Downloading {}...", file.path);
-        curl_download(&url, &dest)?;
+        if human {
+            println!("Downloading {}...", file.path);
+        }
+        let part = download_to_part(&url, &dest, artifact.name(), &file.path, Some(file.size))?;
 
-        let observed = sha256_file(&dest).map_err(|e| {
-            let _ = std::fs::remove_file(&dest);
+        // Hash the part file, not the destination: a file only reaches its
+        // final name once it has matched the manifest.
+        let observed = sha256_file(&part).map_err(|e| {
+            let _ = std::fs::remove_file(&part);
             anyhow::anyhow!("Failed to hash {}: {}", file.path, e)
         })?;
         let expected = file.sha256.to_lowercase();
         if observed != expected {
-            let _ = std::fs::remove_file(&dest);
+            let _ = std::fs::remove_file(&part);
             anyhow::bail!(
                 "sha256 mismatch for {} (downloaded from {}): expected {}, got {}",
                 file.path,
@@ -1087,13 +1144,20 @@ pub fn download_artifact<T: ModelArtifact + ?Sized>(
                 observed,
             );
         }
+        promote_part(&part, &dest)?;
     }
 
-    print_success(&format!(
-        "Model '{}' downloaded to {:?}",
-        artifact.name(),
-        model_dir
-    ));
+    // Leave the manifest behind so later integrity checks have the publisher's
+    // sizes and hashes without a network round trip.
+    super::manifest::write_cached_manifest(&model_dir, &manifest);
+
+    if human {
+        print_success(&format!(
+            "Model '{}' downloaded to {:?}",
+            artifact.name(),
+            model_dir
+        ));
+    }
     Ok(())
 }
 
@@ -1113,24 +1177,78 @@ fn curl_fetch_text(url: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-/// Download a single URL to `dest` via curl with a progress bar. Cleans up
-/// the partial file on failure.
-fn curl_download(url: &str, dest: &Path) -> anyhow::Result<()> {
+/// Scratch path a download occupies until it has been validated: a hidden
+/// `.part` sibling of `dest`.
+///
+/// Nothing may be written directly to a model's final path. A transfer that
+/// dies part way (SIGPIPE from a closed progress consumer, SIGKILL, power
+/// loss) would otherwise leave a truncated file exactly where the loader and
+/// `model_catalog::model_installed` look, so voxtype would report the model as
+/// installed and the daemon would fail to load it. The `.part` name is both
+/// dot-prefixed and suffixed so no installed-model check can match it.
+fn part_path(dest: &Path) -> std::path::PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    parent.join(format!(".{}.part", name))
+}
+
+/// Move a validated download onto its final path.
+///
+/// `rename(2)` within one directory is atomic, so a concurrent reader sees
+/// either no file or the whole, checked file — never a prefix of one.
+fn promote_part(part: &Path, dest: &Path) -> anyhow::Result<()> {
+    std::fs::rename(part, dest).map_err(|e| {
+        let _ = std::fs::remove_file(part);
+        anyhow::anyhow!(
+            "could not move the finished download into place ({} -> {}): {}",
+            part.display(),
+            dest.display(),
+            e
+        )
+    })
+}
+
+/// Download a single URL to `dest`'s `.part` file via curl with a progress
+/// bar, returning the path the bytes landed on. Cleans up on failure.
+///
+/// The caller validates that path and then calls [`promote_part`].
+/// curl flags shared by both download paths.
+///
+/// `-C -` resumes from whatever the `.part` file already holds, which matters
+/// on the 2.4GB models where a dropped connection previously meant starting
+/// from zero. If the server ignores the Range request, curl restarts the
+/// transfer; a server that honours it wrongly is caught by the sha256 check
+/// against the manifest, which is why resuming is safe to do unconditionally.
+///
+/// `--speed-limit` / `--speed-time` abort a connection that goes quiet without
+/// closing, rather than hanging until the user notices (#645).
+const CURL_TRANSFER_ARGS: &[&str] = &[
+    "-L",
+    "--fail",
+    "-C",
+    "-",
+    "--speed-limit",
+    "1024",
+    "--speed-time",
+    "30",
+];
+
+fn curl_download(url: &str, dest: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let part = part_path(dest);
     let status = Command::new("curl")
-        .args([
-            "-L",
-            "--fail",
-            "--progress-bar",
-            "-o",
-            dest.to_str().unwrap_or("file"),
-            url,
-        ])
+        .args(CURL_TRANSFER_ARGS)
+        .args(["--progress-bar", "-o", part.to_str().unwrap_or("file"), url])
         .status();
 
     match status {
-        Ok(s) if s.success() => Ok(()),
+        Ok(s) if s.success() => Ok(part),
         Ok(s) => {
-            let _ = std::fs::remove_file(dest);
+            // Deliberately keep the .part file: the next attempt resumes from
+            // it. A corrupt partial is caught by the sha256 check rather than
+            // by discarding progress on every hiccup.
             print_failure(&format!(
                 "Download failed: curl exited with code {}",
                 s.code().unwrap_or(-1)
@@ -1151,9 +1269,113 @@ fn curl_download(url: &str, dest: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// How often the JSON progress path samples the growing file. Also the
+/// effective ceiling on event rate: ~4 lines/sec per file.
+const PROGRESS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Download `url` into `dest`'s `.part` file, reporting progress in whichever
+/// format this process selected, and return the path the bytes landed on.
+///
+/// Nothing is written to `dest` itself; the caller validates the returned path
+/// and calls [`promote_part`] to make the download visible.
+///
+/// Human mode is [`curl_download`], progress bar and all. JSON mode runs curl
+/// silently and samples the part file's length instead, because curl's
+/// `--progress-bar` output is a terminal animation with no byte counts to
+/// parse and `-w` only reports totals once the transfer is over. Sampling the
+/// file costs one `stat` per tick and needs no new dependency.
+///
+/// `total` comes from the R2 manifest where there is one; the whisper path has
+/// no manifest, so it resolves the size with a `HEAD` and passes it in.
+fn download_to_part(
+    url: &str,
+    dest: &Path,
+    model: &str,
+    file: &str,
+    total: Option<u64>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if !progress::is_json() {
+        return curl_download(url, dest);
+    }
+
+    let part = part_path(dest);
+    let total = total.or_else(|| content_length(url));
+    let mut reporter = FileProgress::new(model, file, total);
+
+    let mut child = Command::new("curl")
+        .args(CURL_TRANSFER_ARGS)
+        .args([
+            "--silent",
+            "--show-error",
+            "-o",
+            part.to_str().unwrap_or("file"),
+            url,
+        ])
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "curl not available: {}. Please ensure curl is installed.",
+                e
+            )
+        })?;
+
+    loop {
+        match child.try_wait()? {
+            Some(status) if status.success() => {
+                reporter.finish(file_len(&part));
+                return Ok(part);
+            }
+            Some(status) => {
+                let _ = std::fs::remove_file(&part);
+                anyhow::bail!(
+                    "Download failed for {} from {} (curl exited with code {}).\n  \
+                     If this persists, check models.voxtype.io status: \
+                     https://www.cloudflarestatus.com/",
+                    dest.display(),
+                    url,
+                    status.code().unwrap_or(-1)
+                );
+            }
+            None => {
+                reporter.update(file_len(&part));
+                std::thread::sleep(PROGRESS_POLL);
+            }
+        }
+    }
+}
+
+/// Bytes on disk so far, or 0 before curl has created the file.
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Ask the server how big a download is, for the paths that have no manifest
+/// to read a size from. Best effort: a server that refuses `HEAD` just means
+/// the progress events carry `"total":null`.
+fn content_length(url: &str) -> Option<u64> {
+    let output = Command::new("curl")
+        .args(["-sIL", "--max-time", "15", url])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Redirect chains produce one header block per hop; the last
+    // content-length is the one describing the body we'll receive.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<u64>().ok())?
+        })
+        .next_back()
+}
+
 /// Streaming sha256 of a file on disk. Used both for post-download
 /// verification and for re-validating a previously cached file.
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
@@ -1203,6 +1425,7 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     let is_dolphin_engine = matches!(config.engine, TranscriptionEngine::Dolphin);
     let is_omnilingual_engine = matches!(config.engine, TranscriptionEngine::Omnilingual);
     let is_cohere_engine = matches!(config.engine, TranscriptionEngine::Cohere);
+    let is_openvino_engine = matches!(config.engine, TranscriptionEngine::OpenVino);
     let current_whisper_model = &config.whisper.model;
     let current_parakeet_model = config.parakeet.as_ref().map(|p| p.model.as_str());
     let current_moonshine_model = config.moonshine.as_ref().map(|m| m.model.as_str());
@@ -1211,6 +1434,7 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     let current_dolphin_model = config.dolphin.as_ref().map(|d| d.model.as_str());
     let current_omnilingual_model = config.omnilingual.as_ref().map(|o| o.model.as_str());
     let current_cohere_model = config.cohere.as_ref().map(|c| c.model.as_str());
+    let current_openvino_model = config.openvino.as_ref().map(|o| o.model.as_str());
     let parakeet_available = cfg!(feature = "parakeet");
     let moonshine_available = cfg!(feature = "moonshine");
     let sensevoice_available = cfg!(feature = "sensevoice");
@@ -1218,6 +1442,7 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     let dolphin_available = cfg!(feature = "dolphin");
     let omnilingual_available = cfg!(feature = "omnilingual");
     let cohere_available = cfg!(feature = "cohere");
+    let openvino_available = cfg!(feature = "openvino-whisper");
     let whisper_count = MODELS.len();
     let parakeet_count = PARAKEET_MODELS.len();
     let moonshine_count = MOONSHINE_MODELS.len();
@@ -1226,6 +1451,7 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     let dolphin_count = DOLPHIN_MODELS.len();
     let omnilingual_count = OMNILINGUAL_MODELS.len();
     let cohere_count = COHERE_MODELS.len();
+    let openvino_count = OPENVINO_MODELS.len();
 
     let available_count = |available: bool, count: usize| if available { count } else { 0 };
     let total_count = whisper_count
@@ -1235,7 +1461,8 @@ pub async fn interactive_select() -> anyhow::Result<()> {
         + available_count(paraformer_available, paraformer_count)
         + available_count(dolphin_available, dolphin_count)
         + available_count(omnilingual_available, omnilingual_count)
-        + available_count(cohere_available, cohere_count);
+        + available_count(cohere_available, cohere_count)
+        + available_count(openvino_available, openvino_count);
 
     // --- Whisper Section ---
     println!("--- Whisper (OpenAI, 99+ languages) ---\n");
@@ -1535,6 +1762,45 @@ pub async fn interactive_select() -> anyhow::Result<()> {
         println!("  \x1b[90m(not available - rebuild with --features cohere)\x1b[0m");
     }
 
+    // --- OpenVINO Section ---
+    let openvino_offset = cohere_offset + available_count(cohere_available, cohere_count);
+    println!("\n--- OpenVINO Whisper (Intel NPU/CPU/GPU via OpenVINO) ---\n");
+
+    if openvino_available {
+        for (i, model) in OPENVINO_MODELS.iter().enumerate() {
+            let model_path = models_dir.join(model.dir_name);
+            let installed = model_path.exists() && validate_openvino_model(&model_path).is_ok();
+
+            let is_current = is_openvino_engine && current_openvino_model == Some(model.name);
+            let star = if is_current { "*" } else { " " };
+
+            let status = if installed {
+                "\x1b[32m[installed]\x1b[0m"
+            } else {
+                ""
+            };
+
+            let lang = if model.name.contains(".en") {
+                "en"
+            } else {
+                "multi"
+            };
+
+            println!(
+                " {}[{:>2}] {:<28} (~{:>4} MB) {} - {} {}",
+                star,
+                openvino_offset + i + 1,
+                model.name,
+                model.size_mb,
+                lang,
+                model.description,
+                status
+            );
+        }
+    } else {
+        println!("  \x1b[90m(not available - rebuild with --features openvino-whisper)\x1b[0m");
+    }
+
     println!("\n  [ 0] Cancel\n");
 
     // Get user selection
@@ -1581,6 +1847,9 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     } else if cohere_available && selection <= cohere_offset + cohere_count {
         let idx = selection - cohere_offset;
         handle_cohere_selection(idx).await
+    } else if openvino_available && selection <= openvino_offset + openvino_count {
+        let idx = selection - openvino_offset;
+        handle_openvino_selection(idx, &config).await
     } else {
         println!("\nInvalid selection.");
         Ok(())
@@ -1802,6 +2071,94 @@ async fn restart_daemon_if_running() {
 // Whisper Download Functions
 // =============================================================================
 
+/// First four bytes of every whisper.cpp model: `GGML_FILE_MAGIC`
+/// (`0x67676d6c`) written little-endian.
+const GGML_MAGIC: [u8; 4] = *b"lmgg";
+
+/// What a finished download has to look like before it may take its final
+/// name. None of these files are on the R2 mirror, so there is no published
+/// sha256 to compare against and this is the whole of their validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentCheck {
+    /// ggml container: whisper models and the Silero VAD model.
+    Ggml,
+    /// No format marker worth checking (ONNX protobufs); completeness only.
+    SizeOnly,
+}
+
+/// Check a freshly downloaded file before it takes the name the loader reads.
+///
+/// The two signals available without a manifest are the server's
+/// `Content-Length` and the file's own magic, which between them catch the
+/// realistic failures: a truncated transfer, and an HTML error page saved
+/// under a `.bin` name.
+pub(crate) fn validate_download(
+    path: &Path,
+    expected_len: Option<u64>,
+    check: ContentCheck,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let len = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("could not stat the download: {}", e))?
+        .len();
+    if len == 0 {
+        anyhow::bail!("the download is empty");
+    }
+    if let Some(expected) = expected_len {
+        if len != expected {
+            anyhow::bail!("incomplete download: got {} of {} bytes", len, expected);
+        }
+    }
+
+    if check == ContentCheck::Ggml {
+        let mut magic = [0u8; 4];
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .map_err(|e| anyhow::anyhow!("could not read the download: {}", e))?;
+        if magic != GGML_MAGIC {
+            anyhow::bail!(
+                "not a ggml model: expected magic {:02x?}, got {:02x?}. \
+                 The server likely returned an error page instead of the model.",
+                GGML_MAGIC,
+                magic
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Download one file to `dest` without ever exposing a partial one there.
+///
+/// Bytes land on a `.part` sibling, get checked for completeness (and format,
+/// per `check`), and only then take the final name via an atomic rename. Used
+/// by every single-file download that has no R2 manifest behind it: whisper
+/// models, the Silero VAD model, and the auxiliary meeting-mode models.
+///
+/// `label` is the name reported in progress events.
+pub(crate) fn download_atomically(
+    url: &str,
+    dest: &Path,
+    label: &str,
+    check: ContentCheck,
+) -> anyhow::Result<()> {
+    let file = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| label.to_string());
+
+    // Ask the server for the size, since there's no manifest to read it from.
+    // Best effort: a server that refuses HEAD just leaves the size check out.
+    let expected_len = content_length(url);
+
+    let part = download_to_part(url, dest, label, &file, expected_len)?;
+    validate_download(&part, expected_len, check).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        anyhow::anyhow!("Downloaded file '{}' is not usable: {}", file, e)
+    })?;
+    promote_part(&part, dest)
+}
+
 /// Download a specific Whisper model using curl
 pub fn download_model(model_name: &str) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
@@ -1813,40 +2170,17 @@ pub fn download_model(model_name: &str) -> anyhow::Result<()> {
 
     let url = get_model_url(model_name);
 
-    println!("\nDownloading {}...", model_name);
-    println!("URL: {}", url);
-
-    // Use curl for downloading - it handles progress display and redirects
-    let status = Command::new("curl")
-        .args([
-            "-L",             // Follow redirects
-            "--progress-bar", // Show progress bar
-            "-o",
-            model_path.to_str().unwrap_or("model.bin"),
-            &url,
-        ])
-        .status();
-
-    match status {
-        Ok(exit_status) if exit_status.success() => {
-            print_success(&format!("Saved to {:?}", model_path));
-            Ok(())
-        }
-        Ok(exit_status) => {
-            print_failure(&format!(
-                "Download failed: curl exited with code {}",
-                exit_status.code().unwrap_or(-1)
-            ));
-            // Clean up partial download
-            let _ = std::fs::remove_file(&model_path);
-            anyhow::bail!("Download failed")
-        }
-        Err(e) => {
-            print_failure(&format!("Failed to run curl: {}", e));
-            print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
-            anyhow::bail!("curl not available: {}", e)
-        }
+    if !progress::is_json() {
+        println!("\nDownloading {}...", model_name);
+        println!("URL: {}", url);
     }
+
+    download_atomically(&url, &model_path, model_name, ContentCheck::Ggml)?;
+
+    if !progress::is_json() {
+        print_success(&format!("Saved to {:?}", model_path));
+    }
+    Ok(())
 }
 
 /// GTCRN speech enhancement model URL and filename
@@ -1876,28 +2210,21 @@ pub fn ensure_gtcrn_model() -> Option<std::path::PathBuf> {
 
     println!("Downloading GTCRN speech enhancement model (523 KB)...");
 
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            "--progress-bar",
-            "-o",
-            model_path.to_str().unwrap_or("gtcrn_simple.onnx"),
-            GTCRN_MODEL_URL,
-        ])
-        .status();
-
-    match status {
-        Ok(exit_status) if exit_status.success() => {
+    // These `ensure_*` helpers treat "the file exists" as "the model is
+    // installed" and never re-download, so a partial file here is permanent.
+    // The atomic path is what keeps that from happening.
+    match download_atomically(
+        GTCRN_MODEL_URL,
+        &model_path,
+        "gtcrn",
+        ContentCheck::SizeOnly,
+    ) {
+        Ok(()) => {
             println!("Speech enhancement model downloaded.");
             Some(model_path)
         }
-        Ok(_) => {
-            eprintln!("Warning: Failed to download speech enhancement model. Meetings will work without echo cancellation.");
-            let _ = std::fs::remove_file(&model_path);
-            None
-        }
-        Err(_) => {
-            eprintln!("Warning: curl not available. Speech enhancement model not downloaded.");
+        Err(e) => {
+            eprintln!("Warning: Failed to download speech enhancement model ({e}). Meetings will work without echo cancellation.");
             None
         }
     }
@@ -1922,49 +2249,111 @@ pub fn ensure_ecapa_model() -> Option<std::path::PathBuf> {
 
     println!("Downloading ECAPA-TDNN speaker embedding model (~26 MB)...");
 
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            "--progress-bar",
-            "-o",
-            model_path.to_str().unwrap_or(ECAPA_MODEL_FILENAME),
-            ECAPA_MODEL_URL,
-        ])
-        .status();
-
-    match status {
-        Ok(exit_status) if exit_status.success() => {
+    match download_atomically(
+        ECAPA_MODEL_URL,
+        &model_path,
+        "ecapa-tdnn",
+        ContentCheck::SizeOnly,
+    ) {
+        Ok(()) => {
             println!("Speaker embedding model downloaded.");
             Some(model_path)
         }
-        Ok(_) => {
-            eprintln!("Warning: Failed to download speaker embedding model. ML diarization will fall back to simple speaker attribution.");
-            let _ = std::fs::remove_file(&model_path);
+        Err(e) => {
+            eprintln!("Warning: Failed to download speaker embedding model ({e}). ML diarization will fall back to simple speaker attribution.");
             None
         }
-        Err(_) => {
-            eprintln!("Warning: curl not available. Speaker embedding model not downloaded.");
-            None
-        }
+    }
+}
+
+/// Which config writer a `setup model --set <name>` should route to.
+///
+/// `--set` used to funnel every name into the whisper writer, which
+/// hard-codes `engine = "whisper"`. Passing a Parakeet model produced a
+/// self-contradictory config (`engine = "whisper"` + a Parakeet name in
+/// `[whisper].model`) that crash-loops the daemon while `--set` reports
+/// success (#610). Anything that is not a known engine's registry name
+/// still routes to Whisper: whisper accepts bare registry names and
+/// filesystem paths to .bin files, so unknown strings belong there.
+#[derive(Debug, PartialEq)]
+enum SetModelRoute {
+    Whisper,
+    Parakeet,
+    /// A known model of an engine `--set` has no config writer for yet.
+    UnsupportedEngine(&'static str),
+}
+
+fn set_model_route(model_name: &str) -> SetModelRoute {
+    // Whisper registry names win outright: engines share short names with
+    // whisper (SenseVoice literally has a model named "small"), and `--set`
+    // has always meant the whisper model for those. Only names whisper does
+    // not claim are classified against the other engines.
+    if is_valid_model(model_name) {
+        SetModelRoute::Whisper
+    } else if is_parakeet_model(model_name) {
+        SetModelRoute::Parakeet
+    } else if MOONSHINE_MODELS
+        .iter()
+        .any(|m| m.dir_name == model_name || m.name == model_name)
+    {
+        // Moonshine registry `name`s ("base", "tiny") all collide with
+        // whisper and are claimed above; only the unambiguous dir_names
+        // ("moonshine-base") reach this arm in practice.
+        SetModelRoute::UnsupportedEngine("moonshine")
+    } else if is_sensevoice_model(model_name) {
+        SetModelRoute::UnsupportedEngine("sensevoice")
+    } else {
+        SetModelRoute::Whisper
     }
 }
 
 /// Set a specific model as the default (must already be downloaded)
 pub async fn set_model(model_name: &str, restart: bool) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
-    let filename = get_model_filename(model_name);
-    let model_path = models_dir.join(&filename);
 
-    // Verify the model exists
-    if !model_path.exists() {
-        print_failure(&format!("Model '{}' is not installed", model_name));
-        println!("\n  Run 'voxtype setup model' to download it first.");
-        println!("  Or 'voxtype setup model --list' to see installed models.");
-        anyhow::bail!("Model not installed: {}", model_name);
+    match set_model_route(model_name) {
+        SetModelRoute::Parakeet => {
+            let model_dir = models_dir.join(model_name);
+            if !model_dir.exists() {
+                print_failure(&format!("Model '{}' is not installed", model_name));
+                println!(
+                    "\n  Run 'voxtype setup --download --model {}' to download it first.",
+                    model_name
+                );
+                anyhow::bail!("Model not installed: {}", model_name);
+            }
+            // Writes engine = "parakeet" and [parakeet].model, and prints
+            // its own success line naming both.
+            update_config_parakeet(model_name)?;
+        }
+        SetModelRoute::UnsupportedEngine(engine) => {
+            print_failure(&format!(
+                "'{}' is a {} model; `setup model --set` cannot activate it yet",
+                model_name, engine
+            ));
+            println!(
+                "\n  Use: voxtype setup --download --model {} --activate",
+                model_name
+            );
+            println!("  Or switch engines in the TUI: voxtype configure");
+            anyhow::bail!("--set does not support {} models", engine);
+        }
+        SetModelRoute::Whisper => {
+            let filename = get_model_filename(model_name);
+            let model_path = models_dir.join(&filename);
+
+            // Verify the model exists
+            if !model_path.exists() {
+                print_failure(&format!("Model '{}' is not installed", model_name));
+                println!("\n  Run 'voxtype setup model' to download it first.");
+                println!("  Or 'voxtype setup model --list' to see installed models.");
+                anyhow::bail!("Model not installed: {}", model_name);
+            }
+
+            // Update the config
+            update_config_model(model_name)?;
+        }
     }
-
-    // Update the config
-    update_config_model(model_name)?;
 
     if restart {
         println!("  Restarting daemon...");
@@ -2022,7 +2411,39 @@ pub fn list_installed() {
     }
 
     if !found {
-        println!("  No models installed.");
+        println!("  No Whisper models installed.");
+    }
+
+    // List installed OpenVINO models
+    println!("\nInstalled OpenVINO Whisper Models\n");
+    println!("=================================\n");
+
+    let mut openvino_found = false;
+
+    for model in OPENVINO_MODELS {
+        let model_path = models_dir.join(model.dir_name);
+
+        if model_path.exists() && validate_openvino_model(&model_path).is_ok() {
+            let size = std::fs::read_dir(&model_path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+                        .sum::<f64>()
+                })
+                .unwrap_or(0.0);
+
+            println!("  {} ({:.0} MB) - {}", model.name, size, model.description);
+            openvino_found = true;
+        }
+    }
+
+    if !openvino_found {
+        println!("  No OpenVINO models installed.");
+    }
+
+    if !found && !openvino_found {
         println!("\n  Run 'voxtype setup model' to download a model.");
     }
 }
@@ -2327,14 +2748,45 @@ pub fn list_installed_parakeet() {
 // Moonshine Model Functions
 // =============================================================================
 
+fn find_moonshine_model(name: &str) -> Option<&'static MoonshineModelInfo> {
+    MOONSHINE_MODELS
+        .iter()
+        .find(|m| m.name == name || m.dir_name == name)
+}
+
 /// Check if a model name is a Moonshine model
 pub fn is_moonshine_model(name: &str) -> bool {
-    MOONSHINE_MODELS.iter().any(|m| m.name == name)
+    find_moonshine_model(name).is_some()
 }
 
 /// Get list of valid Moonshine model names
 pub fn valid_moonshine_model_names() -> Vec<&'static str> {
     MOONSHINE_MODELS.iter().map(|m| m.name).collect()
+}
+
+/// Moonshine names to show for `voxtype setup --model`. Uses the directory
+/// form so the suggestion can't be swallowed by the Whisper table (`base`
+/// and `tiny` are Whisper names too).
+pub fn moonshine_setup_model_names() -> Vec<&'static str> {
+    MOONSHINE_MODELS.iter().map(|m| m.dir_name).collect()
+}
+
+/// Config value for a Moonshine model: the short name, matching what the
+/// interactive picker writes and the `[moonshine]` default.
+pub fn moonshine_config_name(name: &str) -> Option<&'static str> {
+    find_moonshine_model(name).map(|m| m.name)
+}
+
+/// Directory name for a Moonshine model.
+///
+/// Moonshine, like SenseVoice, uses short config values (`base`) while the
+/// on-disk directory carries the engine prefix (`moonshine-base`). Anything
+/// looking for the files needs this mapping, not the config value.
+pub fn moonshine_dir_name(name: &str) -> Option<&'static str> {
+    MOONSHINE_MODELS
+        .iter()
+        .find(|m| m.name == name || m.dir_name == name)
+        .map(|m| m.dir_name)
 }
 
 /// Validate that a Moonshine model directory has the required files
@@ -2373,9 +2825,7 @@ pub fn validate_moonshine_model(path: &Path) -> anyhow::Result<()> {
 /// after to guard against publisher errors that the sha256 check can't
 /// catch.
 pub fn download_moonshine_model(model_name: &str) -> anyhow::Result<()> {
-    let model = MOONSHINE_MODELS
-        .iter()
-        .find(|m| m.name == model_name)
+    let model = find_moonshine_model(model_name)
         .ok_or_else(|| anyhow::anyhow!("Unknown Moonshine model: {}", model_name))?;
 
     let models_dir = Config::models_dir();
@@ -2387,6 +2837,28 @@ pub fn download_moonshine_model(model_name: &str) -> anyhow::Result<()> {
 // =============================================================================
 // Cohere Transcribe Functions
 // =============================================================================
+
+fn find_cohere_model(name: &str) -> Option<&'static CohereModelInfo> {
+    COHERE_MODELS
+        .iter()
+        .find(|m| m.name == name || m.dir_name == name)
+}
+
+/// Check if a model name is a Cohere model
+pub fn is_cohere_model(name: &str) -> bool {
+    find_cohere_model(name).is_some()
+}
+
+/// Directory name for a Cohere model. Also its config value: the picker,
+/// the catalog, and the `[cohere]` default all use the directory form.
+pub fn cohere_dir_name(name: &str) -> Option<&'static str> {
+    find_cohere_model(name).map(|m| m.dir_name)
+}
+
+/// Cohere names to show for `voxtype setup --model`.
+pub fn cohere_setup_model_names() -> Vec<&'static str> {
+    COHERE_MODELS.iter().map(|m| m.dir_name).collect()
+}
 
 /// Validate that a Cohere model directory has the required files.
 ///
@@ -2433,9 +2905,7 @@ pub fn validate_cohere_model(path: &Path) -> anyhow::Result<()> {
 /// the unified downloader takes over so users don't wonder why their
 /// disk is filling.
 pub fn download_cohere_model(model_name: &str) -> anyhow::Result<()> {
-    let model = COHERE_MODELS
-        .iter()
-        .find(|m| m.name == model_name)
+    let model = find_cohere_model(model_name)
         .ok_or_else(|| anyhow::anyhow!("Unknown Cohere model: {}", model_name))?;
     let models_dir = Config::models_dir();
     let model_path = models_dir.join(model.dir_name);
@@ -2818,22 +3288,36 @@ pub fn list_installed_moonshine() {
 // SenseVoice Model Functions
 // =============================================================================
 
+/// Look up a SenseVoice model by its config name (`small`) or its directory
+/// name (`sensevoice-small`).
+///
+/// The directory form exists because `small` also names a Whisper model and
+/// Whisper wins that collision in `voxtype setup --model`.
+fn find_sensevoice_model(name: &str) -> Option<&'static SenseVoiceModelInfo> {
+    SENSEVOICE_MODELS
+        .iter()
+        .find(|m| m.name == name || m.dir_name == name)
+}
+
 /// Check if a model name is a SenseVoice model
 pub fn is_sensevoice_model(name: &str) -> bool {
-    SENSEVOICE_MODELS.iter().any(|m| m.name == name)
+    find_sensevoice_model(name).is_some()
 }
 
 /// Get the directory name for a SenseVoice model
 pub fn sensevoice_dir_name(name: &str) -> Option<&'static str> {
-    SENSEVOICE_MODELS
-        .iter()
-        .find(|m| m.name == name)
-        .map(|m| m.dir_name)
+    find_sensevoice_model(name).map(|m| m.dir_name)
 }
 
 /// Get list of valid SenseVoice model names
 pub fn valid_sensevoice_model_names() -> Vec<&'static str> {
     SENSEVOICE_MODELS.iter().map(|m| m.name).collect()
+}
+
+/// SenseVoice names to show for `voxtype setup --model`. Uses the directory
+/// form so the suggestion can't be swallowed by the Whisper table.
+pub fn sensevoice_setup_model_names() -> Vec<&'static str> {
+    SENSEVOICE_MODELS.iter().map(|m| m.dir_name).collect()
 }
 
 /// Validate that a SenseVoice model directory has the required files
@@ -2867,9 +3351,7 @@ pub fn validate_sensevoice_model(path: &Path) -> anyhow::Result<()> {
 /// Routes through the unified R2 downloader; per-engine validator runs
 /// after to guard against publisher errors the sha256 check can't catch.
 pub fn download_sensevoice_model(model_name: &str) -> anyhow::Result<()> {
-    let model = SENSEVOICE_MODELS
-        .iter()
-        .find(|m| m.name == model_name)
+    let model = find_sensevoice_model(model_name)
         .ok_or_else(|| anyhow::anyhow!("Unknown SenseVoice model: {}", model_name))?;
 
     let models_dir = Config::models_dir();
@@ -3022,7 +3504,7 @@ pub fn list_installed_sensevoice() {
 // =============================================================================
 
 /// Validate a CTC-based ONNX model directory (model.int8.onnx or model.onnx + tokens.txt)
-fn validate_onnx_ctc_model(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_onnx_ctc_model(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("Model directory does not exist: {:?}", path);
     }
@@ -3042,6 +3524,197 @@ fn validate_onnx_ctc_model(path: &Path) -> anyhow::Result<()> {
         }
         anyhow::bail!("Incomplete model, missing: {}", missing.join(", "))
     }
+}
+
+fn find_paraformer_model(name: &str) -> Option<&'static ParaformerModelInfo> {
+    PARAFORMER_MODELS
+        .iter()
+        .find(|m| m.name == name || m.dir_name == name)
+}
+
+/// Check if a model name is a Paraformer model
+pub fn is_paraformer_model(name: &str) -> bool {
+    find_paraformer_model(name).is_some()
+}
+
+/// Directory name for a Paraformer model. Also its config value: the catalog
+/// and the `[paraformer]` default use the directory form, and the runtime
+/// resolver accepts it.
+pub fn paraformer_dir_name(name: &str) -> Option<&'static str> {
+    find_paraformer_model(name).map(|m| m.dir_name)
+}
+
+/// Paraformer names to show for `voxtype setup --model`.
+pub fn paraformer_setup_model_names() -> Vec<&'static str> {
+    PARAFORMER_MODELS.iter().map(|m| m.dir_name).collect()
+}
+
+/// Download a Paraformer model by name (public API for run_setup).
+pub fn download_paraformer_model(model_name: &str) -> anyhow::Result<()> {
+    let model = find_paraformer_model(model_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown Paraformer model: {}", model_name))?;
+    let models_dir = Config::models_dir();
+    download_artifact(model, &models_dir)?;
+    validate_onnx_ctc_model(&models_dir.join(model.dir_name))?;
+    Ok(())
+}
+
+fn find_dolphin_model(name: &str) -> Option<&'static DolphinModelInfo> {
+    DOLPHIN_MODELS
+        .iter()
+        .find(|m| m.name == name || m.dir_name == name)
+}
+
+/// Check if a model name is a Dolphin model
+pub fn is_dolphin_model(name: &str) -> bool {
+    find_dolphin_model(name).is_some()
+}
+
+/// Directory name for a Dolphin model. Also its config value.
+pub fn dolphin_dir_name(name: &str) -> Option<&'static str> {
+    find_dolphin_model(name).map(|m| m.dir_name)
+}
+
+/// Dolphin names to show for `voxtype setup --model`. Uses the directory
+/// form so the suggestion can't be swallowed by the Whisper table (`base`
+/// is a Whisper name too).
+pub fn dolphin_setup_model_names() -> Vec<&'static str> {
+    DOLPHIN_MODELS.iter().map(|m| m.dir_name).collect()
+}
+
+/// Download a Dolphin model by name (public API for run_setup).
+pub fn download_dolphin_model(model_name: &str) -> anyhow::Result<()> {
+    let model = find_dolphin_model(model_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown Dolphin model: {}", model_name))?;
+    let models_dir = Config::models_dir();
+    download_artifact(model, &models_dir)?;
+    validate_onnx_ctc_model(&models_dir.join(model.dir_name))?;
+    Ok(())
+}
+
+fn find_omnilingual_model(name: &str) -> Option<&'static OmnilingualModelInfo> {
+    OMNILINGUAL_MODELS
+        .iter()
+        .find(|m| m.name == name || m.dir_name == name)
+}
+
+/// Check if a model name is an Omnilingual model
+pub fn is_omnilingual_model(name: &str) -> bool {
+    find_omnilingual_model(name).is_some()
+}
+
+/// Directory name for an Omnilingual model. Also its config value.
+pub fn omnilingual_dir_name(name: &str) -> Option<&'static str> {
+    find_omnilingual_model(name).map(|m| m.dir_name)
+}
+
+/// Omnilingual names to show for `voxtype setup --model`.
+pub fn omnilingual_setup_model_names() -> Vec<&'static str> {
+    OMNILINGUAL_MODELS.iter().map(|m| m.dir_name).collect()
+}
+
+/// Download an Omnilingual model by name (public API for run_setup).
+pub fn download_omnilingual_model(model_name: &str) -> anyhow::Result<()> {
+    let model = find_omnilingual_model(model_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown Omnilingual model: {}", model_name))?;
+    let models_dir = Config::models_dir();
+    download_artifact(model, &models_dir)?;
+    validate_onnx_ctc_model(&models_dir.join(model.dir_name))?;
+    Ok(())
+}
+
+/// Silently point the config at `engine` + `model_name`, like
+/// `set_parakeet_config`: no status output, so `run_setup` can print its own
+/// confirmation while honoring --quiet.
+pub(crate) fn set_engine_model_config(engine: &str, model_name: &str) -> anyhow::Result<()> {
+    if let Some(config_path) = Config::default_path() {
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            let updated = update_engine_in_config(&content, engine, model_name);
+            std::fs::write(&config_path, updated)?;
+        }
+        Ok(())
+    } else {
+        anyhow::bail!("Could not determine config path")
+    }
+}
+
+/// Handle OpenVINO model selection (download/config).
+async fn handle_openvino_selection(selection: usize, config: &Config) -> anyhow::Result<()> {
+    let models_dir = Config::models_dir();
+
+    if selection == 0 || selection > OPENVINO_MODELS.len() {
+        println!("\nCancelled.");
+        return Ok(());
+    }
+
+    let model = &OPENVINO_MODELS[selection - 1];
+    let model_path = models_dir.join(model.dir_name);
+
+    if model_path.exists() && validate_openvino_model(&model_path).is_ok() {
+        println!("\nModel '{}' is already installed.\n", model.name);
+        println!("  [1] Set as default model (update config)");
+        println!("  [2] Re-download");
+        println!("  [0] Cancel\n");
+        print!("Select option [1]: ");
+        io::stdout().flush()?;
+
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice)?;
+        match choice.trim() {
+            "" | "1" => {
+                update_config_openvino(model.name)?;
+                prepare_openvino_model(model.name, config);
+                restart_daemon_if_running().await;
+                return Ok(());
+            }
+            "2" => {}
+            _ => {
+                println!("Cancelled.");
+                return Ok(());
+            }
+        }
+    }
+
+    download_openvino_model(model.name)?;
+    update_config_openvino(model.name)?;
+    prepare_openvino_model(model.name, config);
+    restart_daemon_if_running().await;
+    Ok(())
+}
+
+/// Update config to use OpenVINO with a specific model.
+fn update_config_openvino(model_name: &str) -> anyhow::Result<()> {
+    if let Some(config_path) = Config::default_path() {
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            let updated = update_openvino_in_config(&content, model_name);
+            std::fs::write(&config_path, &updated)?;
+            print_success(&format!(
+                "Config updated: engine = \"openvino\", model = \"{}\"",
+                model_name
+            ));
+            let device = toml::from_str::<Config>(&updated)
+                .ok()
+                .and_then(|config| config.openvino.map(|openvino| openvino.device))
+                .unwrap_or_else(|| "NPU".to_string());
+            print_openvino_installation_guidance(&device);
+        } else {
+            print_info("No config file found. Run 'voxtype setup' first.");
+        }
+        Ok(())
+    } else {
+        anyhow::bail!("Could not determine config path")
+    }
+}
+
+/// Print the runtime and driver requirements for a configured OpenVINO device.
+pub fn print_openvino_installation_guidance(device: &str) {
+    let config = crate::config::OpenVinoConfig {
+        device: device.to_string(),
+        ..crate::config::OpenVinoConfig::default()
+    };
+    println!("\n{}", config.installation_guidance());
 }
 
 /// Generic handler for ONNX engine model selection (download/config/restart).
@@ -3204,9 +3877,749 @@ fn update_engine_in_config(config: &str, engine_name: &str, model_name: &str) ->
     result
 }
 
+// --- OpenVINO Whisper Models ---
+
+struct OpenVinoModelInfo {
+    /// Short config name (e.g., "base.en-int8", "small-fp16")
+    name: &'static str,
+    /// Directory name under models/
+    dir_name: &'static str,
+    size_mb: u32,
+    description: &'static str,
+    /// Quantization type
+    quantization: &'static str,
+    huggingface_repo: &'static str,
+}
+
+/// Files common to all OpenVINO Whisper model repos
+const OPENVINO_MODEL_FILES: &[&str] = &[
+    "openvino_encoder_model.xml",
+    "openvino_encoder_model.bin",
+    "openvino_decoder_model.xml",
+    "openvino_decoder_model.bin",
+    "openvino_tokenizer.xml",
+    "openvino_tokenizer.bin",
+    "openvino_detokenizer.xml",
+    "openvino_detokenizer.bin",
+    "tokenizer.json",
+    "config.json",
+    "generation_config.json",
+    // Mel-spectrogram feature-extraction params (n_mels/hop_length/etc).
+    // Not needed to *construct* a WhisperPipeline -- only the .xml/.bin
+    // graphs above are -- but OpenVINO GenAI reads it internally on the
+    // first real transcription call, so its absence didn't show up here;
+    // it surfaced downstream as an opaque "unknown exception" instead.
+    // Fetched per-model like everything else above (the URL below is
+    // templated with `model.huggingface_repo`), which matters since this
+    // file isn't identical across sizes -- large-v3/large-v3-turbo use
+    // 128 mel bins, everything else uses 80.
+    "preprocessor_config.json",
+];
+
+/// Files required for an OpenVINO Whisper model to be usable at inference time.
+const OPENVINO_REQUIRED_MODEL_FILES: &[&str] = &[
+    "openvino_encoder_model.xml",
+    "openvino_encoder_model.bin",
+    "openvino_decoder_model.xml",
+    "openvino_decoder_model.bin",
+    "tokenizer.json",
+    "preprocessor_config.json",
+];
+
+const OPENVINO_MODELS: &[OpenVinoModelInfo] = &[
+    // --- Tiny models ---
+    OpenVinoModelInfo {
+        name: "tiny-int4",
+        dir_name: "openvino-whisper-tiny-int4-ov",
+        size_mb: 25,
+        description: "Multilingual, int4 quantized (smallest)",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-tiny-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "tiny-int8",
+        dir_name: "openvino-whisper-tiny-int8-ov",
+        size_mb: 50,
+        description: "Multilingual, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-tiny-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "tiny-fp16",
+        dir_name: "openvino-whisper-tiny-fp16-ov",
+        size_mb: 80,
+        description: "Multilingual, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-tiny-fp16-ov",
+    },
+    OpenVinoModelInfo {
+        name: "tiny.en-int4",
+        dir_name: "openvino-whisper-tiny.en-int4-ov",
+        size_mb: 25,
+        description: "English, int4 quantized (smallest)",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-tiny.en-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "tiny.en-int8",
+        dir_name: "openvino-whisper-tiny.en-int8-ov",
+        size_mb: 50,
+        description: "English, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-tiny.en-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "tiny.en-fp16",
+        dir_name: "openvino-whisper-tiny.en-fp16-ov",
+        size_mb: 80,
+        description: "English, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-tiny.en-fp16-ov",
+    },
+    // --- Base models ---
+    OpenVinoModelInfo {
+        name: "base-int4",
+        dir_name: "openvino-whisper-base-int4-ov",
+        size_mb: 55,
+        description: "Multilingual, int4 quantized",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-base-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "base-int8",
+        dir_name: "openvino-whisper-base-int8-ov",
+        size_mb: 100,
+        description: "Multilingual, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-base-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "base-fp16",
+        dir_name: "openvino-whisper-base-fp16-ov",
+        size_mb: 145,
+        description: "Multilingual, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-base-fp16-ov",
+    },
+    OpenVinoModelInfo {
+        name: "base.en-int4",
+        dir_name: "openvino-whisper-base.en-int4-ov",
+        size_mb: 55,
+        description: "English, int4 quantized",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-base.en-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "base.en-int8",
+        dir_name: "openvino-whisper-base.en-int8-ov",
+        size_mb: 100,
+        description: "English, int8 quantized (best for NPU)",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-base.en-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "base.en-fp16",
+        dir_name: "openvino-whisper-base.en-fp16-ov",
+        size_mb: 145,
+        description: "English, fp16 (higher accuracy)",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-base.en-fp16-ov",
+    },
+    // --- Small models ---
+    OpenVinoModelInfo {
+        name: "small-int4",
+        dir_name: "openvino-whisper-small-int4-ov",
+        size_mb: 160,
+        description: "Multilingual, int4 quantized",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-small-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "small-int8",
+        dir_name: "openvino-whisper-small-int8-ov",
+        size_mb: 300,
+        description: "Multilingual, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-small-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "small-fp16",
+        dir_name: "openvino-whisper-small-fp16-ov",
+        size_mb: 470,
+        description: "Multilingual, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-small-fp16-ov",
+    },
+    OpenVinoModelInfo {
+        name: "small.en-int4",
+        dir_name: "openvino-whisper-small.en-int4-ov",
+        size_mb: 160,
+        description: "English, int4 quantized",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-small.en-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "small.en-int8",
+        dir_name: "openvino-whisper-small.en-int8-ov",
+        size_mb: 300,
+        description: "English, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-small.en-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "small.en-fp16",
+        dir_name: "openvino-whisper-small.en-fp16-ov",
+        size_mb: 470,
+        description: "English, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-small.en-fp16-ov",
+    },
+    // --- Medium models ---
+    OpenVinoModelInfo {
+        name: "medium-int4",
+        dir_name: "openvino-whisper-medium-int4-ov",
+        size_mb: 400,
+        description: "Multilingual, int4 quantized",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-medium-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "medium-int8",
+        dir_name: "openvino-whisper-medium-int8-ov",
+        size_mb: 780,
+        description: "Multilingual, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-medium-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "medium-fp16",
+        dir_name: "openvino-whisper-medium-fp16-ov",
+        size_mb: 1500,
+        description: "Multilingual, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-medium-fp16-ov",
+    },
+    OpenVinoModelInfo {
+        name: "medium.en-int4",
+        dir_name: "openvino-whisper-medium.en-int4-ov",
+        size_mb: 400,
+        description: "English, int4 quantized",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-medium.en-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "medium.en-int8",
+        dir_name: "openvino-whisper-medium.en-int8-ov",
+        size_mb: 780,
+        description: "English, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-medium.en-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "medium.en-fp16",
+        dir_name: "openvino-whisper-medium.en-fp16-ov",
+        size_mb: 1500,
+        description: "English, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-medium.en-fp16-ov",
+    },
+    // --- Large-v3 models ---
+    OpenVinoModelInfo {
+        name: "large-v3-int4",
+        dir_name: "openvino-whisper-large-v3-int4-ov",
+        size_mb: 850,
+        description: "Multilingual, best accuracy, int4 quantized",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/whisper-large-v3-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "large-v3-int8",
+        dir_name: "openvino-whisper-large-v3-int8-ov",
+        size_mb: 1600,
+        description: "Multilingual, best accuracy, int8 quantized",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/whisper-large-v3-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "large-v3-fp16",
+        dir_name: "openvino-whisper-large-v3-fp16-ov",
+        size_mb: 3100,
+        description: "Multilingual, best accuracy, fp16",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/whisper-large-v3-fp16-ov",
+    },
+    // --- Distil-whisper models (distilled, faster) ---
+    OpenVinoModelInfo {
+        name: "distil-large-v2-int4",
+        dir_name: "openvino-distil-whisper-large-v2-int4-ov",
+        size_mb: 500,
+        description: "Distilled large-v2, int4 quantized (fast)",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/distil-whisper-large-v2-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "distil-large-v2-int8",
+        dir_name: "openvino-distil-whisper-large-v2-int8-ov",
+        size_mb: 950,
+        description: "Distilled large-v2, int8 quantized (fast)",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/distil-whisper-large-v2-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "distil-large-v2-fp16",
+        dir_name: "openvino-distil-whisper-large-v2-fp16-ov",
+        size_mb: 1800,
+        description: "Distilled large-v2, fp16 (fast)",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/distil-whisper-large-v2-fp16-ov",
+    },
+    OpenVinoModelInfo {
+        name: "distil-large-v3-int4",
+        dir_name: "openvino-distil-whisper-large-v3-int4-ov",
+        size_mb: 400,
+        description: "Distilled large-v3, int4 quantized (fast)",
+        quantization: "int4",
+        huggingface_repo: "OpenVINO/distil-whisper-large-v3-int4-ov",
+    },
+    OpenVinoModelInfo {
+        name: "distil-large-v3-int8",
+        dir_name: "openvino-distil-whisper-large-v3-int8-ov",
+        size_mb: 750,
+        description: "Distilled large-v3, int8 quantized (fast)",
+        quantization: "int8",
+        huggingface_repo: "OpenVINO/distil-whisper-large-v3-int8-ov",
+    },
+    OpenVinoModelInfo {
+        name: "distil-large-v3-fp16",
+        dir_name: "openvino-distil-whisper-large-v3-fp16-ov",
+        size_mb: 1400,
+        description: "Distilled large-v3, fp16 (fast)",
+        quantization: "fp16",
+        huggingface_repo: "OpenVINO/distil-whisper-large-v3-fp16-ov",
+    },
+];
+
+fn openvino_download_needs_precompile(device: &str) -> bool {
+    device.trim().eq_ignore_ascii_case("NPU")
+}
+
+/// The `[openvino]` config to compile with when the user has explicitly opted
+/// into the NPU, and `None` otherwise. Only a literal `device = "NPU"` in a
+/// real `[openvino]` section opts in: `OpenVinoConfig::default()` uses
+/// `device = "NPU"`, so falling back to the default for a missing section
+/// would manufacture an NPU opt-in on machines that never asked for one.
+/// AUTO does not opt in either — it may resolve to CPU or GPU at runtime.
+fn openvino_npu_opted_in(config: &Config) -> Option<OpenVinoConfig> {
+    config
+        .openvino
+        .as_ref()
+        .filter(|openvino| openvino_download_needs_precompile(&openvino.device))
+        .cloned()
+}
+
+/// Run the setup-time NPU compile for one model when, and only when, it is
+/// needed: the user has explicitly opted into NPU (see
+/// `openvino_npu_opted_in`; `voxtype setup npu` persists that opt-in before
+/// calling this) and no compiled cache blob exists for this model yet. This
+/// also covers retrying after a previous compile failed but left the fully
+/// downloaded IR files in place.
+///
+/// Never fails setup. The runtime falls back NPU -> GPU -> CPU, so a failed
+/// warm-up is a slower or degraded first transcription, not a broken install:
+/// compile errors print as a warning and setup's exit code keeps reflecting
+/// download and config success only.
+pub fn prepare_openvino_model(model_name: &str, config: &Config) {
+    let Some(mut openvino) = openvino_npu_opted_in(config) else {
+        return;
+    };
+    openvino.model = model_name.to_string();
+
+    #[cfg(feature = "openvino-whisper")]
+    {
+        if crate::transcribe::openvino_whisper::has_compiled_blob(&openvino) {
+            return;
+        }
+
+        println!(
+            "\nCompiling '{}' for Intel NPU and creating its cache blob...",
+            model_name
+        );
+        println!("  This can take several minutes for large models. Please wait.");
+        let _ = io::stdout().flush();
+
+        match crate::transcribe::openvino_whisper::precompile_npu_model(&openvino) {
+            Ok(cache_dir) => print_success(&format!(
+                "OpenVINO model '{}' compiled for NPU and cached in {}",
+                model_name,
+                cache_dir.display()
+            )),
+            Err(error) => {
+                print_warning(&format!("NPU preparation failed: {}", error));
+                print_info(
+                    "Continuing setup. The daemon compiles the model on first use \
+                     and falls back to GPU or CPU when the NPU is unavailable.",
+                );
+            }
+        }
+    }
+
+    // Unreachable in practice: every OpenVINO setup path checks the feature
+    // before it can download or activate a model.
+    #[cfg(not(feature = "openvino-whisper"))]
+    {
+        let _ = openvino;
+    }
+}
+
+/// Download an OpenVINO Whisper model by name.
+///
+/// Routes through the unified R2 downloader (#692) - manifest fetch, per-file
+/// sha256 verification, resume, and stall detection - replacing a per-file
+/// curl loop that fetched straight from huggingface.co with no integrity
+/// checking and skipped any file already on disk, however truncated.
+/// `validate_openvino_model` still runs after, as the inference-time check
+/// for the files OpenVINO GenAI actually loads.
+pub fn download_openvino_model(model_name: &str) -> anyhow::Result<()> {
+    let model = OPENVINO_MODELS
+        .iter()
+        .find(|m| m.name == model_name || m.dir_name == model_name)
+        .ok_or_else(|| {
+            let valid: Vec<&str> = OPENVINO_MODELS.iter().map(|m| m.name).collect();
+            anyhow::anyhow!(
+                "Unknown OpenVINO model: {}. Valid options: {}",
+                model_name,
+                valid.join(", ")
+            )
+        })?;
+
+    let models_dir = Config::models_dir();
+    let model_path = models_dir.join(model.dir_name);
+
+    println!(
+        "\nDownloading OpenVINO Whisper {} (~{} MB, {})...",
+        model.name, model.size_mb, model.quantization
+    );
+
+    download_artifact(model, &models_dir)?;
+
+    validate_openvino_model(&model_path).inspect_err(|_| {
+        print_failure("Model download incomplete. Missing required files.");
+    })?;
+
+    print_success(&format!(
+        "OpenVINO model '{}' downloaded to {:?}",
+        model.name, model_path
+    ));
+
+    Ok(())
+}
+
+/// Get list of valid OpenVINO model names
+pub fn valid_openvino_model_names() -> Vec<&'static str> {
+    OPENVINO_MODELS.iter().map(|m| m.name).collect()
+}
+
+/// Check if a model name is an OpenVINO model
+pub fn is_openvino_model(name: &str) -> bool {
+    OPENVINO_MODELS.iter().any(|m| m.name == name)
+}
+
+/// Get the directory name for an OpenVINO model
+pub fn openvino_dir_name(name: &str) -> Option<&'static str> {
+    OPENVINO_MODELS
+        .iter()
+        .find(|m| m.name == name)
+        .map(|m| m.dir_name)
+}
+
+/// Validate that an OpenVINO model directory has required files
+pub fn validate_openvino_model(path: &std::path::Path) -> anyhow::Result<()> {
+    for file in OPENVINO_REQUIRED_MODEL_FILES {
+        if !path.join(file).exists() {
+            anyhow::bail!("Missing required file: {}", file);
+        }
+    }
+    Ok(())
+}
+
+/// Persist `device` in the config file's `[openvino]` section, preserving
+/// comments and unrelated keys via the same toml_edit editor that backs the
+/// TUI and `voxtype config set`. Like `set_openvino_config`, this only writes
+/// when the config file already exists.
+pub fn set_openvino_device(device: &str) -> anyhow::Result<()> {
+    if let Some(config_path) = Config::default_path() {
+        if config_path.exists() {
+            let mut editor = crate::tui::ConfigEditor::load_from_path(config_path)?;
+            editor.set_string("openvino", "device", device);
+            editor.save()?;
+        }
+        Ok(())
+    } else {
+        anyhow::bail!("Could not determine config path")
+    }
+}
+
+/// Update config to use OpenVINO engine with a specific model
+pub fn set_openvino_config(model_name: &str) -> anyhow::Result<()> {
+    if let Some(config_path) = Config::default_path() {
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            let updated = update_openvino_in_config(&content, model_name);
+            std::fs::write(&config_path, updated)?;
+        }
+        Ok(())
+    } else {
+        anyhow::bail!("Could not determine config path")
+    }
+}
+
+/// Update the config to use OpenVINO engine with a specific model
+fn update_openvino_in_config(config: &str, model_name: &str) -> String {
+    let mut result = String::new();
+    let mut has_engine_line = false;
+    let mut has_openvino_section = false;
+    let mut in_openvino_section = false;
+    let mut openvino_model_updated = false;
+
+    for line in config.lines() {
+        let trimmed = line.trim();
+
+        // Track sections
+        if trimmed.starts_with('[') {
+            // If we were in openvino section and didn't update model, add it
+            if in_openvino_section && !openvino_model_updated {
+                result.push_str(&format!("model = \"{}\"\n", model_name));
+                openvino_model_updated = true;
+            }
+            in_openvino_section = trimmed == "[openvino]";
+            if in_openvino_section {
+                has_openvino_section = true;
+            }
+        }
+
+        // Update or add engine line at the top level
+        if trimmed.starts_with("engine") && !trimmed.starts_with('[') {
+            result.push_str("engine = \"openvino\"\n");
+            has_engine_line = true;
+        }
+        // Update model line in openvino section
+        else if in_openvino_section && trimmed.starts_with("model") {
+            result.push_str(&format!("model = \"{}\"\n", model_name));
+            openvino_model_updated = true;
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+
+    // If we were in openvino section at EOF and didn't update model, add it
+    if in_openvino_section && !openvino_model_updated {
+        result.push_str(&format!("model = \"{}\"\n", model_name));
+    }
+
+    // Add engine line if not present
+    if !has_engine_line {
+        let mut new_result = String::new();
+        let mut engine_added = false;
+        for line in result.lines() {
+            let trimmed = line.trim();
+            if !engine_added
+                && !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && !trimmed.starts_with("engine")
+            {
+                new_result.push_str("engine = \"openvino\"\n\n");
+                engine_added = true;
+            }
+            new_result.push_str(line);
+            new_result.push('\n');
+        }
+        result = new_result;
+    }
+
+    // Add [openvino] section if not present
+    if !has_openvino_section {
+        result.push_str(&format!("\n[openvino]\nmodel = \"{}\"\n", model_name));
+    }
+
+    // Remove trailing newline if original didn't have one
+    if !config.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_npu_downloads_require_eager_openvino_compilation() {
+        assert!(openvino_download_needs_precompile("NPU"));
+        assert!(openvino_download_needs_precompile(" npu "));
+        assert!(!openvino_download_needs_precompile("GPU"));
+        assert!(!openvino_download_needs_precompile("CPU"));
+        assert!(!openvino_download_needs_precompile("AUTO"));
+    }
+
+    #[test]
+    fn npu_preparation_requires_an_explicit_openvino_section() {
+        // No [openvino] section: never opt in, even though the section's
+        // *default* device would be NPU.
+        let mut config = Config {
+            openvino: None,
+            ..Config::default()
+        };
+        assert!(openvino_npu_opted_in(&config).is_none());
+
+        // A real section with device = "NPU" opts in.
+        let mut openvino = OpenVinoConfig {
+            device: "NPU".to_string(),
+            ..OpenVinoConfig::default()
+        };
+        config.openvino = Some(openvino.clone());
+        assert!(openvino_npu_opted_in(&config).is_some());
+
+        // Any other device, AUTO included, does not.
+        for device in ["AUTO", "CPU", "GPU"] {
+            openvino.device = device.to_string();
+            config.openvino = Some(openvino.clone());
+            assert!(
+                openvino_npu_opted_in(&config).is_none(),
+                "device {device} must not trigger setup-time NPU compilation"
+            );
+        }
+    }
+
+    #[test]
+    fn openvino_download_manifest_covers_every_required_runtime_file() {
+        for required in OPENVINO_REQUIRED_MODEL_FILES {
+            assert!(
+                OPENVINO_MODEL_FILES.contains(required),
+                "OpenVINO downloader is missing runtime-required file: {required}"
+            );
+        }
+        assert!(
+            OPENVINO_MODEL_FILES.contains(&"preprocessor_config.json"),
+            "preprocessor_config.json is read lazily by OpenVINO on first inference"
+        );
+    }
+
+    /// The OpenVINO download goes through `download_artifact` (#692), so its
+    /// artifacts must speak the manifest contract: R2 URL under the
+    /// `openvino` prefix keyed by directory name, and a manifest that
+    /// enumerates every file the runtime expects.
+    #[test]
+    fn openvino_artifacts_follow_the_r2_manifest_contract() {
+        use super::super::manifest::{
+            manifest_url, validate_manifest, Manifest, ManifestFile, MANIFEST_SCHEMA_VERSION,
+        };
+
+        let model = OPENVINO_MODELS
+            .iter()
+            .find(|m| m.name == "base.en-int8")
+            .unwrap();
+        assert_eq!(
+            manifest_url(model),
+            "https://models.voxtype.io/openvino/openvino-whisper-base.en-int8-ov/manifest.json"
+        );
+
+        // A manifest listing exactly the published file set validates.
+        let good = Manifest {
+            version: MANIFEST_SCHEMA_VERSION,
+            model: model.dir_name.to_string(),
+            engine: "openvino".to_string(),
+            files: OPENVINO_MODEL_FILES
+                .iter()
+                .map(|f| ManifestFile {
+                    path: (*f).to_string(),
+                    size: 1,
+                    sha256: "aa".to_string(),
+                })
+                .collect(),
+        };
+        validate_manifest(&good, model).unwrap();
+
+        // A publisher who forgets a file (and so would never sha256-verify
+        // it) is rejected before anything lands on disk.
+        let mut incomplete = good.clone();
+        incomplete
+            .files
+            .retain(|f| f.path != "preprocessor_config.json");
+        let err = validate_manifest(&incomplete, model)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("preprocessor_config.json"), "{}", err);
+
+        // A manifest uploaded under the wrong prefix fails fast.
+        let mut misrouted = good.clone();
+        misrouted.engine = "moonshine".to_string();
+        assert!(validate_manifest(&misrouted, model).is_err());
+    }
+
+    /// Every catalog entry must have a registry entry keyed by its directory
+    /// name, or the mirror script can't publish it and the runtime download
+    /// 404s on the manifest - exactly how moonshine tiny-ja/tiny-zh shipped
+    /// broken (#694).
+    #[test]
+    fn every_openvino_model_is_in_the_mirror_registry() {
+        let registry = registry_snapshot();
+        for model in OPENVINO_MODELS {
+            let entry = registry
+                .iter()
+                .find(|e| e.engine_prefix == "openvino" && e.name == model.dir_name)
+                .unwrap_or_else(|| panic!("'{}' has no registry entry", model.dir_name));
+            let paths: Vec<&str> = entry.files.iter().map(|f| f.local_path.as_str()).collect();
+            for file in OPENVINO_MODEL_FILES {
+                assert!(
+                    paths.contains(file),
+                    "registry entry for '{}' is missing {}",
+                    model.dir_name,
+                    file
+                );
+            }
+        }
+    }
+
+    /// `download_openvino_model` is called with short names by `run_setup`
+    /// and the picker, and with directory names by anything holding a
+    /// catalog entry; both must resolve to the same artifact.
+    #[test]
+    fn openvino_models_resolve_by_short_and_directory_name() {
+        for model in OPENVINO_MODELS {
+            for name in [model.name, model.dir_name] {
+                let found = OPENVINO_MODELS
+                    .iter()
+                    .find(|m| m.name == name || m.dir_name == name)
+                    .unwrap_or_else(|| panic!("'{}' did not resolve", name));
+                assert_eq!(found.dir_name, model.dir_name);
+            }
+        }
+    }
+
+    #[test]
+    fn openvino_model_validation_requires_preprocessor_config() {
+        let temp = tempfile::tempdir().expect("create temporary model directory");
+        for required in OPENVINO_REQUIRED_MODEL_FILES {
+            if *required != "preprocessor_config.json" {
+                std::fs::write(temp.path().join(required), b"fixture")
+                    .expect("create required model fixture");
+            }
+        }
+
+        let error = validate_openvino_model(temp.path())
+            .expect_err("model without preprocessor_config.json must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "Missing required file: preprocessor_config.json"
+        );
+
+        std::fs::write(temp.path().join("preprocessor_config.json"), b"{}")
+            .expect("create preprocessor config fixture");
+        validate_openvino_model(temp.path())
+            .expect("model should validate once preprocessor_config.json exists");
+    }
 
     #[test]
     fn test_update_model_in_config_basic() {
@@ -3440,6 +4853,35 @@ mode = "type"
         assert!(result.contains("[whisper]"));
         assert!(result.contains("[hotkey]"));
         assert!(result.contains("[output]"));
+    }
+
+    /// Regression for #610: `setup model --set <parakeet-model>` routed to
+    /// the whisper config writer, which hard-codes `engine = "whisper"` and
+    /// produced a crash-looping config while reporting success. Known
+    /// Parakeet names must route to the Parakeet writer; known models of
+    /// engines --set can't activate must be refused; everything else (bare
+    /// whisper names, .bin paths) stays on the Whisper writer.
+    #[test]
+    fn set_model_routes_by_engine() {
+        assert_eq!(
+            set_model_route("parakeet-tdt-0.6b-v3"),
+            SetModelRoute::Parakeet
+        );
+        assert_eq!(
+            set_model_route("parakeet-unified-en-0.6b"),
+            SetModelRoute::Parakeet
+        );
+        // "small" is BOTH a whisper name and a SenseVoice registry name;
+        // whisper has owned it in --set since before SenseVoice existed.
+        assert_eq!(set_model_route("small"), SetModelRoute::Whisper);
+        assert_eq!(
+            set_model_route("/home/user/models/ggml-custom.bin"),
+            SetModelRoute::Whisper
+        );
+        assert_eq!(
+            set_model_route("moonshine-base"),
+            SetModelRoute::UnsupportedEngine("moonshine")
+        );
     }
 
     #[test]
@@ -3883,6 +5325,290 @@ mode = "type"
             assert_eq!(m.engine_prefix(), "cohere");
             assert_eq!(m.name(), m.dir_name);
         }
+    }
+
+    /// The `.part` name has to be one no installed-model check can match:
+    /// dot-prefixed (so directory listings treat it as hidden) and suffixed
+    /// (so an exact-name lookup misses it).
+    #[test]
+    fn part_paths_are_hidden_siblings_of_the_destination() {
+        let part = part_path(Path::new("/models/ggml-base.bin"));
+        assert_eq!(part, Path::new("/models/.ggml-base.bin.part"));
+        assert_eq!(part.parent(), Path::new("/models/ggml-base.bin").parent());
+        assert_ne!(part, Path::new("/models/ggml-base.bin"));
+
+        // Nested ONNX layouts keep the file's own directory.
+        assert_eq!(
+            part_path(Path::new("/models/moonshine-tiny/onnx/encoder.onnx")),
+            Path::new("/models/moonshine-tiny/onnx/.encoder.onnx.part")
+        );
+    }
+
+    /// Whisper is the one engine with no published sha256, so these two checks
+    /// are all that stand between a bad transfer and a model the daemon can't
+    /// load.
+    #[test]
+    fn whisper_validation_catches_truncated_and_non_model_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let good = dir.path().join("good.bin");
+        let mut bytes = GGML_MAGIC.to_vec();
+        bytes.extend_from_slice(&[0u8; 60]);
+        std::fs::write(&good, &bytes).unwrap();
+        validate_download(&good, Some(bytes.len() as u64), ContentCheck::Ggml).unwrap();
+        // Without a Content-Length the magic check still applies.
+        validate_download(&good, None, ContentCheck::Ggml).unwrap();
+
+        let short = dir.path().join("short.bin");
+        std::fs::write(&short, &bytes[..32]).unwrap();
+        let err =
+            validate_download(&short, Some(bytes.len() as u64), ContentCheck::Ggml).unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete download"),
+            "got: {}",
+            err
+        );
+
+        // What a 404 actually leaves on disk when curl has no --fail.
+        let html = dir.path().join("error.bin");
+        std::fs::write(&html, b"<!DOCTYPE html><html><body>404").unwrap();
+        let err = validate_download(&html, None, ContentCheck::Ggml).unwrap_err();
+        assert!(err.to_string().contains("not a ggml model"), "got: {}", err);
+
+        let empty = dir.path().join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        let err = validate_download(&empty, None, ContentCheck::Ggml).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {}", err);
+    }
+
+    /// The whole staging sequence, offline: bytes land on the `.part` path,
+    /// the destination stays absent until validation passes, and the promote
+    /// is what makes the model visible.
+    /// The download tests drive the real curl path with `file://` URLs. Nix
+    /// builds run in a hermetic sandbox with no curl on PATH, where these
+    /// would fail for a reason unrelated to what they cover. Two of them
+    /// assert that a download *fails*, so without this guard they would pass
+    /// in the sandbox for the wrong reason.
+    fn curl_available() -> bool {
+        which::which("curl").is_ok()
+    }
+
+    #[test]
+    fn a_download_only_reaches_its_final_name_after_validation() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let mut bytes = GGML_MAGIC.to_vec();
+        bytes.extend_from_slice(&[7u8; 128]);
+        std::fs::write(&source, &bytes).unwrap();
+
+        let dest = dir.path().join("ggml-test.bin");
+        let url = format!("file://{}", source.display());
+        let part = download_to_part(&url, &dest, "test", "ggml-test.bin", None).unwrap();
+
+        assert_eq!(part, part_path(&dest));
+        assert!(part.exists(), "bytes should land on the part file");
+        assert!(
+            !dest.exists(),
+            "the destination must stay absent until the download is validated"
+        );
+
+        validate_download(&part, Some(bytes.len() as u64), ContentCheck::Ggml).unwrap();
+        promote_part(&part, &dest).unwrap();
+
+        assert!(dest.exists(), "promote should publish the download");
+        assert!(!part.exists(), "the part file should be consumed");
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    }
+
+    /// A non-zero curl exit is an error, and nothing is left behind: not at
+    /// the destination (where an installed-model check would find it) and not
+    /// as a stale part file.
+    ///
+    /// Uses a `file://` URL for a source that doesn't exist, so the failure is
+    /// reproducible without a network.
+    #[test]
+    fn a_failed_json_download_bails_and_removes_the_partial_file() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not on PATH");
+            return;
+        }
+        let _json = progress::json_mode_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        let url = format!("file://{}", dir.path().join("no-such-source.bin").display());
+
+        let err = download_to_part(&url, &dest, "test-model", "model.bin", Some(1024))
+            .expect_err("a missing source must not report success");
+
+        assert!(
+            err.to_string().contains("Download failed"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(!dest.exists(), "nothing may appear at the final path");
+        assert!(
+            !part_path(&dest).exists(),
+            "partial download should be cleaned up"
+        );
+    }
+
+    /// Same guarantee on the human path, which reaches curl through a
+    /// different call and used to download straight onto the final name.
+    #[test]
+    fn a_failed_human_download_leaves_neither_file() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        let url = format!("file://{}", dir.path().join("no-such-source.bin").display());
+
+        assert!(
+            curl_download(&url, &dest).is_err(),
+            "a missing source must not report success"
+        );
+        assert!(!dest.exists(), "nothing may appear at the final path");
+        assert!(!part_path(&dest).exists(), "part file should be cleaned up");
+    }
+
+    /// The whisper path end to end against the real host: the `HEAD` that
+    /// sizes the transfer, the ggml magic check, and the rename. Downloads
+    /// into a temp dir, so it never touches the user's models directory.
+    ///
+    /// ```text
+    /// cargo test --lib whisper_download_is_atomic -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "downloads a model from huggingface.co"]
+    fn whisper_download_is_atomic_end_to_end() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not on PATH");
+            return;
+        }
+        let _json = progress::json_mode_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("ggml-tiny.en.bin");
+
+        download_atomically(
+            &get_model_url("tiny.en"),
+            &dest,
+            "tiny.en",
+            ContentCheck::Ggml,
+        )
+        .expect("tiny.en should download");
+
+        assert!(dest.exists(), "the model should be in place");
+        assert!(!part_path(&dest).exists(), "no part file should survive");
+        // Whatever landed passed the magic check, so re-reading it is a
+        // check that the promote moved the validated bytes.
+        validate_download(
+            &dest,
+            content_length(&get_model_url("tiny.en")),
+            ContentCheck::Ggml,
+        )
+        .unwrap();
+    }
+
+    /// Multi-file models must report progress per file, and the `file` field
+    /// has to name the file being fetched rather than the model.
+    ///
+    /// Ignored so `cargo test` stays offline; this one really downloads a
+    /// model (~113 MB, into a temp dir that is deleted afterwards):
+    ///
+    /// ```text
+    /// cargo test --lib json_progress -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "downloads a model from models.voxtype.io"]
+    fn json_progress_covers_every_file_of_a_multi_file_model() {
+        let _json = progress::json_mode_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let model = MOONSHINE_MODELS
+            .iter()
+            .find(|m| m.dir_name == "moonshine-tiny")
+            .unwrap();
+
+        download_artifact(model, dir.path()).expect("moonshine-tiny should download");
+
+        // Moonshine reports `size: 0` in `expected_files()` (the manifest is
+        // authoritative for sizes), so check the files landed rather than
+        // comparing against a placeholder.
+        for expected in model.expected_files() {
+            let path = dir.path().join("moonshine-tiny").join(&expected.path);
+            let len = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{} missing: {}", expected.path, e))
+                .len();
+            assert!(len > 0, "{} downloaded empty", expected.path);
+        }
+
+        // The download leaves the publisher's manifest behind, which is what
+        // both integrity tiers read. Exercise them against real R2 data.
+        use crate::model_catalog::{
+            model_health_in, verify_model_in, ModelHealth, ModelVerification,
+        };
+        let model_dir = dir.path().join("moonshine-tiny");
+        assert!(
+            super::super::manifest::cached_manifest_path(&model_dir).exists(),
+            "the download should record its manifest"
+        );
+        assert_eq!(
+            model_health_in(dir.path(), "moonshine", "moonshine-tiny"),
+            ModelHealth::Present
+        );
+        assert_eq!(
+            verify_model_in(dir.path(), "moonshine", "moonshine-tiny"),
+            ModelVerification::Ok,
+            "every file should match the manifest it was downloaded against"
+        );
+
+        // Truncating one file has to surface in both tiers.
+        std::fs::write(model_dir.join("tokenizer.json"), b"{}").unwrap();
+        assert!(matches!(
+            model_health_in(dir.path(), "moonshine", "moonshine-tiny"),
+            ModelHealth::Corrupt(_)
+        ));
+        assert!(matches!(
+            verify_model_in(dir.path(), "moonshine", "moonshine-tiny"),
+            ModelVerification::Corrupt(_)
+        ));
+    }
+
+    /// The write that `--download` used to perform behind the user's back.
+    /// Kept as a test because the helper is still reachable from the flows
+    /// where selecting a model is the point (`setup model`, the macOS wizard),
+    /// and it silently rewrites both `engine` and `[parakeet] model`.
+    #[test]
+    fn activating_a_parakeet_model_rewrites_engine_and_model() {
+        let before = "\
+# Voxtype Configuration
+engine = \"whisper\"
+
+[whisper]
+model = \"base.en\"
+
+[parakeet]
+model = \"parakeet-tdt-0.6b-v3-int8\"
+on_demand_loading = false
+";
+        let after = update_parakeet_in_config(before, "parakeet-tdt-0.6b-v2-int8");
+        assert!(after.contains("engine = \"parakeet\""), "{}", after);
+        assert!(
+            after.contains("model = \"parakeet-tdt-0.6b-v2-int8\""),
+            "{}",
+            after
+        );
+        assert!(
+            !after.contains("parakeet-tdt-0.6b-v3-int8"),
+            "the previous selection should be replaced: {}",
+            after
+        );
+        // Untouched sections survive.
+        assert!(after.contains("[whisper]") && after.contains("model = \"base.en\""));
     }
 
     #[test]

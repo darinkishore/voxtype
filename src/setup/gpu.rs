@@ -17,7 +17,7 @@
 //!
 //! This sets VK_LOADER_DRIVERS_SELECT internally to filter Vulkan ICDs.
 
-use super::binary::install_active_binary;
+use super::binary::{install_active_binary, resolve_active_binary};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -43,35 +43,121 @@ fn get_active_binary_path() -> &'static str {
     VOXTYPE_BIN
 }
 
-/// Check if the current symlink points to a Parakeet binary
-/// Follows symlink chains to find the final target
+/// Resolve the real binary `/usr/bin/voxtype` dispatches to.
+///
+/// GPU and ONNX installs replace the symlink with a shell wrapper that
+/// `exec`s the binary by canonical path, so ORT's provider lookup lands in
+/// the right subdirectory. `fs::canonicalize` on that wrapper returns the
+/// wrapper itself, whose filename is just "voxtype", which used to make
+/// every check below conclude no ONNX backend was active. `setup onnx
+/// --status` already resolved this correctly via `resolve_active_binary`;
+/// share that instead of keeping a second, wrapper-blind implementation.
+fn resolved_active_binary_name() -> Option<String> {
+    let resolved = resolve_active_binary(get_active_binary_path())?;
+    resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+}
+
+/// Check if the active binary is a Parakeet/ONNX binary
 fn is_parakeet_binary_active() -> bool {
-    let active_bin = get_active_binary_path();
-    // Use canonicalize to resolve all symlinks and get the final target
-    if let Ok(resolved) = fs::canonicalize(active_bin) {
-        if let Some(target_name) = resolved.file_name() {
-            if let Some(name) = target_name.to_str() {
-                return name.contains("onnx") || name.contains("parakeet");
-            }
-        }
-    }
-    false
+    resolved_active_binary_name()
+        .map(|name| name.contains("onnx") || name.contains("parakeet"))
+        .unwrap_or(false)
 }
 
 /// Get the name of the active Parakeet backend binary
 fn detect_active_parakeet_backend() -> Option<String> {
-    let active_bin = get_active_binary_path();
-    // Use canonicalize to resolve all symlinks and get the final target
-    if let Ok(resolved) = fs::canonicalize(active_bin) {
-        if let Some(target_name) = resolved.file_name() {
-            if let Some(name) = target_name.to_str() {
-                if name.contains("onnx") || name.contains("parakeet") {
-                    return Some(name.to_string());
-                }
+    resolved_active_binary_name().filter(|name| name.contains("onnx") || name.contains("parakeet"))
+}
+
+/// Parse `ldd` output for dependencies the dynamic linker could not resolve.
+///
+/// Lines of interest look like `\tlibmigraphx_c.so.3 => not found`.
+fn parse_ldd_missing(output: &str) -> Vec<String> {
+    let mut missing: Vec<String> = output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (name, rest) = line.split_once("=>")?;
+            if rest.trim() == "not found" {
+                Some(name.trim().to_string())
+            } else {
+                None
             }
-        }
+        })
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// Shared libraries an ONNX GPU execution provider needs but cannot resolve.
+///
+/// The GPU binaries dlopen `libonnxruntime_providers_<ep>.so` at runtime,
+/// relative to their own location. When the system libraries that provider
+/// links against are absent, ORT fails to register the execution provider and
+/// falls back to CPU without saying so. Reporting "Active backend: ONNX GPU
+/// (MIGraphX)" in that state tells the user the opposite of the truth (#444:
+/// the Arch package shipped voxtype-onnx-migraphx with no migraphx dependency).
+///
+/// Returns `None` when the check cannot be performed (no provider library
+/// alongside the binary, or no `ldd`), and `Some(vec![])` when every
+/// dependency resolves.
+fn unresolved_provider_deps(binary_name: &str) -> Option<Vec<String>> {
+    let resolved = fs::canonicalize(Path::new(VOXTYPE_LIB_DIR).join(binary_name)).ok()?;
+    let dir = resolved.parent()?;
+
+    // Providers sit next to the binary; ORT locates them via /proc/self/exe.
+    let provider = ["migraphx", "cuda", "rocm"]
+        .iter()
+        .map(|ep| dir.join(format!("libonnxruntime_providers_{ep}.so")))
+        .find(|p| p.exists())?;
+
+    let output = Command::new("ldd").arg(&provider).output().ok()?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return None;
     }
-    None
+    Some(parse_ldd_missing(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Warn when the active GPU backend cannot actually load its execution
+/// provider, so `--status` stops advertising acceleration that is not running.
+fn warn_if_provider_unloadable(binary_name: &str) {
+    let Some(missing) = unresolved_provider_deps(binary_name) else {
+        return;
+    };
+    if missing.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("  WARNING: this backend is selected but cannot load. ONNX Runtime will");
+    println!("           fall back to CPU. Missing shared libraries:");
+    for lib in &missing {
+        println!("             {lib}");
+    }
+    if binary_name.contains("migraphx") || binary_name.contains("rocm") {
+        println!("           Install the AMD runtime, e.g. on Arch:");
+        println!("             sudo pacman -S migraphx rocm-hip-runtime");
+    } else if binary_name.contains("cuda") {
+        println!("           Install the matching NVIDIA CUDA runtime for this variant.");
+    }
+}
+
+/// Human label for an ONNX variant's binary name.
+fn describe_onnx_variant(name: &str) -> &'static str {
+    match name {
+        "voxtype-onnx-avx2" | "voxtype-parakeet-avx2" => "ONNX CPU (AVX2)",
+        "voxtype-onnx-avx512" | "voxtype-parakeet-avx512" => "ONNX CPU (AVX-512)",
+        "voxtype-onnx-cuda-12" => "ONNX GPU (CUDA 12)",
+        "voxtype-onnx-cuda-13" => "ONNX GPU (CUDA 13)",
+        "voxtype-onnx-cuda" | "voxtype-parakeet-cuda" => "ONNX GPU (CUDA, unversioned)",
+        "voxtype-onnx-migraphx" => "ONNX GPU (MIGraphX)",
+        "voxtype-onnx-rocm" | "voxtype-parakeet-rocm" => "ONNX GPU (MIGraphX, legacy name)",
+        _ => "ONNX (unknown variant)",
+    }
 }
 
 /// Available backend variants
@@ -169,6 +255,28 @@ fn is_tiered_mode() -> bool {
 }
 
 /// Detect which backend is currently active
+/// Map a binary's file name back to its `Backend`.
+///
+/// The forward direction lives in `Backend::binary_name`. This is the reverse,
+/// used to name the variant a running process is executing.
+fn backend_from_binary_name(name: &str) -> Option<Backend> {
+    match name {
+        "voxtype-cpu" => Some(Backend::Cpu),
+        "voxtype-native" => Some(Backend::Native),
+        "voxtype-avx2" => Some(Backend::Avx2),
+        "voxtype-avx512" => Some(Backend::Avx512),
+        "voxtype-vulkan" => Some(Backend::Vulkan),
+        _ => None,
+    }
+}
+
+/// The Whisper backend the live daemon is actually executing.
+fn running_whisper_backend(pid: i32) -> Option<(Backend, std::path::PathBuf)> {
+    let path = super::binary::running_binary_path(pid)?;
+    let name = path.file_name()?.to_str()?;
+    backend_from_binary_name(name).map(|b| (b, path))
+}
+
 pub fn detect_current_backend() -> Option<Backend> {
     let active_bin = get_active_binary_path();
     // Check if the voxtype binary is a symlink
@@ -497,42 +605,100 @@ pub fn show_status() {
     if is_parakeet {
         // Detect active Parakeet backend from symlink
         if let Some(target) = detect_active_parakeet_backend() {
-            let display_name = match target.as_str() {
-                "voxtype-onnx-avx2" | "voxtype-parakeet-avx2" => "ONNX CPU (AVX2)",
-                "voxtype-onnx-avx512" | "voxtype-parakeet-avx512" => "ONNX CPU (AVX-512)",
-                "voxtype-onnx-cuda-12" => "ONNX GPU (CUDA 12)",
-                "voxtype-onnx-cuda-13" => "ONNX GPU (CUDA 13)",
-                "voxtype-onnx-cuda" | "voxtype-parakeet-cuda" => "ONNX GPU (CUDA, unversioned)",
-                "voxtype-onnx-migraphx" => "ONNX GPU (MIGraphX)",
-                "voxtype-onnx-rocm" | "voxtype-parakeet-rocm" => "ONNX GPU (MIGraphX, legacy name)",
-                _ => "ONNX (unknown variant)",
-            };
-            println!("Active backend: {}", display_name);
-            println!(
-                "  Binary: {}",
-                Path::new(VOXTYPE_LIB_DIR).join(&target).display()
-            );
+            let display_name = describe_onnx_variant(&target);
+            // `target` comes from /usr/bin/voxtype, which describes the next
+            // process to start. Report what the daemon is actually executing
+            // when there is one, and say so when the two disagree; a variant
+            // switch does not take effect until a restart.
+            let daemon = crate::daemon_status::read_pid_if_alive();
+            let running_path = daemon.and_then(super::binary::running_binary_path);
+
+            match (&running_path, daemon) {
+                (Some(path), Some(pid)) => {
+                    let running_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                    println!(
+                        "Active backend: {} (daemon pid {})",
+                        describe_onnx_variant(running_name),
+                        pid
+                    );
+                    println!("  Binary: {}", path.display());
+                    if running_name != target {
+                        println!();
+                        println!("  Next launch:  {}", display_name);
+                        println!("    {}", Path::new(VOXTYPE_LIB_DIR).join(&target).display());
+                        println!("  Restart voxtype to pick it up:");
+                        println!("    systemctl --user restart voxtype");
+                    }
+                    warn_if_provider_unloadable(running_name);
+                }
+                _ => {
+                    println!("Next launch: {} (no daemon running)", display_name);
+                    println!(
+                        "  Binary: {}",
+                        Path::new(VOXTYPE_LIB_DIR).join(&target).display()
+                    );
+                    warn_if_provider_unloadable(&target);
+                }
+            }
         } else {
             println!("Active backend: Parakeet (unknown variant)");
         }
     } else {
-        match detect_current_backend() {
-            Some(backend) => {
-                println!("Active backend: {}", backend.display_name());
-                if backend == Backend::Vulkan || (tiered && backend != Backend::Cpu) {
-                    println!(
-                        "  Binary: {}",
-                        Path::new(VOXTYPE_LIB_DIR)
-                            .join(backend.binary_name())
-                            .display()
-                    );
-                } else {
-                    println!("  Binary: {}", active_bin);
+        // Same split as the ONNX branch above: what the daemon is running
+        // now, and separately what /usr/bin/voxtype would launch next. The
+        // symlink alone was reported as "active", which is wrong whenever a
+        // variant switch has not been followed by a restart.
+        let next = detect_current_backend();
+        let daemon = crate::daemon_status::read_pid_if_alive();
+
+        match daemon.and_then(running_whisper_backend) {
+            Some((running, path)) => {
+                println!(
+                    "Active backend: {} (daemon pid {})",
+                    running.display_name(),
+                    daemon.unwrap_or(0)
+                );
+                println!("  Binary: {}", path.display());
+
+                if let Some(next) = next {
+                    if next != running {
+                        println!();
+                        println!("  Next launch:  {}", next.display_name());
+                        println!(
+                            "    {}",
+                            Path::new(VOXTYPE_LIB_DIR)
+                                .join(next.binary_name())
+                                .display()
+                        );
+                        println!("  Restart voxtype to pick it up:");
+                        println!("    systemctl --user restart voxtype");
+                    }
                 }
             }
-            None => {
-                println!("Active backend: Unknown (symlink may be broken)");
-            }
+            None => match next {
+                Some(backend) => {
+                    println!(
+                        "Next launch: {} (no daemon running)",
+                        backend.display_name()
+                    );
+                    if backend == Backend::Vulkan || (tiered && backend != Backend::Cpu) {
+                        println!(
+                            "  Binary: {}",
+                            Path::new(VOXTYPE_LIB_DIR)
+                                .join(backend.binary_name())
+                                .display()
+                        );
+                    } else {
+                        println!("  Binary: {}", active_bin);
+                    }
+                }
+                None => {
+                    println!("Active backend: Unknown (symlink may be broken)");
+                }
+            },
         }
     }
 
@@ -836,6 +1002,10 @@ pub fn enable() -> anyhow::Result<()> {
         }
 
         println!("Switched to ONNX ({}) backend.", backend_name);
+        // Selecting a backend whose execution provider cannot load is how
+        // users end up believing they have GPU acceleration while running on
+        // CPU (#444). Say so at the point of the switch, not just in --status.
+        warn_if_provider_unloadable(backend_binary);
         println!();
         println!("Restart voxtype to use GPU acceleration:");
         println!("  systemctl --user restart voxtype");
@@ -991,4 +1161,77 @@ fn switch_backend_tiered_parakeet(binary_name: &str) -> anyhow::Result<()> {
     }
 
     install_active_binary(active_bin, &binary_path, "setup onnx --enable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_names_round_trip() {
+        // running_whisper_backend maps a /proc basename back to a Backend, so
+        // every backend's own binary name has to resolve. A miss here is what
+        // made setup gpu --status fall back to reading the symlink.
+        for b in [
+            Backend::Cpu,
+            Backend::Native,
+            Backend::Avx2,
+            Backend::Avx512,
+            Backend::Vulkan,
+        ] {
+            assert_eq!(
+                backend_from_binary_name(b.binary_name()),
+                Some(b),
+                "{} did not round-trip",
+                b.binary_name()
+            );
+        }
+    }
+
+    #[test]
+    fn backend_from_binary_name_rejects_non_variants() {
+        // A source build or an ONNX variant is not a Whisper backend; the
+        // caller must get None rather than a wrong label.
+        assert_eq!(backend_from_binary_name("voxtype"), None);
+        assert_eq!(backend_from_binary_name("voxtype-onnx-migraphx"), None);
+        assert_eq!(backend_from_binary_name(""), None);
+    }
+
+    #[test]
+    fn parse_ldd_missing_finds_unresolved_deps() {
+        // Shape of ldd output on a host without the AMD runtime installed,
+        // which is the #444 failure: the provider is present, its deps are not.
+        let output = "\tlinux-vdso.so.1 (0x00007ffd1b5f2000)\n\
+                      \tlibmigraphx_c.so.3 => not found\n\
+                      \tlibamdhip64.so.7 => not found\n\
+                      \tlibstdc++.so.6 => /usr/lib/libstdc++.so.6 (0x00007f83de9ce000)\n\
+                      \tlibc.so.6 => /usr/lib/libc.so.6 (0x00007f83de645000)\n";
+        assert_eq!(
+            parse_ldd_missing(output),
+            vec!["libamdhip64.so.7", "libmigraphx_c.so.3"]
+        );
+    }
+
+    #[test]
+    fn parse_ldd_missing_empty_when_all_resolve() {
+        let output =
+            "\tlibmigraphx_c.so.3 => /opt/rocm/lib/libmigraphx_c.so.3 (0x00007f83e06e9000)\n\
+                      \tlibc.so.6 => /usr/lib/libc.so.6 (0x00007f83de645000)\n";
+        assert!(parse_ldd_missing(output).is_empty());
+    }
+
+    #[test]
+    fn parse_ldd_missing_ignores_static_and_vdso_lines() {
+        // Lines without "=>" must not be mistaken for dependencies.
+        let output = "\tlinux-vdso.so.1 (0x00007ffd1b5f2000)\n\
+                      \t/lib64/ld-linux-x86-64.so.2 (0x00007f83e0a1c000)\n\
+                      \tstatically linked\n";
+        assert!(parse_ldd_missing(output).is_empty());
+    }
+
+    #[test]
+    fn parse_ldd_missing_dedupes() {
+        let output = "\tlibfoo.so.1 => not found\n\tlibfoo.so.1 => not found\n";
+        assert_eq!(parse_ldd_missing(output), vec!["libfoo.so.1"]);
+    }
 }

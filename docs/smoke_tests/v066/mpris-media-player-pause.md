@@ -20,8 +20,7 @@ test -f src/audio/media.rs && echo "media.rs exists" || echo "MISSING"
 # 2. playerctl status  # Should show "Playing"
 # 3. Set [audio] pause_media = true in config.toml, restart daemon
 # 4. voxtype record start
-# 5. playerctl status  # Should show "Paused"
+# 5. playerctl status  # Should show "Paused" before microphone capture begins
 # 6. sleep 3 && voxtype record stop
-# 7. Wait for transcription, then: playerctl status  # Should show "Playing"
+# 7. Immediately: playerctl status  # Should show "Playing" while transcription continues
 ```
-

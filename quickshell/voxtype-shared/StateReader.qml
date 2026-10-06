@@ -15,6 +15,12 @@
 //       }
 //   }
 //
+// The component also exposes `osdSuppressed`, set while the daemon is
+// running a recording started with `voxtype record start --no-osd`. OSD
+// surfaces should stay hidden while it is true; the daemon state itself is
+// still reported truthfully, because Waybar and every other status consumer
+// depends on it.
+//
 // The component exposes `state` as a bindable property so consumers
 // don't have to listen for the signal:
 //
@@ -54,6 +60,17 @@ QtObject {
     /// changes; consumers read the current value off the property.
     property string state: "idle"
 
+    /// Sibling marker written by the daemon while a `--no-osd` recording is
+    /// in flight. True means "do not draw the OSD for this one".
+    property string osdSuppressedPath: {
+        const base = root.statePath;
+        const cut = base.lastIndexOf("/");
+        return (cut > 0 ? base.substring(0, cut) : base) + "/osd_suppressed";
+    }
+
+    /// True while the in-flight recording asked for the OSD to stay hidden.
+    property bool osdSuppressed: false
+
     // FileView re-reads on file changes when watchChanges is true. We
     // update the `state` property inside onLoaded; QML's property change
     // signal fires automatically for binding-based and imperative
@@ -73,6 +90,29 @@ QtObject {
         onLoadFailed: {
             if (root.state !== "idle") {
                 root.state = "idle";
+            }
+        }
+
+        onFileChanged: reload()
+    }
+
+    // The marker is created and removed rather than rewritten, so both the
+    // load and the failure path carry meaning: present means suppress, absent
+    // (the common case) means draw normally.
+    property FileView _osdSuppressedView: FileView {
+        path: root.osdSuppressedPath
+        watchChanges: true
+        printErrors: false
+
+        onLoaded: {
+            if (!root.osdSuppressed) {
+                root.osdSuppressed = true;
+            }
+        }
+
+        onLoadFailed: {
+            if (root.osdSuppressed) {
+                root.osdSuppressed = false;
             }
         }
 

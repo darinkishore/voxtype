@@ -5,11 +5,11 @@
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use voxtype::menubar;
-use voxtype::{
-    config, daemon, setup, transcribe, Cli, Commands, ConfigAction, ConfigSetKey, SetupAction,
-};
+use voxtype::{config, daemon, setup, transcribe, Cli, Commands, ConfigAction, SetupAction};
 
-use super::config_set_engine::run_config_set_engine;
+use super::config_get::run_config_get;
+use super::config_schema::run_config_schema;
+use super::config_set::{run_config_set, run_config_unset};
 use super::config_show::show_config;
 use super::info::run_info_command;
 use super::meeting::run_meeting_command;
@@ -168,7 +168,18 @@ pub(crate) async fn dispatch(
             model,
             quiet,
             no_post_install,
+            activate,
+            progress_format,
         } => {
+            // Set before any action runs: every download in this process reads
+            // the format from here.
+            let progress_format = setup::progress::ProgressFormat::parse(&progress_format)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Unknown --progress-format '{}'", progress_format)
+                })?;
+            setup::progress::set_format(progress_format);
+            let json_progress = progress_format == setup::progress::ProgressFormat::Json;
+
             match action {
                 Some(SetupAction::Check) => {
                     warn_if_root("check");
@@ -278,6 +289,22 @@ pub(crate) async fn dispatch(
                         setup::gpu::show_status();
                     }
                 }
+                Some(SetupAction::Npu {
+                    enable,
+                    disable,
+                    status,
+                }) => {
+                    warn_if_root("npu");
+                    if status {
+                        setup::npu::show_status();
+                    } else if enable {
+                        setup::npu::enable()?;
+                    } else if disable {
+                        setup::npu::disable()?;
+                    } else {
+                        setup::npu::show_status();
+                    }
+                }
                 Some(SetupAction::Variant { to }) => {
                     let variant =
                         setup::binary::Variant::from_binary_name(&to).ok_or_else(|| {
@@ -351,27 +378,58 @@ pub(crate) async fn dispatch(
                 None => {
                     // Default: run setup (non-blocking)
                     warn_if_root("");
-                    setup::run_setup(&config, download, model.as_deref(), quiet, no_post_install)
-                        .await?;
+                    // In JSON mode stdout carries events only, so the human
+                    // status lines are suppressed the same way --quiet does it.
+                    let result = setup::run_setup(
+                        &config,
+                        download,
+                        model.as_deref(),
+                        quiet || json_progress,
+                        no_post_install,
+                        activate,
+                    )
+                    .await;
+                    // The model run_setup acted on: the override when given,
+                    // otherwise the whisper model it falls back to.
+                    let acted_on = model.as_deref().unwrap_or(&config.whisper.model);
+                    setup::progress::report_outcome(acted_on, &result);
+                    result?;
                 }
             }
         }
 
         Commands::Config { action } => match action {
             None => show_config(&config).await?,
-            Some(ConfigAction::Set { key }) => match key {
-                ConfigSetKey::Engine { name } => {
-                    run_config_set_engine(cli.config.clone(), &name)?;
-                }
-            },
+            Some(ConfigAction::Set { key, value }) => {
+                run_config_set(cli.config.clone(), &key, &value)?;
+            }
+            Some(ConfigAction::Unset { key }) => {
+                run_config_unset(cli.config.clone(), &key)?;
+            }
+            Some(ConfigAction::Get { key, json }) => {
+                run_config_get(cli.config.clone(), &config, key, json)?;
+            }
+            Some(ConfigAction::Schema { json }) => {
+                run_config_schema(cli.config.clone(), &config, json)?;
+            }
         },
 
         Commands::Info { action } => {
-            run_info_command(action)?;
+            run_info_command(action, &config)?;
         }
 
-        Commands::Configure { force_package_mode } => {
-            voxtype::tui::run(force_package_mode)?;
+        Commands::Configure {
+            force_package_mode,
+            probe_audio_devices,
+        } => {
+            if probe_audio_devices {
+                voxtype::tui::probe_audio_devices();
+            } else {
+                // Carries the -c/--config path so the TUI edits the file the
+                // user named (#595) while keeping the out-of-process device
+                // probe that keeps the Audio section responsive (#541).
+                voxtype::tui::run(force_package_mode, cli.config.clone())?;
+            }
         }
 
         Commands::Status {

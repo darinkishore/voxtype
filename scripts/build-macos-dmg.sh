@@ -14,6 +14,11 @@
 #
 # Usage:
 #   ./scripts/build-macos-dmg.sh 0.6.0-rc1
+#
+# Phases. By default this builds the .app and then packages the DMG from it.
+# CI needs to sign the .app in between, so each phase can run alone:
+#   VOXTYPE_SKIP_DMG=1  build Voxtype.app, stop before the DMG
+#   VOXTYPE_SKIP_APP=1  package the DMG from an already-built Voxtype.app
 
 set -euo pipefail
 
@@ -39,10 +44,10 @@ APP_DIR="${RELEASES_DIR}/Voxtype.app"
 # Find the binary (try arm64 first, then universal)
 if [[ -f "${RELEASES_DIR}/voxtype-${VERSION}-macos-arm64" ]]; then
     BINARY="${RELEASES_DIR}/voxtype-${VERSION}-macos-arm64"
-    DMG_PATH="${RELEASES_DIR}/Voxtype-${VERSION}-macos-arm64.dmg"
+    DMG_PATH="${RELEASES_DIR}/voxtype-${VERSION}-macos-arm64.dmg"
 elif [[ -f "${RELEASES_DIR}/voxtype-${VERSION}-macos-universal" ]]; then
     BINARY="${RELEASES_DIR}/voxtype-${VERSION}-macos-universal"
-    DMG_PATH="${RELEASES_DIR}/Voxtype-${VERSION}-macos-universal.dmg"
+    DMG_PATH="${RELEASES_DIR}/voxtype-${VERSION}-macos-universal.dmg"
 else
     echo -e "${RED}Error: No binary found in ${RELEASES_DIR}${NC}"
     echo "Expected: voxtype-${VERSION}-macos-arm64 or voxtype-${VERSION}-macos-universal"
@@ -54,6 +59,15 @@ fi
 # into the .app/Contents/Frameworks/ and make the binary's rpath point at it.
 ORT_DYLIB="$(ls "${RELEASES_DIR}"/libonnxruntime.*.dylib 2>/dev/null | head -1 || true)"
 
+if [[ "${VOXTYPE_SKIP_APP:-}" == "1" ]]; then
+    if [[ ! -d "$APP_DIR" ]]; then
+        echo -e "${RED}Error: VOXTYPE_SKIP_APP=1 but $APP_DIR does not exist${NC}"
+        exit 1
+    fi
+    echo -e "${YELLOW}Reusing existing bundle: $APP_DIR${NC}"
+fi
+
+if [[ "${VOXTYPE_SKIP_APP:-}" != "1" ]]; then
 echo -e "${GREEN}Building Voxtype.app for ${VERSION}...${NC}"
 echo "Binary: $BINARY"
 echo
@@ -172,6 +186,13 @@ echo -e "${GREEN}App bundle created:${NC}"
 echo "  $APP_DIR"
 du -sh "$APP_DIR"
 echo
+
+fi  # end app-build phase
+
+if [[ "${VOXTYPE_SKIP_DMG:-}" == "1" ]]; then
+    echo "VOXTYPE_SKIP_DMG=1 set, stopping before DMG creation."
+    exit 0
+fi
 
 # Create DMG with Applications symlink for drag-to-install
 echo -e "${YELLOW}Creating DMG...${NC}"

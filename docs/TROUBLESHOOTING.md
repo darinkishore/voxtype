@@ -17,6 +17,8 @@ Solutions to common issues when using Voxtype.
 - [Performance Issues](#performance-issues)
 - [Soniox Backend Issues](#soniox-backend-issues)
 - [OpenAI Realtime Backend Issues](#openai-realtime-backend-issues)
+
+- [Media Does Not Pause While Recording (Omarchy Quattro)](#media-does-not-pause-while-recording-omarchy-quattro)
 - [Quickshell OSD Issues](#quickshell-osd-issues)
 - [Systemd Service Issues](#systemd-service-issues)
 - [Debug Mode](#debug-mode)
@@ -321,6 +323,38 @@ curl -L -o ~/.local/share/voxtype/models/ggml-base.en.bin \
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 ```
 
+### OpenVINO: transcription fails with "unknown exception" (but the daemon starts fine)
+
+**Cause:** The model directory is missing `preprocessor_config.json` (mel-spectrogram feature-extraction parameters). This file isn't needed to *load* the model — only the `.xml`/`.bin` graph files are — so the daemon starts and logs "Model loaded, ready for voice input" with no complaint. OpenVINO GenAI's `WhisperPipeline` only reads it on the *first real transcription call*, where its absence surfaces as an opaque `unknown exception` instead of a clear error.
+
+Models downloaded by older Voxtype versions may be missing it because the downloader's file list did not include it. Current builds check for this file at startup and fail with a clear message and fix command rather than letting the model reach this confusing runtime error.
+
+**Solution:**
+```bash
+# Re-download the model (fetches the missing file along with everything else)
+voxtype setup --download --model <model-name>
+
+# Or fetch just the missing file directly (note: NOT identical across model
+# sizes -- large-v3/large-v3-turbo use 128 mel bins, everything else uses 80,
+# so fetch it from the specific model's own repo, not a different one's)
+curl -Lo ~/.local/share/voxtype/models/<model-dir>/preprocessor_config.json \
+    https://huggingface.co/<org>/<model-repo>/resolve/main/preprocessor_config.json
+```
+
+### OpenVINO: setup prints "Compiling ... for Intel NPU" and takes minutes, or ends with a warning
+
+**Cause:** When config.toml has an `[openvino]` section with `device = "NPU"`, `voxtype setup` compiles the model for the NPU right after downloading or activating it, so the one-time compile wait happens during setup instead of during your first recording. Large models genuinely take minutes to compile (about 15 minutes for `large-v3-int4` on Lunar Lake); this is the NPU compiler working, not a hang.
+
+If the compile fails, setup prints a warning and continues. This is not a broken install: the model files are downloaded, the config is updated, and the daemon compiles the model on first use, falling back to GPU or CPU when the NPU is unavailable. The warning usually means the OpenVINO GenAI runtime or the NPU driver is missing, and it includes the package list for the configured device (also documented under `[openvino]` in the configuration guide).
+
+**Solution:** Install the packages named in the warning, verify the NPU device exists (`ls /dev/accel/accel*`), then rerun setup:
+
+```bash
+voxtype setup --download --model <model-name>
+```
+
+Setup skips the compile when the model's cache blob already exists, so rerunning after a successful compile is cheap.
+
 ### Voxtype crashes during transcription (Linux)
 
 **Cause:** On some Linux systems (particularly with glibc 2.42+ like Ubuntu 25.10), the whisper-rs FFI bindings crash due to C++ exceptions crossing the FFI boundary.
@@ -394,6 +428,11 @@ If you experience phrase repetition (e.g., "word word word"), make sure this set
 ### Hallucinations (transcribed text not spoken)
 
 **Cause:** Known Whisper behavior with silence or noise.
+
+Whisper may also occasionally return a punctuation-only transcript, such as a
+lone dash (`-`), even when the recording contains speech. Voxtype treats this
+as a degenerate decode: it retries the same audio once with a more conservative
+decode path, then drops the result if the retry is still punctuation-only.
 
 **Solutions:**
 1. Use a larger model for better accuracy
@@ -845,6 +884,36 @@ You can also enable it via CLI flag (`--wtype-shift-prefix`) or environment vari
 type_delay_ms = 10  # Try 10-50ms
 ```
 
+### Non-ASCII characters move to the front of the text (GNOME, type mode)
+
+**Symptom:** Dictating text with non-ASCII characters (umlauts, accents, ß)
+into GTK applications (GNOME Terminal, GNOME Text Editor) delivers them
+clustered at the start of the output: `Müll äöüß` arrives as `üäöüß Mll `.
+The log (`journalctl --user -u voxtype`) shows the correct transcription,
+and Chrome or other non-GTK apps receive the same text correctly. Short
+dictations often arrive intact, longer ones reliably fail.
+
+**Cause:** IBus, GNOME's default input method, reorders non-ASCII key
+events relative to ASCII when synthetic input arrives faster than human
+typing. The events leave the typing tool (eitype) in the correct order,
+so this is neither a voxtype nor an eitype bug. Reported upstream as
+ibus/ibus#2934; details and measurements in
+Adam-D-Lewis/eitype#21.
+
+**Solution:** Use paste mode, which transfers the text atomically through
+the clipboard and cannot be reordered:
+
+```toml
+[output]
+mode = "paste"
+paste_keys = "ctrl+shift+v"  # terminal convention; GUI apps expect ctrl+v
+```
+
+Partial alternatives: `type_delay_ms` shrinks the displacement but does
+not remove it (about 100 ms per key would be needed), and launching the
+receiving app with `GTK_IM_MODULE=simple` avoids the bug at the cost of
+disabling IBus features for that app.
+
 ### Clipboard not working
 
 **Cause:** wl-copy not installed or Wayland session issue.
@@ -1109,7 +1178,7 @@ async_max_wait_secs = 300
 
 ### Post-stop "Streaming Error: Soniox server error (408): Request timeout"
 
-This notification used to appear when you released the hotkey and Soniox's server-side timer fired before the connection fully closed. Voxtype now suppresses 408s that arrive **after** you've signalled end-of-audio, so this should be silent. If you still see it, your build predates the fix (any release after v0.7.2 + soniox).
+This notification used to appear when you released the hotkey and Soniox's server-side timer fired before the connection fully closed. Voxtype now suppresses 408s that arrive **after** you've signalled end-of-audio, so this should be silent. If you still see it, your build predates the fix (any release v0.7.5 or later includes it).
 
 ---
 
@@ -1175,6 +1244,37 @@ With `turn_detection = false` (required for `gpt-live-transcribe`), Voxtype wait
 
 ---
 
+## Media Does Not Pause While Recording (Omarchy Quattro)
+
+**Symptom:** `pause_media = true` is set, but music keeps playing while you
+dictate. Common on Omarchy Quattro, whose upgrade removes `playerctl` while the
+shipped Voxtype config still enables media pausing.
+
+**Cause:** Voxtype v0.7.5 and earlier paused players by shelling out to
+`playerctl`. When that binary is absent the pause silently does nothing.
+
+**Fix:** Upgrade to Voxtype v1.0.0 or newer. Media pausing now speaks MPRIS over
+D-Bus directly and needs no external binary, so it works on a playerctl-free
+system.
+
+If you must stay on v0.7.5, either install `playerctl` or turn the feature off:
+
+```toml
+[audio]
+pause_media = false
+```
+
+**Check which players Voxtype can see:**
+
+```bash
+busctl --user list | grep org.mpris.MediaPlayer2
+```
+
+An empty list means no MPRIS-capable player is running, which is a different
+problem from a missing `playerctl`. Some players (notably certain browsers)
+report unreliable MPRIS status; skip those with
+`pause_media_ignored_players`.
+
 ## Quickshell OSD Issues
 
 These apply when `[osd] frontend = "quickshell"`. See the
@@ -1209,6 +1309,19 @@ in the foreground to see the QML error:
 
 ```bash
 voxtype-osd-quickshell --no-daemonize
+```
+
+### OSD looks or behaves like an older version after a binary upgrade
+
+The Quickshell frontend is two parts: the launcher binary and the QML tree it
+runs (installed to `~/.local/share/voxtype/quickshell/`). Package upgrades
+keep them in sync through `/usr/share/voxtype/quickshell`, but a manual
+binary swap upgrades only the launcher, and the stale QML keeps rendering old
+behavior. The launcher's manifest check catches missing files, not outdated
+ones. After any manual binary upgrade, re-sync the tree:
+
+```bash
+voxtype setup quickshell --force
 ```
 
 ### Style or recipe changes don't show up

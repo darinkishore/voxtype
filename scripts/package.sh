@@ -31,7 +31,8 @@
 #
 # This script builds tiered CPU binaries to support different CPUs:
 #   x86_64:
-#     - voxtype-avx2:   AVX2 baseline (compatible with most CPUs from 2013+)
+#     - voxtype-baseline: x86-64-v2, no AVX2 (pre-Haswell CPUs, #612)
+#     - voxtype-avx2:   AVX2 (most CPUs from 2013+)
 #     - voxtype-avx512: AVX-512 optimized (Zen 4+, some Intel)
 #   aarch64:
 #     - voxtype:        Single binary (no CPU feature tiers needed)
@@ -248,6 +249,11 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
 else
     echo "Skipping binary build (--skip-build)"
     if [[ "$TARGET_ARCH" == "x86_64" ]]; then
+        if [[ ! -f "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-baseline" ]]; then
+            echo "Error: Binary not found: ${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-baseline"
+            echo "  The baseline (pre-AVX2, #612) binary is required from 1.1.0 on."
+            exit 1
+        fi
         if [[ ! -f "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-avx2" ]]; then
             echo "Error: Binary not found: ${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-avx2"
             exit 1
@@ -333,6 +339,12 @@ if [[ "$TARGET_ARCH" == "x86_64" ]]; then
     VERIFY_FAILED=false
 
     # AVX2 binary MUST NOT have AVX-512 or GFNI instructions (strict)
+    # Baseline gets the same static gate as avx2: AVX-512 must be zero. Per
+    # the Dockerfile.baseline notes, ymm/FMA counts cannot be gated statically
+    # (runtime-dispatched kernels); only execution on a pre-AVX2 CPU proves it.
+    if ! verify_no_forbidden_instructions "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-baseline" "voxtype-baseline"; then
+        VALIDATION_FAILED=1
+    fi
     if ! verify_no_forbidden_instructions "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-avx2" "voxtype-avx2"; then
         VERIFY_FAILED=true
     fi
@@ -379,9 +391,11 @@ mkdir -p "$STAGING"/usr/share/{bash-completion/completions,zsh/site-functions,fi
 # Copy binaries to /usr/lib/voxtype/
 if [[ "$TARGET_ARCH" == "x86_64" ]]; then
     # x86_64: Tiered CPU binaries + Vulkan GPU binary (Whisper)
+    cp "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-baseline" "$STAGING/usr/lib/voxtype/voxtype-baseline"
     cp "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-avx2" "$STAGING/usr/lib/voxtype/voxtype-avx2"
     cp "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-avx512" "$STAGING/usr/lib/voxtype/voxtype-avx512"
     cp "${RELEASE_DIR}/voxtype-${VERSION}-linux-x86_64-vulkan" "$STAGING/usr/lib/voxtype/voxtype-vulkan"
+    chmod 755 "$STAGING/usr/lib/voxtype/voxtype-baseline"
     chmod 755 "$STAGING/usr/lib/voxtype/voxtype-avx2"
     chmod 755 "$STAGING/usr/lib/voxtype/voxtype-avx512"
     chmod 755 "$STAGING/usr/lib/voxtype/voxtype-vulkan"
@@ -463,6 +477,38 @@ else
     cp "${SCRIPT_DIR}/voxtype-wrapper.sh" "$STAGING/usr/bin/voxtype"
     chmod 755 "$STAGING/usr/bin/voxtype"
 fi
+# OSD frontends and the audio-bridge sidecar. Dockerfile.onnx builds these
+# four alongside the onnx-avx2 binary and they ship as their own release
+# assets, but until v0.7.6 the deb/rpm never installed them, so
+# `voxtype setup quickshell` could not find the bridge and the OSD stayed
+# empty for package users (#488). Layout mirrors the voxtype-bin AUR
+# package, which had it right.
+#
+# The voxtype-osd launcher probes its own parent directory, so it finds
+# voxtype-osd-gtk4 and voxtype-osd-quickshell in /usr/lib/voxtype without
+# them being on PATH. Only the launcher gets a /usr/bin symlink.
+install_companion_binary() {
+    local asset="$1"        # release-asset suffix, e.g. osd-gtk4
+    local dest="$2"         # absolute path under $STAGING
+    local src="${RELEASE_DIR}/voxtype-${VERSION}-linux-${TARGET_ARCH}-${asset}"
+    if [[ ! -f "$src" ]]; then
+        echo "  warning: ${src##*/} not found, skipping" >&2
+        return 0
+    fi
+    install -Dm755 "$src" "$dest"
+}
+install_companion_binary osd "$STAGING/usr/lib/voxtype/voxtype-osd"
+install_companion_binary osd-gtk4 "$STAGING/usr/lib/voxtype/voxtype-osd-gtk4"
+install_companion_binary osd-quickshell "$STAGING/usr/lib/voxtype/voxtype-osd-quickshell"
+if [[ -f "$STAGING/usr/lib/voxtype/voxtype-osd" ]]; then
+    ln -sf /usr/lib/voxtype/voxtype-osd "$STAGING/usr/bin/voxtype-osd"
+fi
+
+# voxtype-audio-bridge: NDJSON sidecar that streams audio levels over a
+# UNIX socket to the Quickshell OSD. Lives in /usr/bin because the
+# quickshell launcher exec's it directly by basename.
+install_companion_binary audio-bridge "$STAGING/usr/bin/voxtype-audio-bridge"
+
 cp config/default.toml "$STAGING/etc/voxtype/config.toml"
 cp packaging/systemd/voxtype.service "$STAGING/usr/lib/systemd/user/"
 cp README.md "$STAGING/usr/share/doc/voxtype/"
@@ -488,6 +534,35 @@ if [[ -d quickshell ]]; then
     # Ensure world-readable; QML files don't need execute bits.
     find "$STAGING/usr/share/voxtype/quickshell" -type f -exec chmod 644 {} \;
     find "$STAGING/usr/share/voxtype/quickshell" -type d -exec chmod 755 {} \;
+fi
+
+# OSD style packages and recipes. The style resolver searches
+# /usr/share/voxtype/osd/<name> after the user paths, so shipping the
+# examples gives `[osd] style = "<name>"` something to resolve out of the
+# box while still letting a user copy shadow it.
+if [[ -d examples/osd-packages ]]; then
+    mkdir -p "$STAGING/usr/share/voxtype/osd"
+    tar -cf - \
+        --exclude='.git' \
+        --exclude='.gitignore' \
+        --exclude='.*.swp' \
+        --exclude='*~' \
+        --exclude='.DS_Store' \
+        -C examples/osd-packages . | tar -xf - -C "$STAGING/usr/share/voxtype/osd"
+    find "$STAGING/usr/share/voxtype/osd" -type f -exec chmod 644 {} \;
+    find "$STAGING/usr/share/voxtype/osd" -type d -exec chmod 755 {} \;
+fi
+if [[ -d examples/osd-recipes ]]; then
+    mkdir -p "$STAGING/usr/share/voxtype/osd-recipes"
+    tar -cf - \
+        --exclude='.git' \
+        --exclude='.gitignore' \
+        --exclude='.*.swp' \
+        --exclude='*~' \
+        --exclude='.DS_Store' \
+        -C examples/osd-recipes . | tar -xf - -C "$STAGING/usr/share/voxtype/osd-recipes"
+    find "$STAGING/usr/share/voxtype/osd-recipes" -type f -exec chmod 644 {} \;
+    find "$STAGING/usr/share/voxtype/osd-recipes" -type d -exec chmod 755 {} \;
 fi
 
 # Shell completions (must be world-readable for non-root users)

@@ -16,7 +16,7 @@
 //! mirror script at `scripts/mirror-models-to-r2.sh`.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Base URL for the Cloudflare R2 model mirror. Every model artifact lives at
 /// `{MODELS_BASE_URL}/{engine_prefix}/{name}/{file}` and ships a sibling
@@ -165,6 +165,47 @@ pub fn file_url<T: ModelArtifact + ?Sized>(artifact: &T, relative_path: &str) ->
 /// on layout.
 pub fn local_file_path(models_dir: &std::path::Path, name: &str, relative_path: &str) -> PathBuf {
     models_dir.join(name).join(relative_path)
+}
+
+/// Name of the manifest copy the downloader leaves inside a model directory.
+///
+/// Keeping it on disk is what lets later commands check a model without going
+/// back to the network: `voxtype info models` compares file sizes against it
+/// on every listing, and `voxtype info models --verify` re-hashes against it.
+/// Dot-prefixed so it can't be mistaken for one of the model's own files.
+pub const CACHED_MANIFEST_FILENAME: &str = ".voxtype-manifest.json";
+
+/// Where the cached manifest lives for a model directory.
+pub fn cached_manifest_path(model_dir: &Path) -> PathBuf {
+    model_dir.join(CACHED_MANIFEST_FILENAME)
+}
+
+/// Record the manifest a model was validated against, inside its directory.
+///
+/// Best effort by design: a model whose files all passed their sha256 checks
+/// is installed and usable whether or not this write lands. A failure just
+/// means later integrity checks fall back to weaker evidence.
+pub fn write_cached_manifest(model_dir: &Path, manifest: &Manifest) {
+    let path = cached_manifest_path(model_dir);
+    match serde_json::to_string_pretty(manifest) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::debug!("could not cache manifest at {}: {}", path.display(), e);
+            }
+        }
+        Err(e) => tracing::debug!("could not serialize manifest for caching: {}", e),
+    }
+}
+
+/// Read back the manifest recorded at download time, if there is one.
+///
+/// `None` covers both "no manifest recorded" (a model installed before
+/// voxtype started caching them) and "the cached copy is unreadable". Callers
+/// treat both the same way: fall back to weaker evidence rather than calling
+/// the model corrupt.
+pub fn read_cached_manifest(model_dir: &Path) -> Option<Manifest> {
+    let raw = std::fs::read_to_string(cached_manifest_path(model_dir)).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 #[cfg(test)]

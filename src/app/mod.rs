@@ -4,7 +4,8 @@
 //!
 //! The rest of this module is organised by subcommand — each long handler
 //! lives in its own file (`record.rs`, `status.rs`, `meeting.rs`,
-//! `transcribe_file.rs`, `info.rs`, `config_show.rs`, `config_set_engine.rs`,
+//! `transcribe_file.rs`, `info.rs`, `config_show.rs`, `config_set.rs`,
+//! `config_get.rs`, `config_schema.rs`,
 //! `updates.rs`, `macos.rs`). Shared binary-side plumbing lives in
 //! `dispatch.rs` (the top-level subcommand router), `overrides.rs` (CLI →
 //! Config layering), and `sigpipe.rs`. Cross-binary helpers like daemon
@@ -15,7 +16,9 @@
 use std::path::PathBuf;
 use voxtype::{config, Cli};
 
-mod config_set_engine;
+mod config_get;
+mod config_schema;
+mod config_set;
 mod config_show;
 mod dispatch;
 mod info;

@@ -6,9 +6,11 @@
 //! - Interactive model selection
 //! - Output chain detection
 //! - GPU backend management
+//! - NPU backend management (Intel NPU via OpenVINO)
 //! - Parakeet backend management
 //! - Compositor integration (modifier key fix)
 
+pub mod accel;
 #[cfg(target_os = "macos")]
 pub mod app_bundle;
 pub mod binary;
@@ -22,7 +24,9 @@ pub mod launchd;
 pub mod macos;
 pub mod manifest;
 pub mod model;
+pub mod npu;
 pub mod parakeet;
+pub mod progress;
 pub mod quickshell;
 pub mod systemd;
 pub mod vad;
@@ -497,6 +501,150 @@ fn print_tool_status(tool: &OutputToolStatus, is_relevant: bool) {
     }
 }
 
+/// Which engine a `voxtype setup --model <name>` argument refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelKind {
+    Whisper,
+    Parakeet,
+    SenseVoice,
+    Moonshine,
+    Paraformer,
+    Dolphin,
+    Omnilingual,
+    Cohere,
+    OpenVino,
+}
+
+/// Resolve a `--model` name to the engine that owns it.
+///
+/// Whisper wins name collisions. `small` names both a Whisper model and
+/// SenseVoice's int8 export, and it meant Whisper for every release before
+/// SenseVoice existed, so resolving it to SenseVoice made
+/// `setup --download --model small` unable to fetch Whisper small at all: it
+/// failed the `sensevoice` feature gate on Whisper builds, and on ONNX builds
+/// it would have downloaded a different engine's model. The same holds for
+/// Moonshine's `base`/`tiny` and Dolphin's `base`. Every colliding name stays
+/// reachable under its directory form (`sensevoice-small`, `moonshine-base`,
+/// `dolphin-base`), which is what `model_catalog::download_arg` advertises.
+pub(crate) fn classify_model_override(name: &str) -> anyhow::Result<ModelKind> {
+    if model::is_valid_model(name) {
+        Ok(ModelKind::Whisper)
+    } else if model::is_parakeet_model(name) {
+        Ok(ModelKind::Parakeet)
+    } else if model::is_sensevoice_model(name) {
+        Ok(ModelKind::SenseVoice)
+    } else if model::is_moonshine_model(name) {
+        Ok(ModelKind::Moonshine)
+    } else if model::is_paraformer_model(name) {
+        Ok(ModelKind::Paraformer)
+    } else if model::is_dolphin_model(name) {
+        Ok(ModelKind::Dolphin)
+    } else if model::is_omnilingual_model(name) {
+        Ok(ModelKind::Omnilingual)
+    } else if model::is_cohere_model(name) {
+        Ok(ModelKind::Cohere)
+    } else if model::is_openvino_model(name) {
+        Ok(ModelKind::OpenVino)
+    } else {
+        anyhow::bail!(
+            "Unknown model '{}'.\n  Whisper: {}\n  Parakeet: {}\n  SenseVoice: {}\n  \
+             Moonshine: {}\n  Paraformer: {}\n  Dolphin: {}\n  Omnilingual: {}\n  \
+             Cohere: {}\n  OpenVINO: {}",
+            name,
+            model::valid_model_names().join(", "),
+            model::valid_parakeet_model_names().join(", "),
+            model::sensevoice_setup_model_names().join(", "),
+            model::moonshine_setup_model_names().join(", "),
+            model::paraformer_setup_model_names().join(", "),
+            model::dolphin_setup_model_names().join(", "),
+            model::omnilingual_setup_model_names().join(", "),
+            model::cohere_setup_model_names().join(", "),
+            model::valid_openvino_model_names().join(", "),
+        )
+    }
+}
+
+/// How `run_setup` reaches an ONNX engine whose download path was built for
+/// the interactive picker (#687): the same registry lookup, R2 download, and
+/// post-download validator, addressed by function pointer so one branch
+/// serves every such engine.
+struct OnnxSetupRoute {
+    /// Name shown in status lines.
+    display: &'static str,
+    /// Engine name written to the config on --activate.
+    engine: &'static str,
+    /// Cargo feature that compiles the engine's transcriber.
+    feature: &'static str,
+    /// Whether this binary can run the engine. The registry and downloader
+    /// are compiled unconditionally, but fetching a model the binary can't
+    /// load helps nobody, so the gate matches the older per-engine branches.
+    enabled: bool,
+    /// On-disk directory under the models dir.
+    dir_name: fn(&str) -> Option<&'static str>,
+    /// Config value --activate writes. Moonshine keeps its short name (the
+    /// `[moonshine]` default and what the picker writes); the others use the
+    /// directory name, matching their config defaults.
+    config_value: fn(&str) -> Option<&'static str>,
+    validate: fn(&std::path::Path) -> anyhow::Result<()>,
+    download: fn(&str) -> anyhow::Result<()>,
+}
+
+fn onnx_setup_route(kind: ModelKind) -> Option<OnnxSetupRoute> {
+    match kind {
+        ModelKind::Moonshine => Some(OnnxSetupRoute {
+            display: "Moonshine",
+            engine: "moonshine",
+            feature: "moonshine",
+            enabled: cfg!(feature = "moonshine"),
+            dir_name: model::moonshine_dir_name,
+            config_value: model::moonshine_config_name,
+            validate: model::validate_moonshine_model,
+            download: model::download_moonshine_model,
+        }),
+        ModelKind::Paraformer => Some(OnnxSetupRoute {
+            display: "Paraformer",
+            engine: "paraformer",
+            feature: "paraformer",
+            enabled: cfg!(feature = "paraformer"),
+            dir_name: model::paraformer_dir_name,
+            config_value: model::paraformer_dir_name,
+            validate: model::validate_onnx_ctc_model,
+            download: model::download_paraformer_model,
+        }),
+        ModelKind::Dolphin => Some(OnnxSetupRoute {
+            display: "Dolphin",
+            engine: "dolphin",
+            feature: "dolphin",
+            enabled: cfg!(feature = "dolphin"),
+            dir_name: model::dolphin_dir_name,
+            config_value: model::dolphin_dir_name,
+            validate: model::validate_onnx_ctc_model,
+            download: model::download_dolphin_model,
+        }),
+        ModelKind::Omnilingual => Some(OnnxSetupRoute {
+            display: "Omnilingual",
+            engine: "omnilingual",
+            feature: "omnilingual",
+            enabled: cfg!(feature = "omnilingual"),
+            dir_name: model::omnilingual_dir_name,
+            config_value: model::omnilingual_dir_name,
+            validate: model::validate_onnx_ctc_model,
+            download: model::download_omnilingual_model,
+        }),
+        ModelKind::Cohere => Some(OnnxSetupRoute {
+            display: "Cohere Transcribe",
+            engine: "cohere",
+            feature: "cohere",
+            enabled: cfg!(feature = "cohere"),
+            dir_name: model::cohere_dir_name,
+            config_value: model::cohere_dir_name,
+            validate: model::validate_cohere_model,
+            download: model::download_cohere_model,
+        }),
+        _ => None,
+    }
+}
+
 /// Run setup tasks (non-blocking, no red X errors)
 ///
 /// Flags:
@@ -504,12 +652,24 @@ fn print_tool_status(tool: &OutputToolStatus, is_relevant: bool) {
 /// - `model_override`: Specific model to download (use with `download`)
 /// - `quiet`: Suppress ALL output (for scripting/automation)
 /// - `no_post_install`: Suppress only "Next steps" instructions
+/// - `activate`: Also point the config at the model that was handled
+///
+/// `activate` is off by default because downloading is not selecting.
+/// Fetching a model used to rewrite `engine` and `<engine>.model` in the
+/// user's config as a side effect, which meant a GUI's Download button
+/// silently changed which engine the daemon would load, and the documented
+/// "pre-download your secondary models" sequence in `docs/CONFIGURATION.md`
+/// left the config pointing at whichever model happened to be fetched last.
+/// Model selection belongs to `voxtype config set`, the TUI, and the
+/// interactive picker (`voxtype setup model`), all of which write it
+/// explicitly.
 pub async fn run_setup(
     config: &Config,
     download: bool,
     model_override: Option<&str>,
     quiet: bool,
     no_post_install: bool,
+    activate: bool,
 ) -> anyhow::Result<()> {
     if !quiet {
         println!("Voxtype Setup\n");
@@ -544,31 +704,162 @@ pub async fn run_setup(
 
     let models_dir = Config::models_dir();
 
-    // Check if model_override is a Parakeet or SenseVoice model
-    let is_parakeet = model_override
-        .map(model::is_parakeet_model)
-        .unwrap_or(false);
-    let is_sensevoice = model_override
-        .map(model::is_sensevoice_model)
-        .unwrap_or(false);
+    // Set when the run ends with a model on disk that can't be loaded, so the
+    // summary doesn't report success over it.
+    let mut left_damaged = false;
 
-    // Validate model_override if provided (variable unused after this, each branch re-defines)
-    let _model_name: &str = match model_override {
-        Some(name) => {
-            // Validate the model name (check Whisper, Parakeet, and SenseVoice)
-            if !model::is_valid_model(name)
-                && !model::is_parakeet_model(name)
-                && !model::is_sensevoice_model(name)
-            {
-                let valid = model::valid_model_names().join(", ");
-                anyhow::bail!("Unknown model '{}'. Valid models are: {}", name, valid);
-            }
-            name
-        }
-        None => &config.whisper.model,
+    // Which engine `--model` named, rejecting names no engine claims.
+    let kind = match model_override {
+        Some(name) => Some(classify_model_override(name)?),
+        None => None,
     };
+    let is_parakeet = kind == Some(ModelKind::Parakeet);
+    let is_sensevoice = kind == Some(ModelKind::SenseVoice);
+    let is_openvino = kind == Some(ModelKind::OpenVino);
 
-    if is_sensevoice {
+    if let Some(route) = kind.and_then(onnx_setup_route) {
+        // Engines whose downloads were picker-only until #687: routed
+        // through the same registry + R2 + validator path the picker uses.
+        let model_name = model_override.unwrap(); // Safe: a route implies Some
+
+        if !quiet {
+            println!("\n{} model...", route.display);
+        }
+
+        if !route.enabled {
+            print_failure(&format!(
+                "{} model '{}' requires the '{}' feature",
+                route.display, model_name, route.feature
+            ));
+            println!(
+                "       Rebuild with: cargo build --features {}",
+                route.feature
+            );
+            anyhow::bail!("{} feature not enabled", route.feature);
+        }
+
+        let dir_name = (route.dir_name)(model_name).unwrap(); // Safe: classifier matched
+        let model_path = models_dir.join(dir_name);
+        let model_valid = model_path.exists() && (route.validate)(&model_path).is_ok();
+
+        // Downloading is not selecting (#610): the config is only touched
+        // behind --activate, exactly like the branches below.
+        let apply_activation = || -> anyhow::Result<()> {
+            let value = (route.config_value)(model_name).unwrap();
+            model::set_engine_model_config(route.engine, value)?;
+            if !quiet {
+                print_success(&format!(
+                    "Config updated: engine = \"{}\", model = \"{}\"",
+                    route.engine, value
+                ));
+            }
+            Ok(())
+        };
+
+        if model_valid {
+            if !quiet {
+                let size = std::fs::read_dir(&model_path)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter_map(|e| e.metadata().ok())
+                            .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+                            .sum::<f64>()
+                    })
+                    .unwrap_or(0.0);
+                print_success(&format!("Model ready: {} ({:.0} MB)", model_name, size));
+            }
+            if activate {
+                apply_activation()?;
+            }
+        } else if download {
+            (route.download)(model_name)?;
+            if activate {
+                apply_activation()?;
+            }
+        } else if !quiet {
+            print_info(&format!("Model '{}' not downloaded yet", model_name));
+            println!(
+                "       Run: voxtype setup --download --model {}",
+                model_name
+            );
+        }
+    } else if is_openvino {
+        // Handle OpenVINO model
+        #[allow(unused_variables)]
+        let model_name = model_override.unwrap(); // Safe: is_openvino implies Some
+
+        if !quiet {
+            println!("\nOpenVINO Whisper model...");
+        }
+
+        #[cfg(not(feature = "openvino-whisper"))]
+        {
+            print_failure(&format!(
+                "OpenVINO model '{}' requires the 'openvino-whisper' feature",
+                model_name
+            ));
+            println!("       Rebuild with: cargo build --features openvino-whisper");
+            anyhow::bail!("openvino-whisper feature not enabled");
+        }
+
+        #[cfg(feature = "openvino-whisper")]
+        {
+            let dir_name = model::openvino_dir_name(model_name).unwrap();
+            let model_path = models_dir.join(dir_name);
+            let model_valid =
+                model_path.exists() && model::validate_openvino_model(&model_path).is_ok();
+
+            if model_valid {
+                if !quiet {
+                    let size = std::fs::read_dir(&model_path)
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .filter_map(|e| e.metadata().ok())
+                                .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+                                .sum::<f64>()
+                        })
+                        .unwrap_or(0.0);
+                    print_success(&format!("Model ready: {} ({:.0} MB)", model_name, size));
+                }
+                if activate {
+                    model::set_openvino_config(model_name)?;
+                    if !quiet {
+                        print_success(&format!(
+                            "Config updated: engine = \"openvino\", model = \"{}\"",
+                            model_name
+                        ));
+                    }
+                }
+                // A failed first compile leaves valid downloaded IR files in
+                // place, so a --download retry (or activating the model) must
+                // still get a chance at NPU preparation. The compile is
+                // skipped when this model's cache blob already exists.
+                if download || activate {
+                    model::prepare_openvino_model(model_name, config);
+                }
+            } else if download {
+                model::download_openvino_model(model_name)?;
+                if activate {
+                    model::set_openvino_config(model_name)?;
+                    if !quiet {
+                        print_success(&format!(
+                            "Config updated: engine = \"openvino\", model = \"{}\"",
+                            model_name
+                        ));
+                    }
+                }
+                model::prepare_openvino_model(model_name, config);
+            } else if !quiet {
+                print_info(&format!("Model '{}' not downloaded yet", model_name));
+                println!(
+                    "       Run: voxtype setup --download --model {}",
+                    model_name
+                );
+            }
+        }
+    } else if is_sensevoice {
         // Handle SenseVoice model
         #[allow(unused_variables)]
         let model_name = model_override.unwrap(); // Safe: is_sensevoice implies Some
@@ -656,23 +947,25 @@ pub async fn run_setup(
                         .unwrap_or(0.0);
                     print_success(&format!("Model ready: {} ({:.0} MB)", model_name, size));
                 }
-                // Update config to use Parakeet
-                model::set_parakeet_config(model_name)?;
-                if !quiet {
-                    print_success(&format!(
-                        "Config updated: engine = \"parakeet\", model = \"{}\"",
-                        model_name
-                    ));
+                if activate {
+                    model::set_parakeet_config(model_name)?;
+                    if !quiet {
+                        print_success(&format!(
+                            "Config updated: engine = \"parakeet\", model = \"{}\"",
+                            model_name
+                        ));
+                    }
                 }
             } else if download {
                 model::download_parakeet_model(model_name)?;
-                // Update config to use Parakeet
-                model::set_parakeet_config(model_name)?;
-                if !quiet {
-                    print_success(&format!(
-                        "Config updated: engine = \"parakeet\", model = \"{}\"",
-                        model_name
-                    ));
+                if activate {
+                    model::set_parakeet_config(model_name)?;
+                    if !quiet {
+                        print_success(&format!(
+                            "Config updated: engine = \"parakeet\", model = \"{}\"",
+                            model_name
+                        ));
+                    }
                 }
             } else if !quiet {
                 print_info(&format!("Model '{}' not downloaded yet", model_name));
@@ -688,37 +981,34 @@ pub async fn run_setup(
             println!("\nWhisper model...");
         }
 
-        // Use model_override if provided, otherwise use config default
-        let model_name: &str = match model_override {
-            Some(name) => {
-                // Validate the model name
-                if !model::is_valid_model(name) {
-                    let whisper_models = model::valid_model_names().join(", ");
-                    let parakeet_models = model::valid_parakeet_model_names().join(", ");
-                    anyhow::bail!(
-                        "Unknown model '{}'. Valid Whisper models: {}. Valid Parakeet models: {}",
-                        name,
-                        whisper_models,
-                        parakeet_models
-                    );
-                }
-                name
-            }
-            None => &config.whisper.model,
-        };
+        // An override reaching here is already a known Whisper name; the
+        // config default is taken as-is, since it may be a path to a .bin.
+        let model_name: &str = model_override.unwrap_or(&config.whisper.model);
 
         let model_filename = crate::transcribe::whisper::get_model_filename(model_name);
         let model_path = models_dir.join(&model_filename);
 
-        if model_path.exists() {
+        // Existence isn't enough: a file left by an interrupted download from
+        // an older voxtype (or an error page saved under the model's name)
+        // must not read as ready, or `--download` would refuse to replace the
+        // very file the user is trying to repair. The ONNX branches already
+        // gate on their per-engine validators.
+        let damaged = if model_path.exists() {
+            model::validate_download(&model_path, None, model::ContentCheck::Ggml).err()
+        } else {
+            None
+        };
+
+        if model_path.exists() && damaged.is_none() {
+            let bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
             if !quiet {
-                let size = std::fs::metadata(&model_path)
-                    .map(|m| m.len() as f64 / 1024.0 / 1024.0)
-                    .unwrap_or(0.0);
+                let size = bytes as f64 / 1024.0 / 1024.0;
                 print_success(&format!("Model ready: {} ({:.0} MB)", model_name, size));
             }
-            // If user explicitly requested this model, update config even if already downloaded
-            if model_override.is_some() {
+            // Report the existing file as complete so a progress bar driven by
+            // these events finishes rather than jumping straight to `done`.
+            progress::file_already_complete(model_name, &model_filename, bytes);
+            if activate {
                 model::set_model_config(model_name)?;
                 if !quiet {
                     print_success(&format!("Config updated to use '{}'", model_name));
@@ -726,26 +1016,52 @@ pub async fn run_setup(
             }
         } else if download {
             if !quiet {
+                if let Some(problem) = &damaged {
+                    print_warning(&format!(
+                        "Existing '{}' is damaged ({}); replacing it",
+                        model_name, problem
+                    ));
+                }
                 println!("  Downloading {}...", model_name);
             }
             model::download_model(model_name)?;
-            // Update config to use the downloaded model
-            if model_override.is_some() {
+            if activate {
                 model::set_model_config(model_name)?;
                 if !quiet {
                     print_success(&format!("Config updated to use '{}'", model_name));
                 }
             }
-        } else if !quiet {
-            print_info(&format!("Model '{}' not downloaded yet", model_name));
-            println!("       Run: voxtype setup --download");
+        } else {
+            if let Some(problem) = &damaged {
+                left_damaged = true;
+                if !quiet {
+                    print_failure(&format!("Model '{}' is damaged: {}", model_name, problem));
+                    // A custom path isn't something --download can fetch.
+                    if model::is_valid_model(model_name) {
+                        println!(
+                            "       Replace it with: voxtype setup --download --model {}",
+                            model_name
+                        );
+                    } else {
+                        println!("       Replace the file, or point [whisper] model at a model voxtype can download.");
+                    }
+                }
+            } else if !quiet {
+                print_info(&format!("Model '{}' not downloaded yet", model_name));
+                println!("       Run: voxtype setup --download");
+            }
         }
     }
 
     // Summary
     if !quiet {
         println!("\n---");
-        println!("\x1b[32m✓ Setup complete!\x1b[0m");
+        if left_damaged {
+            // Don't call a run that ended with an unusable model a success.
+            println!("\x1b[33m⚠ Setup finished, but the configured model needs replacing.\x1b[0m");
+        } else {
+            println!("\x1b[32m✓ Setup complete!\x1b[0m");
+        }
     }
 
     // Show next steps unless --quiet or --no-post-install is passed
@@ -879,14 +1195,26 @@ pub async fn run_checks(config: &Config) -> anyhow::Result<()> {
         let model_filename = crate::transcribe::whisper::get_model_filename(model_name);
         let model_path = models_dir.join(&model_filename);
 
-        if model_path.exists() {
-            let size = std::fs::metadata(&model_path)
-                .map(|m| m.len() as f64 / 1024.0 / 1024.0)
-                .unwrap_or(0.0);
+        let size = std::fs::metadata(&model_path)
+            .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+            .unwrap_or(0.0);
+        if crate::model_catalog::model_installed("whisper", model_name) {
             print_success(&format!(
                 "Model '{}' installed ({:.0} MB)",
                 model_name, size
             ));
+        } else if model_path.exists() {
+            // Present but short: an interrupted download used to be reported
+            // as installed, then failed to load at runtime.
+            print_failure(&format!(
+                "Model '{}' is incomplete ({:.0} MB on disk)",
+                model_name, size
+            ));
+            println!(
+                "       Run: voxtype setup --download --model {}",
+                model_name
+            );
+            all_ok = false;
         } else {
             print_failure(&format!("Model '{}' not found", model_name));
             println!("       Run: voxtype setup --download");
@@ -942,6 +1270,70 @@ pub async fn run_checks(config: &Config) -> anyhow::Result<()> {
         }
     }
 
+    // Check OpenVINO models
+    println!("\nOpenVINO Whisper Models:");
+
+    let mut openvino_models: Vec<(String, u64)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&models_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("openvino-whisper")
+                    && model::validate_openvino_model(&path).is_ok()
+                {
+                    let size = std::fs::read_dir(&path)
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .filter_map(|e| e.metadata().ok())
+                                .map(|m| m.len())
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    openvino_models.push((name, size));
+                }
+            }
+        }
+    }
+
+    if openvino_models.is_empty() {
+        print_info("No OpenVINO models found");
+        println!("       Download with: voxtype setup --download --model base.en-int8");
+    } else {
+        for (name, size) in &openvino_models {
+            let size_mb = *size as f64 / 1024.0 / 1024.0;
+            print_success(&format!("Model '{}' installed ({:.0} MB)", name, size_mb));
+        }
+    }
+
+    // Check if OpenVINO is configured but model is missing
+    if config.engine == crate::config::TranscriptionEngine::OpenVino {
+        if let Some(ref openvino_config) = config.openvino {
+            let configured_model = &openvino_config.model;
+            // Resolve the dir name for the configured model
+            let dir_name = model::openvino_dir_name(configured_model);
+            let model_found = match dir_name {
+                Some(dir) => openvino_models.iter().any(|(name, _)| name == dir),
+                None => false,
+            };
+            if !model_found {
+                print_failure(&format!(
+                    "Configured OpenVINO model '{}' not found",
+                    configured_model
+                ));
+                println!(
+                    "       Download with: voxtype setup --download --model {}",
+                    configured_model
+                );
+                all_ok = false;
+            }
+        } else {
+            print_failure("Engine set to 'openvino' but [openvino] config section is missing");
+            all_ok = false;
+        }
+    }
+
     // Check if Parakeet is configured but model is missing
     if config.engine == crate::config::TranscriptionEngine::Parakeet {
         if let Some(ref parakeet_config) = config.parakeet {
@@ -972,4 +1364,215 @@ pub async fn run_checks(config: &Config) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `small` is in both the Whisper and SenseVoice tables. Whisper has to
+    /// win, or `setup --download --model small` can never fetch Whisper small.
+    #[test]
+    fn whisper_wins_colliding_model_names() {
+        assert!(model::is_sensevoice_model("small"));
+        assert_eq!(
+            classify_model_override("small").unwrap(),
+            ModelKind::Whisper
+        );
+        assert_eq!(
+            classify_model_override("small.en").unwrap(),
+            ModelKind::Whisper
+        );
+        // Moonshine and Dolphin also use `base` as a short name.
+        assert!(model::is_moonshine_model("base"));
+        assert!(model::is_dolphin_model("base"));
+        assert_eq!(classify_model_override("base").unwrap(), ModelKind::Whisper);
+        assert_eq!(classify_model_override("tiny").unwrap(), ModelKind::Whisper);
+    }
+
+    /// The picker-only engines (#687) are reachable by their directory-form
+    /// names, which is what `download_arg` advertises.
+    #[test]
+    fn picker_only_engines_classify_by_directory_name() {
+        for (name, expected) in [
+            ("moonshine-base", ModelKind::Moonshine),
+            ("moonshine-tiny-ko", ModelKind::Moonshine),
+            ("paraformer-zh", ModelKind::Paraformer),
+            ("dolphin-base", ModelKind::Dolphin),
+            ("omnilingual-300m", ModelKind::Omnilingual),
+            ("cohere-transcribe-q4f16", ModelKind::Cohere),
+            ("cohere-transcribe-fp16", ModelKind::Cohere),
+        ] {
+            assert_eq!(classify_model_override(name).unwrap(), expected, "{}", name);
+        }
+    }
+
+    /// `run_setup` unwraps a route's `dir_name` and `config_value` for any
+    /// name the classifier accepted, so every advertised argument must
+    /// resolve through its route without panicking.
+    #[test]
+    fn every_routed_engine_resolves_names_for_its_catalog() {
+        for engine in [
+            "moonshine",
+            "paraformer",
+            "dolphin",
+            "omnilingual",
+            "cohere",
+        ] {
+            for model in crate::model_catalog::model_catalog(engine) {
+                let arg = crate::model_catalog::download_arg(engine, model).unwrap();
+                let kind = classify_model_override(&arg).unwrap();
+                let route = onnx_setup_route(kind)
+                    .unwrap_or_else(|| panic!("no setup route for {} '{}'", engine, arg));
+                assert_eq!(route.engine, engine, "{}", arg);
+                assert!(
+                    (route.dir_name)(&arg).is_some(),
+                    "{} '{}' has no directory name",
+                    engine,
+                    arg
+                );
+                assert!(
+                    (route.config_value)(&arg).is_some(),
+                    "{} '{}' has no config value",
+                    engine,
+                    arg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sensevoice_models_stay_reachable_under_their_directory_name() {
+        assert_eq!(
+            classify_model_override("sensevoice-small").unwrap(),
+            ModelKind::SenseVoice
+        );
+        assert_eq!(
+            classify_model_override("sensevoice-small-fp32").unwrap(),
+            ModelKind::SenseVoice
+        );
+        // `small-fp32` doesn't collide with anything, so the short form works.
+        assert_eq!(
+            classify_model_override("small-fp32").unwrap(),
+            ModelKind::SenseVoice
+        );
+        assert_eq!(
+            model::sensevoice_dir_name("sensevoice-small"),
+            Some("sensevoice-small")
+        );
+    }
+
+    #[test]
+    fn parakeet_models_classify_as_parakeet() {
+        let name = model::valid_parakeet_model_names()[0];
+        assert_eq!(
+            classify_model_override(name).unwrap(),
+            ModelKind::Parakeet,
+            "{}",
+            name
+        );
+    }
+
+    /// Whatever `voxtype info models` advertises as a download argument has to
+    /// fetch that engine's model, not a same-named model from another engine.
+    ///
+    /// This is the invariant a GUI depends on: it lists models from
+    /// `info models --json` and hands `download_arg` straight to
+    /// `setup --download --model`. SenseVoice is the reason the field exists —
+    /// its catalog names (`small`) are Whisper model names too.
+    #[test]
+    fn advertised_download_args_resolve_to_their_own_engine() {
+        for engine in crate::model_catalog::CATALOG_ENGINES {
+            for model in crate::model_catalog::model_catalog(engine) {
+                let Some(arg) = crate::model_catalog::download_arg(engine, model) else {
+                    continue;
+                };
+                let expected = match *engine {
+                    "whisper" => ModelKind::Whisper,
+                    "parakeet" => ModelKind::Parakeet,
+                    "sensevoice" => ModelKind::SenseVoice,
+                    "moonshine" => ModelKind::Moonshine,
+                    "paraformer" => ModelKind::Paraformer,
+                    "dolphin" => ModelKind::Dolphin,
+                    "omnilingual" => ModelKind::Omnilingual,
+                    "cohere" => ModelKind::Cohere,
+                    "openvino" => ModelKind::OpenVino,
+                    other => panic!(
+                        "'{}' advertises a download argument but run_setup has no branch for it",
+                        other
+                    ),
+                };
+                let got = classify_model_override(&arg).unwrap_or_else(|e| {
+                    panic!("{} model '{}' advertises '{}': {}", engine, model, arg, e)
+                });
+                assert_eq!(
+                    got, expected,
+                    "{} model '{}' advertises '{}', which downloads a {:?} model",
+                    engine, model, arg, got
+                );
+            }
+        }
+    }
+
+    /// A plain model name must fetch that exact model. Quantized variants are
+    /// separate catalog entries, never aliases reached by a plain name.
+    #[test]
+    fn quantized_variants_are_distinct_entries_not_aliases() {
+        let names = model::valid_parakeet_model_names();
+        assert!(names.contains(&"parakeet-tdt-0.6b-v2"), "{:?}", names);
+        assert!(names.contains(&"parakeet-tdt-0.6b-v2-int8"), "{:?}", names);
+
+        for name in &names {
+            // A registry entry keyed by the catalog name is what makes the
+            // files land in a directory of that name.
+            assert!(
+                !model::expected_file_names("parakeet", name).is_empty(),
+                "no registry entry for '{}'",
+                name
+            );
+            assert_eq!(
+                crate::model_catalog::model_dir_name("parakeet", name),
+                *name,
+                "'{}' would install under a different directory",
+                name
+            );
+        }
+
+        assert_ne!(
+            model::expected_file_names("parakeet", "parakeet-tdt-0.6b-v2"),
+            model::expected_file_names("parakeet", "parakeet-tdt-0.6b-v2-int8"),
+            "plain and int8 must not share a file list"
+        );
+    }
+
+    /// Moonshine and SenseVoice keep short config values while their files
+    /// live under a prefixed directory. Looking in the wrong place made
+    /// installed models report as missing.
+    #[test]
+    fn short_config_names_map_to_prefixed_directories() {
+        assert_eq!(
+            crate::model_catalog::model_dir_name("moonshine", "base"),
+            "moonshine-base"
+        );
+        assert_eq!(
+            crate::model_catalog::model_dir_name("sensevoice", "small"),
+            "sensevoice-small"
+        );
+        // Engines whose catalog names are already directory names.
+        assert_eq!(
+            crate::model_catalog::model_dir_name("dolphin", "dolphin-base"),
+            "dolphin-base"
+        );
+    }
+
+    /// A name no engine claims must fail rather than fall through to whisper,
+    /// where it would become a download for a nonexistent file.
+    #[test]
+    fn unknown_model_names_are_rejected() {
+        let err = classify_model_override("gargantuan-v9")
+            .expect_err("unknown model should be an error")
+            .to_string();
+        assert!(err.contains("Unknown model 'gargantuan-v9'"), "{}", err);
+        assert!(err.contains("large-v3-turbo"), "{}", err);
+    }
 }

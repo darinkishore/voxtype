@@ -1063,6 +1063,7 @@ async fn run_streaming_attempt(
     let mut resampler = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE);
     let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_BYTES * 2);
     let mut samples_closed = false;
+    let mut source_samples = 0usize;
     let mut sent_stop_sequence = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     // `input_audio_buffer.committed` names the turn's final item; once that
@@ -1093,6 +1094,7 @@ async fn run_streaming_attempt(
             chunk = samples_rx.recv(), if !samples_closed => {
                 match chunk {
                     Some(c) if !c.is_empty() => {
+                        source_samples += c.len();
                         let bytes = resampler.encode_chunk(&c);
                         pending.extend_from_slice(&bytes);
                         while pending.len() >= CHUNK_BYTES {
@@ -1125,6 +1127,7 @@ async fn run_streaming_attempt(
                             sent_stop_sequence = true;
                             let timeout = if turn_detection { DRAIN_TIMEOUT } else { BATCH_TIMEOUT };
                             drain_deadline = Some(tokio::time::Instant::now() + timeout);
+                            tracing::info!("OpenAI Realtime: uploaded {} source samples ({:.3}s) before end-of-turn", source_samples, source_samples as f64 / SOURCE_SAMPLE_RATE as f64);
                             tracing::debug!(
                                 "OpenAI Realtime: end-of-turn signalled (turn_detection={}); draining (timeout {}s)",
                                 turn_detection,
@@ -1172,6 +1175,7 @@ async fn run_streaming_attempt(
                     }
                     "conversation.item.input_audio_transcription.completed" => {
                         let transcript = parsed.get("transcript").and_then(|v| v.as_str()).unwrap_or("");
+                        tracing::info!("OpenAI Realtime: final received ({} chars, item {})", transcript.chars().count(), item_id);
                         if committed_item.as_deref() == Some(item_id) {
                             committed_item_done = true;
                         }

@@ -40,7 +40,9 @@ modifiers = []
 
 [audio]
 # Audio input device ("default" uses system default)
-# List devices with: pactl list sources short
+# List devices with: voxtype info devices
+# (or `arecord -L`). This takes an ALSA device name, not a PulseAudio
+# or PipeWire source name -- names from `pactl list sources` will not work.
 device = "default"
 
 # Sample rate in Hz (whisper expects 16000)
@@ -49,8 +51,8 @@ sample_rate = 16000
 # Maximum recording duration in seconds (safety limit)
 max_duration_secs = 60
 
-# Pause MPRIS media players (Spotify, Firefox, etc.) when recording starts,
-# resume them when recording stops. Talks D-Bus directly; no external
+# Pause MPRIS media players (Spotify, Firefox, etc.) before recording starts,
+# then resume them as soon as recording stops. Talks D-Bus directly; no external
 # playerctl binary required.
 # pause_media = false
 
@@ -64,7 +66,30 @@ max_duration_secs = 60
 # recording stops. This is separate from pause_media; enable one behavior or
 # the other depending on whether you want media paused or only quieter.
 # duck_media = false
-# duck_media_volume_percent = 70
+#
+# Percent of its current amplitude a ducked stream keeps: 70 keeps media at
+# 70% (-3.1 dB), 50 at half (-6 dB). Converted internally to PulseAudio's
+# cubic scale, so what you configure is what you hear.
+# duck_media_volume_percent = 34
+#
+# Fade the ducking ramp instead of jumping straight to the target volume. The
+# same duration is used going down and coming back up; 0 keeps the previous
+# instant behavior.
+# duck_media_fade_ms = 150
+
+# Auto-stop an external-trigger recording (`voxtype record start`, e.g. from
+# a wake-word integration) after this many seconds of silence. Unset by
+# default: the recording only ends on an explicit `record stop`/`record
+# toggle`. Never applies to hotkey-driven push-to-talk/toggle recordings,
+# which already have an explicit user-driven stop.
+# external_trigger_silence_timeout_secs = 2.0
+
+# Peak level (dBFS) at or above which a frame counts as speech for
+# external_trigger_silence_timeout_secs above. -20 sits above typical
+# laptop-mic noise (~-30 dBFS); raise it (toward 0) on a noisier mic,
+# lower it if soft speech isn't resetting the silence timer. A frame only
+# counts once a short burst sustains it, so stray noise spikes don't count.
+# external_trigger_speech_threshold_dbfs = -20.0
 
 # [audio.feedback]
 # Enable audio feedback sounds (beeps when recording starts/stops)
@@ -165,6 +190,12 @@ translate = false
 #
 # Timeout for remote requests in seconds (default: 30)
 # remote_timeout_secs = 30
+#
+# Send an explicit "language=auto" field when language = "auto" (default: false)
+# By default the language field is omitted in auto mode, which OpenAI-compatible
+# endpoints treat as auto-detect. whisper.cpp's server instead falls back to its
+# own -l setting (default "en"); enable this so "auto" is sent explicitly.
+# remote_send_auto_language = true
 
 [output]
 # Primary output mode: "type" or "clipboard"

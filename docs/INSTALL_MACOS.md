@@ -7,7 +7,7 @@ Voxtype is a push-to-talk voice-to-text tool with fast, local speech recognition
 ## Requirements
 
 - macOS 13 (Ventura) or later
-- Apple Silicon (M1/M2/M3/M4)
+- Apple Silicon or Intel (the release binary is universal)
 - Microphone access
 - Input Monitoring permission (for global hotkey)
 
@@ -21,29 +21,32 @@ brew tap peteonrails/voxtype
 brew install --cask peteonrails/voxtype/voxtype
 ```
 
-The Cask automatically:
-- Installs Voxtype.app to /Applications
-- Creates CLI symlink (`voxtype` command)
-- Sets up auto-start at login
-- Starts the daemon
+The Cask installs a single `voxtype` command-line tool into your Homebrew
+prefix and clears the quarantine flag on it. There is no app bundle, no
+`/Applications` entry, and no login item: start the daemon yourself, or install
+the formula instead of the cask if you want a `brew services` job.
+
+The fastest way through the rest of setup is the TUI:
+
+```bash
+voxtype configure
+```
 
 ### First-Time Security Setup
 
-Because the app is unsigned, macOS will block it on first run. This is a one-time setup:
+The binary is not signed or notarized yet, so macOS asks about it on first run.
+This is a one-time setup:
 
-1. **Allow the app to run:**
-   - Open **System Settings** > **Privacy & Security**
-   - Scroll down to find "Voxtype.app was blocked"
-   - Click **Open Anyway**
-
-2. **Grant Input Monitoring permission (required for hotkey):**
+1. **Grant Input Monitoring permission (required for the hotkey):**
    - Open **System Settings** > **Privacy & Security** > **Input Monitoring**
-   - Enable **Voxtype**
+   - Add and enable the terminal you run `voxtype` from
+
+2. **Grant Microphone access** when macOS prompts on the first recording.
 
 3. **Restart the daemon** to pick up permissions:
    ```bash
-   launchctl stop io.voxtype.daemon
-   launchctl start io.voxtype.daemon
+   pkill voxtype
+   voxtype daemon
    ```
 
 ### Download a Speech Model
@@ -85,7 +88,10 @@ This shows:
 
 ## Configuration
 
-Config file: `~/Library/Application Support/voxtype/config.toml`
+Config file: `~/.config/voxtype/config.toml`, honoring `$XDG_CONFIG_HOME` if set.
+
+Older installs that wrote to `~/Library/Application Support/voxtype/config.toml`
+keep using it until you move the file to `~/.config/voxtype/`.
 
 ```toml
 # Transcription engine
@@ -164,10 +170,7 @@ launchctl start io.voxtype.daemon
 brew uninstall --cask voxtype
 ```
 
-This removes:
-- Voxtype.app from /Applications
-- LaunchAgent (auto-start)
-- CLI symlink
+This removes the `voxtype` command-line tool and the staged DMG payload.
 
 To also remove data:
 ```bash

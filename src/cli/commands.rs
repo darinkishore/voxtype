@@ -1,5 +1,6 @@
 //! Top-level subcommand enum.
 
+use clap::builder::PossibleValuesParser;
 use clap::Subcommand;
 
 use super::{ConfigAction, InfoAction, MeetingAction, RecordAction, SetupAction};
@@ -64,7 +65,10 @@ pub enum Commands {
 
         /// Specify which model to download (use with --download).
         /// Whisper: tiny, base, small, medium, large-v3, large-v3-turbo (and .en variants).
-        /// Parakeet: parakeet-tdt-0.6b-v3, parakeet-tdt-0.6b-v3-int8
+        /// Parakeet: parakeet-tdt-0.6b-v3, parakeet-tdt-0.6b-v3-int8.
+        /// Other engines (Moonshine, SenseVoice, Paraformer, Dolphin,
+        /// Omnilingual, Cohere, OpenVINO) take the directory-form names shown
+        /// by `voxtype info models`, e.g. cohere-transcribe-q4f16.
         #[arg(long, value_name = "NAME")]
         model: Option<String>,
 
@@ -75,6 +79,31 @@ pub enum Commands {
         /// Suppress only "Next steps" instructions
         #[arg(long)]
         no_post_install: bool,
+
+        /// Also switch the config to use the model, the way the interactive
+        /// picker does: sets `engine` and `<engine>.model`.
+        ///
+        /// Off by default. Downloading a model does not select it, so a GUI's
+        /// Download button and scripted pre-downloads can't change which
+        /// engine the daemon loads. Select a model explicitly with
+        /// `voxtype config set <engine>.model <NAME>`.
+        #[arg(long)]
+        activate: bool,
+
+        /// How download progress is reported: human (curl's progress bar) or
+        /// json (one NDJSON event per update on stdout, for a GUI to render).
+        ///
+        /// json implies --quiet for human status lines; stdout carries only
+        /// events. Failures still exit non-zero, with an "error" event
+        /// alongside.
+        #[arg(
+            long,
+            value_name = "FORMAT",
+            default_value = "human",
+            value_parser = PossibleValuesParser::new(super::PROGRESS_FORMATS),
+            env = "VOXTYPE_PROGRESS_FORMAT",
+        )]
+        progress_format: String,
     },
 
     /// Show or modify configuration
@@ -98,6 +127,12 @@ pub enum Commands {
         /// Render as if installed from a package (for testing source builds).
         #[arg(long, hide = true)]
         force_package_mode: bool,
+
+        /// Print detected audio input devices (one per line) and exit.
+        /// Used internally by the TUI to probe devices in a subprocess, so
+        /// an ALSA hang or crash during probing can't take the TUI with it.
+        #[arg(long, hide = true)]
+        probe_audio_devices: bool,
     },
 
     /// Show daemon status (for Waybar/polybar integration)

@@ -14,6 +14,7 @@ use crate::config;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use toml_edit::{DocumentMut, Item, Value};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,11 +46,54 @@ pub struct ConfigEditor {
     dirty: bool,
 }
 
+/// Config file the TUI edits, when it is not the default.
+///
+/// The TUI has 24 `ConfigEditor::load()` call sites across 12 section modules.
+/// Threading a path through all of them invites a missed one, and a missed one
+/// silently writes the user's real config instead of the file they named —
+/// which is the bug this exists to prevent (#595). Setting it once at TUI
+/// startup keeps the resolution in a single place that cannot be partially
+/// applied.
+static TUI_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point `ConfigEditor::load()` at a specific file for the rest of this
+/// process. Called once, from `tui::run`, with the `-c/--config` value.
+///
+/// Ignored when `path` is `None` so the default resolution stays untouched,
+/// and a no-op if called twice: the TUI is a single-purpose process and a
+/// second config file mid-run has no meaning.
+pub fn set_tui_config_path(path: Option<PathBuf>) {
+    if let Some(path) = path {
+        let _ = TUI_CONFIG_PATH.set(path);
+    }
+}
+
+/// The config file the TUI is editing: the `-c/--config` override when one was
+/// given, otherwise the default path.
+///
+/// Anything in the TUI that needs to know which file is in play must ask here
+/// rather than calling `Config::default_path()` directly, or it will disagree
+/// with what the sections actually read and write.
+pub fn tui_config_path() -> Option<PathBuf> {
+    resolve_tui_config_path(TUI_CONFIG_PATH.get())
+}
+
+/// Pure form of `tui_config_path`, taking the override explicitly so the
+/// resolution can be tested without touching the process-global `OnceLock`
+/// (which only sets once, making order-dependent tests unavoidable otherwise).
+fn resolve_tui_config_path(override_path: Option<&PathBuf>) -> Option<PathBuf> {
+    match override_path {
+        Some(path) => Some(path.clone()),
+        None => config::Config::default_path(),
+    }
+}
+
 impl ConfigEditor {
-    /// Load `~/.config/voxtype/config.toml` (creating an empty document if the
-    /// file is missing — `save()` will write it on first edit).
+    /// Load the config the TUI is editing: the `-c/--config` file when one was
+    /// given, otherwise `~/.config/voxtype/config.toml`. Creates an empty
+    /// document if the file is missing — `save()` writes it on first edit.
     pub fn load() -> Result<Self, EditorError> {
-        let path = config::Config::default_path().ok_or(EditorError::NoConfigPath)?;
+        let path = tui_config_path().ok_or(EditorError::NoConfigPath)?;
         Self::load_from(path)
     }
 
@@ -235,6 +279,15 @@ impl ConfigEditor {
         self.table(table)?.get(key).and_then(|i| i.as_value())
     }
 
+    /// The raw TOML value at `table.key`, or `None` when the key is absent.
+    ///
+    /// Callers that need to report what is *literally in the file* (as
+    /// opposed to a resolved value with defaults applied) use this to type
+    /// the value themselves — `voxtype config schema --json` reports both.
+    pub fn get_toml_value(&self, table: &str, key: &str) -> Option<&Value> {
+        self.value(table, key)
+    }
+
     /// Ensure a (possibly dotted) `[table]` path exists and return it as a
     /// mutable Item. Creates intermediate tables as needed.
     fn ensure_table(&mut self, dotted: &str) -> &mut Item {
@@ -348,6 +401,43 @@ mod tests {
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         (dir, path)
+    }
+
+    /// #595: an override is used verbatim, and its absence falls back to the
+    /// default so the common case is unchanged.
+    #[test]
+    fn tui_config_path_prefers_the_override() {
+        let scratch = PathBuf::from("/tmp/scratch.toml");
+        assert_eq!(
+            resolve_tui_config_path(Some(&scratch)).as_deref(),
+            Some(scratch.as_path())
+        );
+        // Without an override the answer is whatever the default resolution
+        // says — including None in an environment with no home directory.
+        assert_eq!(
+            resolve_tui_config_path(None),
+            config::Config::default_path()
+        );
+    }
+
+    /// The override is what `load()` consults, and it is what `save()` then
+    /// writes back to — the two must not diverge, which is exactly how the
+    /// bug wrote the user's real config while reporting the scratch file.
+    #[test]
+    fn editor_saves_to_the_path_it_loaded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scratch = dir.path().join("scratch.toml");
+        std::fs::write(&scratch, "engine = \"whisper\"\n").unwrap();
+
+        let mut ed = ConfigEditor::load_from_path(scratch.clone()).unwrap();
+        ed.set_string("whisper", "model", "large-v3");
+        ed.save().unwrap();
+
+        let written = std::fs::read_to_string(&scratch).unwrap();
+        assert!(
+            written.contains("large-v3"),
+            "the file that was loaded must be the file that is written"
+        );
     }
 
     #[test]

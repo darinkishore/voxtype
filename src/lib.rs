@@ -85,6 +85,7 @@ pub mod hotkey_macos;
 pub mod meeting;
 #[cfg(target_os = "macos")]
 pub mod menubar;
+pub mod model_catalog;
 pub mod model_manager;
 pub mod notification;
 pub mod osd;
@@ -98,8 +99,8 @@ pub mod tui;
 pub mod vad;
 
 pub use cli::{
-    Cli, Commands, CompositorType, ConfigAction, ConfigSetKey, InfoAction, MeetingAction,
-    OutputModeOverride, RecordAction, SetupAction,
+    Cli, Commands, CompositorType, ConfigAction, InfoAction, MeetingAction, OutputModeOverride,
+    RecordAction, SetupAction,
 };
 pub use config::Config;
 pub use daemon::Daemon;

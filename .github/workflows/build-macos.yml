@@ -23,6 +23,12 @@ on:
 jobs:
   build:
     runs-on: macos-14  # Apple Silicon runner for ARM64 build
+    # Hoisted to job scope on purpose. A step's `if:` cannot read that same
+    # step's own `env:` block, so gating on secrets has to happen against a
+    # job-level env var or the step silently never runs.
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT != '' }}
+      HAS_NOTARY_CREDS: ${{ secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -78,7 +84,7 @@ jobs:
           releases/${VERSION}/voxtype-${VERSION}-macos-universal --version
 
       - name: Import certificate
-        if: env.APPLE_DEVELOPER_ID_CERT != ''
+        if: env.HAS_SIGNING_CERT == 'true'
         env:
           APPLE_DEVELOPER_ID_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT }}
           APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
@@ -105,7 +111,7 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
       - name: Sign binary
-        if: env.APPLE_DEVELOPER_ID_CERT != ''
+        if: env.HAS_SIGNING_CERT == 'true'
         env:
           APPLE_DEVELOPER_ID_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT }}
         run: |
@@ -126,7 +132,7 @@ jobs:
           codesign --verify --strict --verbose=2 "$BINARY"
 
       - name: Notarize binary
-        if: env.APPLE_ID != ''
+        if: env.HAS_NOTARY_CREDS == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -135,44 +141,92 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           BINARY=releases/${VERSION}/voxtype-${VERSION}-macos-universal
 
-          # Create ZIP for notarization
+          # A standalone Mach-O can be notarized but has nowhere to hold the
+          # ticket, so there is no stapling here. Gatekeeper checks this one
+          # online. The DMG below is what gets stapled.
           ditto -c -k "$BINARY" "${BINARY}.zip"
-
-          # Submit for notarization
           xcrun notarytool submit "${BINARY}.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
-
-          # Clean up and staple
           rm "${BINARY}.zip"
-          xcrun stapler staple "$BINARY"
 
-      - name: Create DMG
+      - name: Build app bundle
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          BINARY=releases/${VERSION}/voxtype-${VERSION}-macos-universal
+          VOXTYPE_SKIP_DMG=1 ./scripts/build-macos-dmg.sh "$VERSION"
+
+      - name: Sign app bundle
+        if: env.HAS_SIGNING_CERT == 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          APP=releases/${VERSION}/Voxtype.app
+
+          IDENTITY=$(security find-identity -v -p codesigning | \
+            grep "Developer ID Application" | head -1 | \
+            sed 's/.*"\(.*\)".*/\1/')
+
+          # Inner code first, then the wrapper. build-macos-dmg.sh ad-hoc signs
+          # the inner binary so it runs unsigned locally; re-sign it here with
+          # the real identity before sealing the outer bundle.
+          codesign --force --timestamp --options runtime \
+            --sign "$IDENTITY" \
+            "$APP/Contents/MacOS/VoxtypeMenubar.app" \
+            "$APP/Contents/MacOS/VoxtypeSetup.app"
+
+          codesign --force --deep --timestamp --options runtime \
+            --sign "$IDENTITY" "$APP"
+
+          codesign --verify --strict --deep --verbose=2 "$APP"
+
+      - name: Package DMG
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          VOXTYPE_SKIP_APP=1 ./scripts/build-macos-dmg.sh "$VERSION"
+
+      - name: Sign DMG
+        if: env.HAS_SIGNING_CERT == 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
           DMG=releases/${VERSION}/voxtype-${VERSION}-macos-universal.dmg
 
-          # Create temp directory with binary
-          TEMP_DIR=$(mktemp -d)
-          cp "$BINARY" "$TEMP_DIR/voxtype"
+          IDENTITY=$(security find-identity -v -p codesigning | \
+            grep "Developer ID Application" | head -1 | \
+            sed 's/.*"\(.*\)".*/\1/')
 
-          # Create simple DMG
-          hdiutil create -volname "Voxtype $VERSION" \
-            -srcfolder "$TEMP_DIR" \
-            -ov -format UDZO \
-            "$DMG"
+          codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
-          rm -rf "$TEMP_DIR"
+      - name: Notarize and staple DMG
+        if: env.HAS_NOTARY_CREDS == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          DMG=releases/${VERSION}/voxtype-${VERSION}-macos-universal.dmg
+
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # A DMG can hold the ticket, so staple it. This is what makes the
+          # download work on a machine with no network path to Apple.
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
 
       - name: Generate checksums
         run: |
           VERSION=${{ steps.version.outputs.version }}
           cd releases/${VERSION}
-          shasum -a 256 * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          # Namespaced per platform. Both this job and build-linux.yml upload
+          # to the same release, and a bare SHA256SUMS.txt from each meant one
+          # silently clobbered the other.
+          shasum -a 256 voxtype-* > SHA256SUMS-macos.txt
+          cat SHA256SUMS-macos.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -180,15 +234,21 @@ jobs:
           name: voxtype-${{ steps.version.outputs.version }}-macos
           path: |
             releases/${{ steps.version.outputs.version }}/voxtype-*
-            releases/${{ steps.version.outputs.version }}/SHA256SUMS.txt
+            releases/${{ steps.version.outputs.version }}/SHA256SUMS-macos.txt
 
       - name: Upload to release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
+          # Whichever workflow finishes first CREATES the release, and a
+          # created release defaults to prerelease=false, which GitHub then
+          # marks "latest". This step racing ahead of Build Linux on the
+          # v1.1.0-rc2 tag published an RC as the latest release. Every
+          # workflow that can create the release must set this.
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
           files: |
             releases/${{ steps.version.outputs.version }}/voxtype-*
-            releases/${{ steps.version.outputs.version }}/SHA256SUMS.txt
+            releases/${{ steps.version.outputs.version }}/SHA256SUMS-macos.txt
 
   # Aggregator job — branch protection only needs to require `macos-ci-success`.
   # If we add more macOS jobs (arm64 smoke test, notarization gate, etc.) they

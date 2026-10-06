@@ -26,17 +26,39 @@ if [[ ! -d "$RELEASE_DIR" ]]; then
     exit 1
 fi
 
-# Define expected binaries
+# Binaries report the base version: a v1.0.0-rc1 tag builds from a crate
+# whose version is 1.0.0, and the --version regex below only captures the
+# numeric triple anyway. Compare against the base so prerelease tags work.
+BASE_VERSION="${VERSION%%-*}"
+
+# Define expected binaries. This list is the release manifest: anything
+# named here that is missing fails validation (see #351, #436, and the
+# v1.0.0-rc1 post-mortem).
 WHISPER_BINARIES=(
     "voxtype-${VERSION}-linux-x86_64-avx2"
     "voxtype-${VERSION}-linux-x86_64-avx512"
     "voxtype-${VERSION}-linux-x86_64-vulkan"
 )
 
+# The single onnx-cuda binary split into major-version-specific builds in
+# v0.7.0, and MIGraphX replaced ROCm in the same release. This list had
+# never been updated, so it expected a name nothing produces.
 ONNX_BINARIES=(
     "voxtype-${VERSION}-linux-x86_64-onnx-avx2"
     "voxtype-${VERSION}-linux-x86_64-onnx-avx512"
-    "voxtype-${VERSION}-linux-x86_64-onnx-cuda"
+    "voxtype-${VERSION}-linux-x86_64-onnx-cuda-12"
+    "voxtype-${VERSION}-linux-x86_64-onnx-cuda-13"
+    "voxtype-${VERSION}-linux-x86_64-onnx-migraphx"
+)
+
+# OSD frontends and the audio-bridge sidecar, built by Dockerfile.onnx.
+# Shipped as their own release assets and consumed by the voxtype-bin AUR
+# package, so a release missing them is incomplete (#488).
+COMPANION_BINARIES=(
+    "voxtype-${VERSION}-linux-x86_64-osd"
+    "voxtype-${VERSION}-linux-x86_64-osd-gtk4"
+    "voxtype-${VERSION}-linux-x86_64-osd-quickshell"
+    "voxtype-${VERSION}-linux-x86_64-audio-bridge"
 )
 
 # Binaries that must NOT have AVX-512 instructions
@@ -54,9 +76,18 @@ MUST_HAVE_AVX512=(
 FAILED=false
 
 # 1. Check all binaries exist
+#
+# A missing binary used to print an X and carry on, so a release with three
+# of eight binaries validated clean. That is how #351 and #436 shipped with
+# assets missing. Absence is now a hard failure.
 echo "Checking binary existence..."
-ALL_BINARIES=("${WHISPER_BINARIES[@]}" "${ONNX_BINARIES[@]}")
+ALL_BINARIES=(
+    "${WHISPER_BINARIES[@]}"
+    "${ONNX_BINARIES[@]}"
+    "${COMPANION_BINARIES[@]}"
+)
 FOUND_BINARIES=()
+MISSING_BINARIES=()
 
 for binary in "${ALL_BINARIES[@]}"; do
     if [[ -f "${RELEASE_DIR}/${binary}" ]]; then
@@ -64,6 +95,8 @@ for binary in "${ALL_BINARIES[@]}"; do
         FOUND_BINARIES+=("$binary")
     else
         echo "  ✗ ${binary} (NOT FOUND)"
+        MISSING_BINARIES+=("$binary")
+        FAILED=true
     fi
 done
 echo ""
@@ -74,13 +107,22 @@ if [[ ${#FOUND_BINARIES[@]} -eq 0 ]]; then
 fi
 
 # 2. Check version strings
-echo "Checking version strings..."
+#
+# Compared against BASE_VERSION, not VERSION. The regex captures only the
+# numeric triple, so on a v1.0.0-rc1 tag it yields "1.0.0" while VERSION is
+# "1.0.0-rc1" and every binary failed. That mismatch is why the v1.0.0-rc1
+# release job died before uploading a single Linux asset.
+if [[ "$VERSION" != "$BASE_VERSION" ]]; then
+    echo "Checking version strings (prerelease ${VERSION}, expecting v${BASE_VERSION} from binaries)..."
+else
+    echo "Checking version strings..."
+fi
 for binary in "${FOUND_BINARIES[@]}"; do
     REPORTED_VERSION=$("${RELEASE_DIR}/${binary}" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    if [[ "$REPORTED_VERSION" == "$VERSION" ]]; then
+    if [[ "$REPORTED_VERSION" == "$BASE_VERSION" ]]; then
         echo "  ✓ ${binary}: v${REPORTED_VERSION}"
     else
-        echo "  ✗ ${binary}: reports v${REPORTED_VERSION}, expected v${VERSION}"
+        echo "  ✗ ${binary}: reports v${REPORTED_VERSION}, expected v${BASE_VERSION}"
         FAILED=true
     fi
 done
@@ -159,6 +201,14 @@ fi
 echo "=== Validation Summary ==="
 echo ""
 echo "Binaries found: ${#FOUND_BINARIES[@]} / ${#ALL_BINARIES[@]}"
+
+if [[ ${#MISSING_BINARIES[@]} -gt 0 ]]; then
+    echo ""
+    echo "Missing from the release manifest:"
+    for binary in "${MISSING_BINARIES[@]}"; do
+        echo "  - ${binary}"
+    done
+fi
 
 if [[ "$FAILED" == "true" ]]; then
     echo ""

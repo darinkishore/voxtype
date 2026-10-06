@@ -320,8 +320,37 @@ semantic Omarchy tokens by default (`accent`, `background`, `foreground`,
 `success`, `warning`, `error`). `layout` changes the outer frame: strip-style
 layouts use `compact`, `wide`, or `minimal`, while `tile` and `orb` create
 non-strip OSD frames. `[osd.frame]` can remove or recolor the host background
-and border without changing QML. Advanced users can select a trusted package
-directory with `plugin_path`; package QML is not sandboxed.
+and border without changing QML. The styling system was contributed by
+[OldJobobo](https://github.com/OldJobobo)
+([#501](https://github.com/peteonrails/voxtype/issues/501)).
+
+`style` also accepts a style package: a directory containing a
+`voxtype-osd.toml` manifest and optionally custom QML. Package names resolve
+against `~/.config/voxtype/osd/`, `~/.local/share/voxtype/osd/`, and
+`/usr/share/voxtype/osd/`, so installing a shared package is copying its
+directory into `~/.config/voxtype/osd/` and setting `style` to the directory
+name. `voxtype info styles` lists everything the search currently finds.
+Packaged installs ship example styles under `/usr/share/voxtype/osd/` and
+recipe presets under `/usr/share/voxtype/osd-recipes/`; the source tree keeps
+them in `examples/osd-packages/` alongside `examples/osd-recipes/`. Recipes
+are plain `[osd]` config presets you copy keys from rather than installable
+packages. While developing a package, set
+`plugin_path` to your working directory; it takes priority over the search
+paths so edits apply on the next OSD launch. Package QML is trusted code and
+is not sandboxed.
+
+All of these keys work with `voxtype config set`, the `voxtype configure`
+TUI's OSD section, and the config file:
+
+```bash
+voxtype info styles
+voxtype config set osd.style aegis-hud
+voxtype config set osd.plugin_path ~/dev/my-style
+voxtype config unset osd.plugin_path
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md#quickshell-osd-customization) for the
+full recipe and package reference.
 
 ### `voxtype record`
 
@@ -457,7 +486,8 @@ fallback_to_clipboard = true
 type_delay_ms = 0
 
 [output.notification]
-# Show notification when recording starts (hotkey pressed)
+# Show notification when recording starts (hotkey pressed).
+# Stays on screen until the recording ends.
 on_recording_start = false
 
 # Show notification when recording stops (transcription begins)
@@ -471,7 +501,7 @@ on_transcription = true
 
 For a cloud streaming alternative to the local engines above, voxtype supports [Soniox](https://soniox.com). Different trade-off space: paid SaaS, no local model, 60+ languages with strong Hungarian/EU coverage, sub-second partials at the cursor.
 
-Build with `--features soniox`, set `SONIOX_API_KEY`, and:
+Soniox ships in every release binary. Set `SONIOX_API_KEY` and:
 
 ```toml
 engine = "soniox"
@@ -547,7 +577,17 @@ voxtype record start --auto-submit
 
 # Disable auto-submit just this recording (even if config has auto_submit = true)
 voxtype record toggle --no-auto-submit
+
+# Suppress the on-screen display for just this recording
+voxtype record start --no-osd
 ```
+
+`--no-osd` hides the OSD for that recording only and leaves `osd.enabled` in
+`config.toml` untouched. It exists for programs that drive dictation and draw
+their own UI: without it, the only way to suppress the overlay is to rewrite the
+user's config and restart the daemon. Both OSD frontends honor it, and the
+daemon still reports the real state, so Waybar and `voxtype status` are
+unaffected.
 
 ---
 
@@ -2455,7 +2495,7 @@ icon_theme = "nerd-font"  # or: material, phosphor, codicons, minimal, dots, arr
 
 Available themes include Nerd Font, Material Design Icons, Phosphor, VS Code Codicons, and several universal themes that don't require special fonts (minimal, dots, arrows, text).
 
-**Extended status info:** Use `--extended` to include model, device, and backend in the JSON output and tooltip:
+**Extended status info:** Use `--extended` to include model, device, and backend in the JSON output and tooltip. The backend field describes the running daemon's binary, not the package-selected one, so it stays accurate when the daemon was started before a variant switch or from a systemd `ExecStart=` override. A daemon running a binary that is not an installed variant reports `custom`:
 
 ```json
 "custom/voxtype": {

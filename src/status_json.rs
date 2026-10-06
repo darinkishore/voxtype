@@ -36,38 +36,76 @@ pub struct ExtendedStatusInfo {
 }
 
 impl ExtendedStatusInfo {
-    /// Build an `ExtendedStatusInfo` from the loaded config. Resolves the
-    /// backend through the inventory machinery (wrapper-script aware via
-    /// `setup::binary::active_variant`) so it reports correctly whether
-    /// `/usr/bin/voxtype` is a plain symlink or the exec-wrapper used by
-    /// GPU/ONNX variants. The legacy `setup::gpu::detect_current_backend()`
-    /// path was Whisper-focused: it would treat any wrapper script as
-    /// `Backend::Native`, which is why waybar previously showed
-    /// "CPU (native)" while MIGraphX or CUDA was actually doing the work.
+    /// Build an `ExtendedStatusInfo` from the loaded config.
+    ///
+    /// The backend label describes the *running daemon* when there is one,
+    /// resolved through `/proc/<pid>/exe` (`setup::binary::running_variant`).
+    /// The package inventory (`active_variant`) only says what the next
+    /// process would run: a daemon started before a variant switch, or from
+    /// a systemd `ExecStart=` override pointing at a private build, can be
+    /// executing something else entirely (#563). When the daemon's binary is
+    /// not a packaged variant and not this CLI's own executable, the honest
+    /// answer is "custom", not the package-selected backend.
+    ///
+    /// With no daemon alive, the label falls back to describing the install:
+    /// the inventory machinery (wrapper-script aware, so GPU/ONNX exec
+    /// wrappers classify correctly), then the legacy Whisper-focused
+    /// detection, then Parakeet.
     pub fn from_config(config: &config::Config) -> Self {
         let inv = setup::binary::inventory();
-        let backend = if let Some(v) = inv.active_variant {
-            backend_display_for_variant(v).to_string()
-        } else if let Some(b) = setup::gpu::detect_current_backend() {
-            match b {
-                setup::gpu::Backend::Cpu => "CPU (legacy)",
-                setup::gpu::Backend::Native => "CPU (native)",
-                setup::gpu::Backend::Avx2 => "CPU (AVX2)",
-                setup::gpu::Backend::Avx512 => "CPU (AVX-512)",
-                setup::gpu::Backend::Vulkan => "GPU (Vulkan)",
-            }
-            .to_string()
-        } else if let Some(pb) = setup::parakeet::detect_current_parakeet_backend() {
-            pb.display_name().to_string()
-        } else {
-            "unknown".to_string()
-        };
+        let daemon_exe = inv.daemon_pid.and_then(setup::binary::running_binary_path);
+        let backend =
+            daemon_backend_label(inv.running_variant, daemon_exe.as_deref(), &inv.binary_path)
+                .unwrap_or_else(|| install_backend_label(&inv));
 
         Self {
             model: config.model_name().to_string(),
             device: config.audio.device.clone(),
             backend,
         }
+    }
+}
+
+/// Backend label settled by the live daemon, or `None` when the caller
+/// should describe the install instead.
+///
+/// `None` covers three cases that all mean "the daemon's executable does not
+/// contradict the install": no daemon alive (`daemon_exe` is `None`),
+/// `/proc/<pid>/exe` unreadable (same), or the daemon is running this CLI's
+/// own binary (a source install, where the install-describing fallback chain
+/// examines the very binary that is running).
+fn daemon_backend_label(
+    running_variant: Option<setup::binary::Variant>,
+    daemon_exe: Option<&std::path::Path>,
+    cli_exe: &std::path::Path,
+) -> Option<String> {
+    if let Some(v) = running_variant {
+        return Some(backend_display_for_variant(v).to_string());
+    }
+    match daemon_exe {
+        Some(exe) if exe != cli_exe => Some("custom".to_string()),
+        _ => None,
+    }
+}
+
+/// Backend label describing the install rather than a live process: what a
+/// daemon started now would run.
+fn install_backend_label(inv: &setup::binary::Inventory) -> String {
+    if let Some(v) = inv.active_variant {
+        backend_display_for_variant(v).to_string()
+    } else if let Some(b) = setup::gpu::detect_current_backend() {
+        match b {
+            setup::gpu::Backend::Cpu => "CPU (legacy)",
+            setup::gpu::Backend::Native => "CPU (native)",
+            setup::gpu::Backend::Avx2 => "CPU (AVX2)",
+            setup::gpu::Backend::Avx512 => "CPU (AVX-512)",
+            setup::gpu::Backend::Vulkan => "GPU (Vulkan)",
+        }
+        .to_string()
+    } else if let Some(pb) = setup::parakeet::detect_current_parakeet_backend() {
+        pb.display_name().to_string()
+    } else {
+        "unknown".to_string()
     }
 }
 
@@ -79,6 +117,7 @@ impl ExtendedStatusInfo {
 pub fn backend_display_for_variant(v: setup::binary::Variant) -> &'static str {
     use setup::binary::Variant;
     match v {
+        Variant::WhisperBaseline => "CPU (baseline)",
         Variant::WhisperAvx2 => "CPU (AVX2)",
         Variant::WhisperAvx512 => "CPU (AVX-512)",
         Variant::WhisperVulkan => "GPU (Vulkan)",
@@ -163,6 +202,53 @@ fn json_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// Regression for #563: the daemon runs a packaged variant, so its label
+    /// wins no matter where /usr/bin/voxtype points. This covers both the
+    /// systemd `ExecStart=` override to a different installed variant and the
+    /// daemon-started-before-a-variant-switch case.
+    #[test]
+    fn daemon_variant_settles_the_backend_label() {
+        let label = daemon_backend_label(
+            Some(setup::binary::Variant::WhisperAvx2),
+            Some(Path::new("/usr/lib/voxtype/voxtype-avx2")),
+            Path::new("/usr/lib/voxtype/cuda-13/voxtype-onnx-cuda-13"),
+        );
+        assert_eq!(label.as_deref(), Some("CPU (AVX2)"));
+    }
+
+    /// Regression for #563: a daemon executing a binary that is neither a
+    /// packaged variant nor this CLI must report "custom", never the
+    /// package-selected backend.
+    #[test]
+    fn foreign_daemon_binary_reports_custom() {
+        let label = daemon_backend_label(
+            None,
+            Some(Path::new(
+                "/home/user/.local/opt/voxtype-custom/libexec/voxtype",
+            )),
+            Path::new("/usr/lib/voxtype/cuda-13/voxtype-onnx-cuda-13"),
+        );
+        assert_eq!(label.as_deref(), Some("custom"));
+    }
+
+    /// A source install typically runs the daemon from the same binary as
+    /// the CLI. The install-describing fallback chain examines that binary,
+    /// so it must stay in charge — no "custom" downgrade.
+    #[test]
+    fn daemon_running_the_cli_binary_defers_to_install_detection() {
+        let exe = Path::new("/home/user/voxtype/target/release/voxtype");
+        assert_eq!(daemon_backend_label(None, Some(exe), exe), None);
+    }
+
+    /// No daemon alive (or /proc/<pid>/exe unreadable): fall back to
+    /// describing the install.
+    #[test]
+    fn no_daemon_defers_to_install_detection() {
+        let cli = Path::new("/usr/lib/voxtype/voxtype-avx2");
+        assert_eq!(daemon_backend_label(None, None, cli), None);
+    }
 
     /// Regression: after `voxtype record cancel` the daemon writes "idle"
     /// to the state file. `format_state_json` must render "idle" as the

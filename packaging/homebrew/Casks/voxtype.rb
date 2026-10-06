@@ -12,7 +12,7 @@ cask "voxtype" do
     strategy :github_latest
   end
 
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
   depends_on formula: "terminal-notifier"
 
   app "Voxtype.app"
@@ -81,9 +81,11 @@ cask "voxtype" do
     File.write(plist_path, plist_content)
 
     # Run initial setup to create config and download model
-    # This is non-interactive and downloads the smallest fast model
+    # This is non-interactive and downloads the smallest fast model.
+    # --activate points the fresh config at that model; downloads no longer
+    # change the configured engine on their own.
     system_command "/Applications/Voxtype.app/Contents/MacOS/voxtype",
-      args: ["setup", "--download", "--model", "parakeet-tdt-0.6b-v3-int8"],
+      args: ["setup", "--download", "--model", "parakeet-tdt-0.6b-v3-int8", "--activate"],
       print_stdout: true
 
     # Load the LaunchAgent to start the daemon

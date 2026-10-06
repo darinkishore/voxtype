@@ -40,9 +40,42 @@ pub struct TextProcessor {
     filler_connector_before_term_re: Regex,
 }
 
+/// Default filler entries that are ordinary vocabulary in a given language.
+///
+/// Kept deliberately short: only words that are common enough to matter and
+/// unambiguous enough to be sure about. `um` is the Portuguese masculine
+/// indefinite article and the German preposition "around"/"at"; filtering it
+/// silently mangles ordinary sentences in both.
+fn filler_collisions(language: Option<&str>) -> &'static [&'static str] {
+    match language.map(|l| l.split(['-', '_']).next().unwrap_or(l)) {
+        Some("pt") => &["um"],
+        Some("de") => &["um"],
+        _ => &[],
+    }
+}
+
 impl TextProcessor {
     /// Create a new text processor from configuration
+    /// Build a processor for a language-agnostic context.
+    ///
+    /// Prefer [`new_for_language`](Self::new_for_language) where the active
+    /// engine's language is known, so filler filtering can avoid words that
+    /// are ordinary vocabulary rather than disfluencies.
     pub fn new(config: &TextConfig) -> Self {
+        Self::new_for_language(config, None)
+    }
+
+    /// Build a processor that knows which language it is filtering.
+    ///
+    /// The default filler list is English disfluencies, and two of them are
+    /// real words elsewhere: `um` is the masculine indefinite article in
+    /// Portuguese and a common preposition in German. Filtering those turned
+    /// "Faça um commit" into "Faça commit" with no way for the user to see
+    /// why (#566).
+    ///
+    /// Only the built-in default is narrowed. A user who lists filler words
+    /// explicitly gets exactly what they asked for.
+    pub fn new_for_language(config: &TextConfig, language: Option<&str>) -> Self {
         // Normalize replacement keys to lowercase for case-insensitive matching
         let replacements = config
             .replacements
@@ -57,9 +90,21 @@ impl TextProcessor {
 
         // Build a single alternation of all filler words. Word boundaries
         // (\b) ensure "um" is removed without touching "umbrella" or "summer".
-        let filler_re = if config.filter_filler_words && !config.filler_words.is_empty() {
-            let alternation = config
-                .filler_words
+        let effective_fillers: Vec<String> =
+            if config.filler_words == crate::config::text::default_filler_words() {
+                let collisions = filler_collisions(language);
+                config
+                    .filler_words
+                    .iter()
+                    .filter(|w| !collisions.contains(&w.to_lowercase().as_str()))
+                    .cloned()
+                    .collect()
+            } else {
+                config.filler_words.clone()
+            };
+
+        let filler_re = if config.filter_filler_words && !effective_fillers.is_empty() {
+            let alternation = effective_fillers
                 .iter()
                 .filter(|w| !w.trim().is_empty())
                 .map(|w| regex::escape(w.trim()))
@@ -337,6 +382,60 @@ fn clean_punctuation_spacing(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// #566: "um" is the masculine indefinite article in Portuguese, so the
+    /// English filler list silently turned "Faça um commit" into
+    /// "Faça commit" with nothing to tell the user why.
+    #[test]
+    fn portuguese_keeps_um() {
+        let config = TextConfig {
+            filter_filler_words: true,
+            ..Default::default()
+        };
+        let pt = TextProcessor::new_for_language(&config, Some("pt"));
+        assert_eq!(pt.process("Faça um commit"), "Faça um commit");
+
+        // German uses it as a preposition; same protection.
+        let de = TextProcessor::new_for_language(&config, Some("de"));
+        assert_eq!(de.process("Gehen wir um die Ecke"), "Gehen wir um die Ecke");
+    }
+
+    /// The protection must not weaken English, where "um" is the canonical
+    /// filler and removing it is the whole point of the feature.
+    #[test]
+    fn english_still_drops_um() {
+        let config = TextConfig {
+            filter_filler_words: true,
+            ..Default::default()
+        };
+        let en = TextProcessor::new_for_language(&config, Some("en"));
+        assert_eq!(en.process("so um let us commit"), "so let us commit");
+
+        // Unknown or auto-detected language keeps the historical behaviour.
+        let unknown = TextProcessor::new_for_language(&config, None);
+        assert_eq!(unknown.process("so um let us commit"), "so let us commit");
+    }
+
+    /// An explicit list is the user's instruction, not our default, so it is
+    /// honoured verbatim even where it collides.
+    #[test]
+    fn explicit_filler_list_is_not_narrowed() {
+        let config = TextConfig {
+            filter_filler_words: true,
+            filler_words: vec!["um".to_string()],
+            ..Default::default()
+        };
+        let pt = TextProcessor::new_for_language(&config, Some("pt"));
+        assert_eq!(pt.process("Faça um commit"), "Faça commit");
+    }
+
+    /// Regional tags must resolve to their base language.
+    #[test]
+    fn regional_variants_resolve_to_base_language() {
+        assert_eq!(filler_collisions(Some("pt-BR")), &["um"]);
+        assert_eq!(filler_collisions(Some("pt_PT")), &["um"]);
+        assert!(filler_collisions(Some("en-US")).is_empty());
+    }
     use super::*;
 
     fn make_config(spoken_punctuation: bool, replacements: &[(&str, &str)]) -> TextConfig {
@@ -358,6 +457,21 @@ mod tests {
             smart_auto_submit: true,
             ..Default::default()
         }
+    }
+
+    /// #669/#581 regression gate: routing the streaming and transcribe-file
+    /// paths through TextProcessor must not change what the batch path
+    /// produces. Pins the exact output for a representative input that
+    /// exercises replacements and spoken punctuation together.
+    #[test]
+    fn batch_pipeline_output_is_pinned() {
+        let config = make_config(true, &[("vox type", "voxtype")]);
+        let processor = TextProcessor::new(&config);
+
+        assert_eq!(
+            processor.process("hello comma I use vox type for dictation period"),
+            "hello, I use voxtype for dictation."
+        );
     }
 
     #[test]
