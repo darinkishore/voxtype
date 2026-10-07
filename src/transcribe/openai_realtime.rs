@@ -12,8 +12,8 @@
 //!   null` (**regardless** of the `turn_detection` config, which governs
 //!   streaming only — with server VAD a multi-utterance buffer would be
 //!   split into several items and only the first could be returned),
-//!   sends the whole buffer, commits, and returns the single item's
-//!   transcript. This is the GA docs' recommended committed-turn flow.
+//!   paces the buffer through the streaming worker, commits, and returns
+//!   the single item's transcript. This is the GA docs' recommended committed-turn flow.
 //!
 //! - [`StreamingTranscriber::start_stream`] — live streaming session.
 //!   Exposed only when `[openai_realtime] streaming = true` (the default).
@@ -703,125 +703,61 @@ impl Transcriber for OpenaiRealtimeTranscriber {
 
 impl OpenaiRealtimeTranscriber {
     async fn batch_transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
-        let request = self.connect_request()?;
-        let (ws_stream, _) =
-            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-                .await
-                .map_err(|_| {
-                    TranscribeError::InferenceFailed("OpenAI Realtime: connect timeout".into())
-                })?
-                .map_err(|e| {
-                    TranscribeError::InferenceFailed(format!(
-                        "OpenAI Realtime: WS connect failed: {}",
-                        e
-                    ))
-                })?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // Batch always disables server VAD (see session_update docs): the
-        // whole buffer must become exactly one committed item, or a
-        // recording with mid-speech pauses would be split into several
-        // items of which only the first could be returned.
-        write
-            .send(Message::Text(self.session_update(true).to_string()))
-            .await
-            .map_err(|e| {
-                TranscribeError::InferenceFailed(format!(
-                    "OpenAI Realtime: send session.update failed: {}",
-                    e
-                ))
-            })?;
-
-        wait_for_session_updated(&mut read).await?;
-
-        let mut resampler = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE);
-        for chunk in samples.chunks(BATCH_INPUT_CHUNK_SAMPLES) {
-            let bytes = resampler.encode_chunk(chunk);
-            send_append(&mut write, &bytes).await?;
-        }
-
-        write
-            .send(Message::Text(
-                r#"{"type":"input_audio_buffer.commit"}"#.to_string(),
-            ))
-            .await
-            .map_err(|e| {
-                TranscribeError::InferenceFailed(format!(
-                    "OpenAI Realtime: send commit failed: {}",
-                    e
-                ))
-            })?;
-
-        let deadline = tokio::time::Instant::now() + BATCH_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(TranscribeError::InferenceFailed(
-                    "OpenAI Realtime: batch timeout".into(),
-                ));
-            }
-            let msg = match tokio::time::timeout(remaining, read.next()).await {
-                Ok(Some(Ok(m))) => m,
-                Ok(Some(Err(e))) => {
-                    return Err(TranscribeError::InferenceFailed(format!(
-                        "OpenAI Realtime: WS error: {}",
-                        e
-                    )))
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    return Err(TranscribeError::InferenceFailed(
-                        "OpenAI Realtime: batch timeout".into(),
-                    ))
-                }
-            };
-            let text = match msg {
-                Message::Text(t) => t.to_string(),
-                Message::Ping(payload) => {
-                    let _ = write.send(Message::Pong(payload)).await;
-                    continue;
-                }
-                Message::Close(_) => break,
-                _ => continue,
-            };
-            let parsed: serde_json::Value = match serde_json::from_str(&text) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!("OpenAI Realtime: unparseable message ({}): {}", e, text);
-                    continue;
-                }
-            };
-            match parsed.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                "conversation.item.input_audio_transcription.completed" => {
-                    let transcript = parsed
-                        .get("transcript")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let _ = write.send(Message::Close(None)).await;
-                    return Ok(transcript);
-                }
-                "conversation.item.input_audio_transcription.failed" => {
-                    let _ = write.send(Message::Close(None)).await;
-                    return Err(TranscribeError::InferenceFailed(
-                        "OpenAI Realtime: transcription item failed".into(),
-                    ));
-                }
-                "error" => {
-                    let _ = write.send(Message::Close(None)).await;
-                    return Err(TranscribeError::InferenceFailed(format!(
-                        "OpenAI Realtime error: {}",
-                        parsed.get("error").unwrap_or(&parsed)
-                    )));
-                }
-                _ => continue,
-            }
-        }
-
-        Ok(String::new())
+        run_batch_session(
+            self.connect_request()?,
+            self.session_update(true).to_string(),
+            samples,
+        )
+        .await
     }
+}
+
+/// File transcription uses the same paced transport and final-item handling
+/// as microphone streaming. Sending an entire recording as a burst caused
+/// the live model to return only its first half, without an API error.
+async fn run_batch_session(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    session_update: String,
+    samples: &[f32],
+) -> Result<String, TranscribeError> {
+    let (samples_tx, samples_rx) = mpsc::channel(4);
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let (_cancel_tx, cancel_rx) = oneshot::channel();
+    let feed = async {
+        for chunk in samples.chunks(BATCH_INPUT_CHUNK_SAMPLES) {
+            if samples_tx.send(chunk.to_vec()).await.is_err() {
+                break;
+            }
+        }
+        drop(samples_tx);
+    };
+    let collect = async {
+        let mut transcript = String::new();
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                StreamingEvent::Final { text, .. } => transcript.push_str(&text),
+                StreamingEvent::Error(error) => return Err(error),
+                StreamingEvent::Ended => break,
+                _ => {}
+            }
+        }
+        Ok(transcript.trim().to_string())
+    };
+    let (_, result, worker) = tokio::join!(
+        feed,
+        collect,
+        run_streaming_session(
+            request,
+            session_update,
+            false,
+            false,
+            samples_rx,
+            events_tx,
+            cancel_rx,
+        ),
+    );
+    worker?;
+    result
 }
 
 /// Wait for `session.updated` after sending `session.update`. Any `error`
@@ -1063,6 +999,10 @@ async fn run_streaming_attempt(
     let mut resampler = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE);
     let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_BYTES * 2);
     let mut samples_closed = false;
+    // Pace wire audio, including reconnect backlogs. Capture timing alone
+    // cannot bound replay bursts. Retain at most one frame of timing credit
+    // after a stall; keep receiving server events while the timer waits.
+    let mut next_append_at = tokio::time::Instant::now();
     let mut source_samples = 0usize;
     let mut sent_stop_sequence = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
@@ -1090,52 +1030,54 @@ async fn run_streaming_attempt(
                 break;
             }
 
-            // Outgoing audio frames, coalesced to CHUNK_BYTES before send.
-            chunk = samples_rx.recv(), if !samples_closed => {
+            // Accept source audio without blocking capture; the outer worker
+            // retains a backlog while this connection sends at audio speed.
+            chunk = samples_rx.recv(), if !samples_closed && pending.len() < CHUNK_BYTES => {
                 match chunk {
                     Some(c) if !c.is_empty() => {
                         source_samples += c.len();
-                        let bytes = resampler.encode_chunk(&c);
-                        pending.extend_from_slice(&bytes);
-                        while pending.len() >= CHUNK_BYTES {
-                            let frame_bytes: Vec<u8> = pending.drain(..CHUNK_BYTES).collect();
-                            send_append(&mut write, &frame_bytes).await?;
-                        }
+                        pending.extend_from_slice(&resampler.encode_chunk(&c));
                     }
-                    Some(_) => { /* empty chunk, skip */ }
+                    Some(_) => {}
                     None => {
                         samples_closed = true;
-                        if !sent_stop_sequence {
-                            // Flush whatever's left in the coalescing buffer.
-                            if !pending.is_empty() {
-                                let tail = std::mem::take(&mut pending);
-                                send_append(&mut write, &tail).await?;
-                            }
-                            if turn_detection {
-                                // Trailing silence nudges server VAD to finalize
-                                // the turn ending exactly at record-stop.
-                                let silence = vec![
-                                    0.0_f32;
-                                    (TARGET_SAMPLE_RATE * TRAILING_SILENCE_MS / 1000) as usize
-                                ];
-                                let bytes = f32_to_s16le_bytes(&silence);
-                                send_append(&mut write, &bytes).await?;
-                            } else {
-                                let commit = r#"{"type":"input_audio_buffer.commit"}"#;
-                                send_message(&mut write, Message::Text(commit.to_string())).await?;
-                            }
-                            sent_stop_sequence = true;
-                            let timeout = if turn_detection { DRAIN_TIMEOUT } else { BATCH_TIMEOUT };
-                            drain_deadline = Some(tokio::time::Instant::now() + timeout);
-                            tracing::info!("OpenAI Realtime: uploaded {} source samples ({:.3}s) before end-of-turn", source_samples, source_samples as f64 / SOURCE_SAMPLE_RATE as f64);
-                            tracing::debug!(
-                                "OpenAI Realtime: end-of-turn signalled (turn_detection={}); draining (timeout {}s)",
-                                turn_detection,
-                                timeout.as_secs(),
-                            );
+                        if turn_detection {
+                            let silence = vec![
+                                0.0_f32;
+                                (TARGET_SAMPLE_RATE * TRAILING_SILENCE_MS / 1000) as usize
+                            ];
+                            pending.extend_from_slice(&f32_to_s16le_bytes(&silence));
                         }
                     }
                 }
+            }
+
+            // Both full frames and the final short frame are paced. Commit
+            // follows the final frame's duration, never an unfinished upload.
+            _ = tokio::time::sleep_until(next_append_at),
+                if pending.len() >= CHUNK_BYTES || (samples_closed && !pending.is_empty()) => {
+                let count = pending.len().min(CHUNK_BYTES);
+                let frame: Vec<u8> = pending.drain(..count).collect();
+                send_append(&mut write, &frame).await?;
+                let duration = Duration::from_secs_f64(count as f64 / (TARGET_SAMPLE_RATE * 2) as f64);
+                next_append_at = (next_append_at + duration).max(tokio::time::Instant::now());
+            }
+
+            _ = tokio::time::sleep_until(next_append_at),
+                if samples_closed && pending.is_empty() && !sent_stop_sequence => {
+                if !turn_detection {
+                    let commit = r#"{"type":"input_audio_buffer.commit"}"#;
+                    send_message(&mut write, Message::Text(commit.to_string())).await?;
+                }
+                sent_stop_sequence = true;
+                let timeout = if turn_detection { DRAIN_TIMEOUT } else { BATCH_TIMEOUT };
+                drain_deadline = Some(tokio::time::Instant::now() + timeout);
+                tracing::info!("OpenAI Realtime: uploaded {} source samples ({:.3}s) before end-of-turn", source_samples, source_samples as f64 / SOURCE_SAMPLE_RATE as f64);
+                tracing::debug!(
+                    "OpenAI Realtime: end-of-turn signalled (turn_detection={}); draining (timeout {}s)",
+                    turn_detection,
+                    timeout.as_secs(),
+                );
             }
 
             // Incoming server messages.
@@ -1865,6 +1807,83 @@ mod tests {
         ));
         assert!(handle.events.recv().await.is_none());
         handle.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_stream_is_paced_and_preserves_the_partial_tail() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (samples, handle) = local_stream(&listener, false);
+        let source = vec![0.25; 19_753];
+        let expected = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE).encode_chunk(&source);
+        let server = tokio::spawn(async move {
+            let mut ws = mock_session(&listener).await;
+            let start = tokio::time::Instant::now();
+            let audio = receive_audio(&mut ws).await;
+            // A burst used to commit all 1.23 seconds in milliseconds. Allow
+            // one 80 ms frame of scheduling credit, but no whole-buffer rush.
+            assert!(start.elapsed() >= Duration::from_millis(1_150));
+            assert_eq!(audio, expected);
+            send_final(&mut ws).await;
+        });
+        samples.send(source).await.unwrap();
+        drop(samples);
+        successful_stream(handle).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_uses_paced_transport_and_returns_the_committed_final() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request = format!("ws://{}/", listener.local_addr().unwrap())
+            .into_client_request()
+            .unwrap();
+        let update = OpenaiRealtimeTranscriber::new(cfg_with_key(Some("unused-local-key")))
+            .unwrap()
+            .session_update(true)
+            .to_string();
+        let source = vec![0.125; 19_753];
+        let expected = Resampler::new(SOURCE_SAMPLE_RATE, TARGET_SAMPLE_RATE).encode_chunk(&source);
+        let server = tokio::spawn(async move {
+            let mut ws = mock_session(&listener).await;
+            let start = tokio::time::Instant::now();
+            let audio = receive_audio(&mut ws).await;
+            assert!(start.elapsed() >= Duration::from_millis(1_150));
+            assert_eq!(audio, expected);
+            send_final(&mut ws).await;
+        });
+        assert_eq!(
+            run_batch_session(request, update, &source).await.unwrap(),
+            "Recovered dictation."
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_errors_are_read_while_a_large_chunk_is_pacing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (samples, mut handle) = local_stream(&listener, false);
+        let server = tokio::spawn(async move {
+            let mut ws = mock_session(&listener).await;
+            ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"error","error":{"message":"stop upload"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            // Keep the socket alive until the client handles the error.
+            let _ = ws.next().await;
+        });
+        samples
+            .send(vec![0.25; SOURCE_SAMPLE_RATE as usize * 4])
+            .await
+            .unwrap();
+        drop(samples);
+        let event = tokio::time::timeout(Duration::from_secs(1), handle.events.recv())
+            .await
+            .unwrap();
+        assert!(matches!(event, Some(StreamingEvent::Error(_))));
+        handle.task.await.unwrap().unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
