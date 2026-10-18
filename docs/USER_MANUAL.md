@@ -333,8 +333,14 @@ name. `voxtype info styles` lists everything the search currently finds.
 Packaged installs ship example styles under `/usr/share/voxtype/osd/` and
 recipe presets under `/usr/share/voxtype/osd-recipes/`; the source tree keeps
 them in `examples/osd-packages/` alongside `examples/osd-recipes/`. Recipes
-are plain `[osd]` config presets you copy keys from rather than installable
-packages. While developing a package, set
+are plain `[osd]` config presets rather than installable packages. Apply one
+with `voxtype setup osd --recipe <name>`, which writes its keys into your
+config without duplicating any that are already there and prints each
+changed key with its previous value; `--dry-run` previews the change and
+`voxtype setup osd --list` shows what's installed. Recipes resolve against
+`~/.config/voxtype/osd-recipes/`, `~/.local/share/voxtype/osd-recipes/`, and
+`/usr/share/voxtype/osd-recipes/`, and `--recipe` also accepts a path to a
+`.toml` file. While developing a package, set
 `plugin_path` to your working directory; it takes priority over the search
 paths so edits apply on the next OSD launch. Package QML is trusted code and
 is not sandboxed.
@@ -344,6 +350,8 @@ TUI's OSD section, and the config file:
 
 ```bash
 voxtype info styles
+voxtype setup osd --recipe showcase-bars --dry-run
+voxtype setup osd --recipe showcase-bars
 voxtype config set osd.style aegis-hud
 voxtype config set osd.plugin_path ~/dev/my-style
 voxtype config unset osd.plugin_path
@@ -372,7 +380,9 @@ voxtype record start --model large-v3-turbo  # Use a specific model
 voxtype record stop                          # Transcribes with the model specified at start
 ```
 
-The model must be configured as `model`, `secondary_model`, or listed in `available_models` in your config. See [Multi-Model Configuration](CONFIGURATION.md#secondary_model) for setup.
+The override works on any engine, and it can name another engine's model: with Parakeet as your engine, `voxtype record start --model large-v3-turbo` transcribes that one recording with Whisper. Use the names `voxtype info models` shows (other engines use directory-form names such as `moonshine-base` or `cohere-transcribe-q4f16`). The model has to be downloaded; an unknown or missing model fails with an error sound and notification instead of quietly using your default model. The daemon keeps the override model loaded next to your default model for the next override, unless `on_demand_loading` is set. Streaming engines transcribe an override recording in one pass at stop rather than live.
+
+With Whisper as your engine, a Whisper override must be configured as `model`, `secondary_model`, or listed in `available_models`. See [Multi-Model Configuration](CONFIGURATION.md#secondary_model) for setup.
 
 **Output mode override:** Use `--type`, `--clipboard`, or `--paste` to override the output mode:
 
@@ -1501,11 +1511,10 @@ With eager processing enabled:
 
 1. Audio accumulates as you record
 2. Every `eager_chunk_secs` (default: 5 seconds), a chunk is extracted and sent for transcription
-3. Chunks overlap by `eager_overlap_secs` (default: 0.5 seconds) to avoid missing words at boundaries
-4. When you stop recording, all chunk results are combined and deduplicated
-5. The final text is output
-
-The overlap region helps catch words that might be split across chunk boundaries. The deduplication logic matches overlapping text to produce a clean result.
+3. Each chunk ends at the quietest point in the last 1.5 seconds before that length, so the cut lands in a pause between words. Chunks never overlap
+4. A chunk with no speech is skipped, and a recording with no speech produces no output, when voice activity detection is enabled
+5. When you stop recording, the remaining audio is transcribed and all chunk results are joined in order
+6. The final text is output
 
 ### Configuration
 
@@ -1520,9 +1529,6 @@ eager_processing = true
 
 # Chunk duration (default: 5.0 seconds)
 eager_chunk_secs = 5.0
-
-# Overlap between chunks (default: 0.5 seconds)
-eager_overlap_secs = 0.5
 ```
 
 Or via CLI flags:

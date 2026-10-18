@@ -68,9 +68,8 @@ pub struct SharedState {
 /// second as "instant," and 0.5s is well above the recording boundary
 /// gaps the daemon naturally produces.
 const IDLE_TEARDOWN_SECS: f32 = 0.5;
-/// Target render rate. 60 Hz is enough for a smooth scrolling waveform; we
-/// can't render faster than the underlying frame rate (100 Hz IPC) gains us.
-const REDRAW_INTERVAL_MS: u64 = 16;
+/// Idle/recovery checks only; animation is paced by Wayland frame callbacks.
+const IDLE_CHECK_INTERVAL_MS: u64 = 50;
 
 /// Outer state owned by the calloop event loop. Implements the SCTK delegate
 /// traits via `delegate_*` macros.
@@ -107,6 +106,7 @@ struct RenderSurface {
     /// Recording→processing morph progress (0 = recording pill with
     /// waveform, 1 = compact processing pill with bouncing dots).
     proc_blend: f32,
+    frame_pending: bool,
 
     // wgpu plumbing.
     _instance: wgpu::Instance,
@@ -165,12 +165,12 @@ pub fn run(
         })
         .map_err(|e| anyhow!("insert ping source: {}", e))?;
 
-    // Periodic redraw timer + idle teardown. Re-arms each fire.
-    let timer = calloop::timer::Timer::from_duration(Duration::from_millis(REDRAW_INTERVAL_MS));
+    // Periodic idle teardown and recovery after a skipped surface acquisition.
+    let timer = calloop::timer::Timer::from_duration(Duration::from_millis(IDLE_CHECK_INTERVAL_MS));
     loop_handle
         .insert_source(timer, |_deadline, _, app: &mut App| {
             app.tick();
-            calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(REDRAW_INTERVAL_MS))
+            calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(IDLE_CHECK_INTERVAL_MS))
         })
         .map_err(|e| anyhow!("insert redraw timer: {}", e))?;
 
@@ -324,6 +324,7 @@ impl App {
             shown_at: Instant::now(),
             level_smooth: 0.0,
             proc_blend: 0.0,
+            frame_pending: false,
             _instance: instance,
             surface,
             device,
@@ -362,7 +363,7 @@ impl App {
 
     fn render_frame(&mut self) -> anyhow::Result<()> {
         let rs = match self.surface.as_mut() {
-            Some(s) if s.configured => s,
+            Some(s) if s.configured && !s.frame_pending => s,
             _ => return Ok(()),
         };
 
@@ -521,6 +522,7 @@ impl App {
 
         rs.queue.submit(Some(encoder.finish()));
         rs.wl_surface.frame(&self.qh, rs.wl_surface.clone());
+        rs.frame_pending = true;
         surface_texture.present();
         Ok(())
     }
@@ -745,9 +747,16 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _time: u32,
     ) {
+        if let Some(rs) = self.surface.as_mut() {
+            if rs.wl_surface != *surface {
+                return;
+            }
+            rs.frame_pending = false;
+            self.tick();
+        }
     }
 
     fn surface_enter(

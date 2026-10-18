@@ -626,13 +626,12 @@ fn resolve_model_path(model: &str) -> Result<PathBuf, TranscribeError> {
          - {}\n  \
          - {}\n  \
          - {}\n\n\
-         Run 'voxtype setup model' to download, or manually from:\n  \
-         tiny: https://huggingface.co/onnx-community/moonshine-tiny-ONNX\n  \
-         base: https://huggingface.co/onnx-community/moonshine-base-ONNX",
+         Run: {}",
         model,
         model_path.display(),
         cwd_path.display(),
-        local_models_path.display()
+        local_models_path.display(),
+        crate::model_catalog::download_command("moonshine", model),
     )))
 }
 

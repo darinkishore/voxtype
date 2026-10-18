@@ -12,7 +12,10 @@ use super::OutputMode;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PostProcessConfig {
     /// Shell command to execute
-    /// Receives transcribed text on stdin, outputs processed text on stdout
+    /// Receives transcribed text on stdin, outputs processed text on stdout.
+    /// Empty (or absent) turns post-processing off, so a table holding only
+    /// `trim` or `fallback_on_empty` still loads.
+    #[serde(default)]
     pub command: String,
 
     /// Timeout in milliseconds (default: 30000 = 30 seconds)
@@ -30,6 +33,17 @@ pub struct PostProcessConfig {
     /// e.g. filtering out unwanted transcriptions like [BLANK_AUDIO].
     #[serde(default = "default_true")]
     pub fallback_on_empty: bool,
+}
+
+impl Default for PostProcessConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            timeout_ms: default_post_process_timeout(),
+            trim: true,
+            fallback_on_empty: true,
+        }
+    }
 }
 
 /// Named profile for context-specific settings

@@ -30,6 +30,24 @@ fn apply_bool_override(target: &mut bool, enable: bool, disable: bool) {
     }
 }
 
+/// Point `config` at the engine and model a `transcribe --model` names.
+/// Unknown or undownloaded names are an error with the fix, not a silent
+/// fallback to whatever the config already uses.
+fn apply_transcribe_model(config: &mut config::Config, model: &str) {
+    use voxtype::model_catalog::{override_config, override_route, OverrideRoute};
+    match override_route(config, model) {
+        Ok(OverrideRoute::WhisperManager) => config.whisper.model = model.to_string(),
+        Ok(OverrideRoute::Active) => {}
+        Ok(OverrideRoute::Separate { engine, model }) => {
+            *config = override_config(config, engine, &model);
+        }
+        Err(problem) => {
+            eprintln!("Error: {problem}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Apply every `cli.<flag>` onto `config` in place. Returns `top_level_model`
 /// (a clone of `cli.model`) which is consumed downstream by
 /// `send_record_command` so a subcommand-level `--model` can still defer to
@@ -49,9 +67,31 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(delay) = cli.restore_clipboard_delay_ms {
         config.output.restore_clipboard_delay_ms = delay;
     }
-    if let Some(ref model) = cli.model {
+    if let (Some(model), Some(voxtype::Commands::Transcribe { .. })) = (&cli.model, &cli.command) {
+        // `transcribe` runs this one file with the named model, so the name
+        // picks its engine exactly as a per-recording override does in the
+        // daemon, instead of only setting [whisper] model and leaving a
+        // Parakeet config transcribing with Parakeet.
+        apply_transcribe_model(config, model);
+    } else if let Some(ref model) = cli.model {
+        // Another engine's model selects that engine too. A Whisper name
+        // only sets [whisper] model, as it always has, so scripts that pass
+        // one alongside another engine keep working.
+        let other_engine = voxtype::model_catalog::resolve_model(model)
+            .filter(|r| r.engine != "whisper")
+            .and_then(|r| {
+                r.engine
+                    .parse::<config::TranscriptionEngine>()
+                    .ok()
+                    .map(|engine| (engine, r.model))
+            });
         if setup::model::is_valid_model(model) {
             config.whisper.model = model.clone();
+        } else if let Some((engine, resolved)) = other_engine {
+            config.set_model_for(engine, &resolved);
+        } else if matches!(cli.command, Some(voxtype::Commands::Record { .. })) {
+            // `record` forwards the name to the daemon, which rejects an unknown
+            // one with its own error; a "using default" warning would contradict it.
         } else {
             let default_model = &config.whisper.model;
             tracing::warn!(

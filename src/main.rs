@@ -62,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
+    // Every command that writes the config goes through default_path(), so
+    // point it at --config before anything runs.
+    if let Some(path) = &cli.config {
+        config::Config::set_path_override(path.clone());
+    }
+
     // Load configuration. config_path tracks the file we actually loaded (or
     // would load), so subprocess transcribers can reuse the same source.
     let config_path = cli

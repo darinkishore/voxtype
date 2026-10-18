@@ -71,11 +71,16 @@ The R2 mirror script no longer aborts the whole run when one upstream HF
 file 404s; it warns, skips the offending model, and prints a summary at
 the end.
 
+`--dry-run` downloads and uploads nothing. It prints the plan and checks
+each upstream file with a HEAD request, so stale entries still surface:
+
 ```bash
-./scripts/mirror-models-to-r2.sh --all --dry-run 2>&1 | tail -20
-# Expected: per-model "[mirror] foo/bar <- huggingface.co/..." lines
+TMPDIR=$(mktemp -d -p ~/.cache) ./scripts/mirror-models-to-r2.sh --all --dry-run 2>&1 | tail -20
+# Expected: per-model "[mirror] foo/bar <- huggingface.co/..." lines, then
+# "would fetch <url> -> <file>" and "would upload N files + manifest.json to ..."
 # Expected if any model has a stale registry entry: a final
 # "WARNING: N model(s) skipped" summary listing them.
+# Expected: "dry run done; nothing downloaded or uploaded." and the TMPDIR stays empty.
 ```
 
 Confirm process-substitution is used (so `SKIPPED_MODELS` survives the loop):

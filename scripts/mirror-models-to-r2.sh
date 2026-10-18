@@ -25,7 +25,17 @@
 #   ./scripts/mirror-models-to-r2.sh <model-name>       # one model
 #   ./scripts/mirror-models-to-r2.sh --engine <prefix>  # every model of one engine
 #   ./scripts/mirror-models-to-r2.sh --all              # every model
-#   ./scripts/mirror-models-to-r2.sh --all --dry-run    # skip rclone upload
+#   ./scripts/mirror-models-to-r2.sh --all --dry-run    # print the plan only
+#
+# --dry-run downloads nothing and uploads nothing. It prints each file it
+# would fetch and where it would upload it, and checks with a HEAD request
+# that every upstream file still exists, so stale registry entries show up
+# in the end-of-run summary.
+#
+# A real run stages one model at a time under $TMPDIR (default /tmp). On
+# systems where /tmp is tmpfs that is RAM, and the largest models are
+# several GB, so point TMPDIR at a disk path first:
+#   TMPDIR=~/.cache/voxtype-mirror ./scripts/mirror-models-to-r2.sh --all
 #
 # Prefer --engine over --all when adding a new engine's models: --all
 # re-downloads every registry entry from HF and overwrites every manifest
@@ -36,7 +46,7 @@
 #   ./scripts/mirror-models-to-r2.sh --all
 #
 # This is idempotent: re-running re-downloads from HF, recomputes sha256s,
-# and (unless --dry-run) overwrites R2 with the fresh bytes. Identical
+# and overwrites R2 with the fresh bytes. Identical
 # uploads are a no-op for rclone's size/mtime checks but the manifest will
 # always be re-uploaded.
 
@@ -63,7 +73,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            sed -n 's/^# \{0,1\}//p' "$0" | sed -n '1,40p'
+            # The header comment, up to the first line that isn't one.
+            sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"
             exit 0
             ;;
         --engine)
@@ -129,12 +140,17 @@ mirror_one() {
     local upstream="$3"
     local files_json="$4"
 
+    echo "" >&2
+    echo "[mirror] $engine/$name <- huggingface.co/$upstream" >&2
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        plan_one "$engine" "$name" "$upstream" "$files_json"
+        return 0
+    fi
+
     local workdir
     workdir="$(mktemp -d -t voxtype-mirror-XXXXXX)"
     trap 'rm -rf "$workdir"' RETURN
-
-    echo "" >&2
-    echo "[mirror] $engine/$name <- huggingface.co/$upstream" >&2
 
     # Build manifest while downloading.
     local manifest_files="[]"
@@ -189,10 +205,38 @@ mirror_one() {
     echo "[mirror] $name: $file_count files, $total_size bytes, manifest sha256 $manifest_sha" >&2
     echo "[mirror] destination: $dest_path" >&2
 
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "[mirror] --dry-run set, skipping rclone copy" >&2
+    rclone copy --progress "$workdir/" "$dest_path"
+}
+
+# --dry-run half of mirror_one: say what would be fetched and uploaded,
+# without downloading a byte. A HEAD request per file still catches upstream
+# files that have gone missing.
+plan_one() {
+    local engine="$1"
+    local name="$2"
+    local upstream="$3"
+    local files_json="$4"
+
+    local file_count missing=0
+    file_count="$(echo "$files_json" | jq 'length')"
+
+    for i in $(seq 0 $((file_count - 1))); do
+        local upstream_path local_path url
+        upstream_path="$(echo "$files_json" | jq -r ".[$i].upstream_path")"
+        local_path="$(echo "$files_json" | jq -r ".[$i].local_path")"
+        url="https://huggingface.co/$upstream/resolve/main/$upstream_path"
+        echo "  would fetch $url -> $local_path" >&2
+        if ! curl -fsSLI --retry 3 -o /dev/null "$url"; then
+            echo "  WARN: HF 404 (or transient failure) on $upstream_path" >&2
+            missing=1
+            SKIPPED_MODELS+=("$engine/$name (missing: $upstream_path)")
+        fi
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+        echo "  WARN: a real run would skip model $engine/$name" >&2
     else
-        rclone copy --progress "$workdir/" "$dest_path"
+        echo "[mirror] would upload $file_count files + manifest.json to $R2_REMOTE/$engine/$name/" >&2
     fi
 }
 
@@ -236,7 +280,11 @@ else
 fi
 
 echo "" >&2
-echo "[mirror] done." >&2
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[mirror] dry run done; nothing downloaded or uploaded." >&2
+else
+    echo "[mirror] done." >&2
+fi
 
 if [[ ${#SKIPPED_MODELS[@]} -gt 0 ]]; then
     echo "" >&2
@@ -247,5 +295,9 @@ if [[ ${#SKIPPED_MODELS[@]} -gt 0 ]]; then
     echo "" >&2
     echo "[mirror] These registry entries point at upstream HuggingFace files that do not exist (or" >&2
     echo "         changed). Audit them in src/setup/model.rs and either fix the file list or" >&2
-    echo "         remove the entry. The remaining models were mirrored successfully." >&2
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "         remove the entry. Nothing was downloaded or uploaded (--dry-run)." >&2
+    else
+        echo "         remove the entry. The remaining models were mirrored successfully." >&2
+    fi
 fi

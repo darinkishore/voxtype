@@ -114,7 +114,9 @@ This is useful for breaks, side conversations you do not want transcribed, or wh
 voxtype meeting status
 ```
 
-Shows whether a meeting is active, paused, or idle, along with the meeting ID if one is in progress.
+Shows whether a meeting is recording, paused, or idle, along with the meeting ID if one is in progress.
+
+The daemon acts on meeting commands between audio chunks, so while it is transcribing a chunk a request can take a few seconds to land. Until it does, status reports the request itself: `starting`, `pausing`, `resuming` or `stopping`. A second `voxtype meeting start` is refused as soon as the first one is issued, not only once that meeting is recording.
 
 ### Listing Past Meetings
 

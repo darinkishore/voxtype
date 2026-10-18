@@ -397,6 +397,7 @@ pub fn create_output_chain_with_override(
                 config.auto_submit,
                 config.append_text.clone(),
                 config.paste_keys.clone(),
+                config.driver_order.clone(),
                 config.type_delay_ms,
                 pre_type_delay_ms,
                 config.restore_clipboard,
@@ -404,11 +405,14 @@ pub fn create_output_chain_with_override(
             )));
         }
         crate::config::OutputMode::File => {
-            // File output is handled in the daemon before reaching the output chain.
-            // If we get here, it means mode = "file" but no file_path is configured.
-            tracing::warn!(
-                "Output mode is 'file' but no file_path configured. Falling back to clipboard."
-            );
+            // The daemon writes the file itself before reaching the output
+            // chain, so with a file_path this chain only backs the startup
+            // log. Warn only when there is genuinely nowhere to write.
+            if file_mode_lacks_path(config) {
+                tracing::warn!(
+                    "Output mode is 'file' but no file_path configured. Falling back to clipboard."
+                );
+            }
             chain.push(Box::new(clipboard::ClipboardOutput::new(
                 config.append_text.clone(),
             )));
@@ -416,6 +420,12 @@ pub fn create_output_chain_with_override(
     }
 
     chain
+}
+
+/// True when mode = "file" has no file_path to write to, so the output
+/// chain's clipboard fallback is what actually delivers the text.
+fn file_mode_lacks_path(config: &OutputConfig) -> bool {
+    config.mode == crate::config::OutputMode::File && config.file_path.is_none()
 }
 
 /// Run a shell command (for pre/post hooks)
@@ -459,6 +469,15 @@ fn is_keystroke_method(name: &str) -> bool {
     matches!(name, "wtype" | "eitype" | "dotool" | "ydotool") || name.starts_with("paste")
 }
 
+/// True when any method in the chain synthesizes keystrokes, so the
+/// modifier-release guard has something to protect. Clipboard-only chains
+/// (clipboard mode, or a `driver_order` of clipboard drivers) never press a
+/// key, and building the guard costs hundreds of milliseconds on hosts with
+/// many input devices (#543), so they skip it.
+fn chain_synthesizes_keystrokes<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
+    names.into_iter().any(is_keystroke_method)
+}
+
 /// Try each output method in the chain until one succeeds
 /// Pre/post output commands are run before and after typing (for compositor integration).
 pub async fn output_with_fallback(
@@ -479,7 +498,9 @@ pub async fn output_with_fallback(
     // wait_for_modifiers_release in osascript.rs and gets called separately
     // from the osascript output path.
     #[cfg(target_os = "linux")]
-    if options.wait_for_modifier_release {
+    if options.wait_for_modifier_release
+        && chain_synthesizes_keystrokes(chain.iter().map(|o| o.name()))
+    {
         let mut guard = modifier_guard::ModifierGuard::new();
         if guard
             .wait_for_release(options.modifier_release_timeout)
@@ -556,6 +577,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_mode_warns_only_without_a_path() {
+        let mut config = OutputConfig {
+            mode: crate::config::OutputMode::File,
+            ..Default::default()
+        };
+        assert!(file_mode_lacks_path(&config));
+
+        config.file_path = Some(PathBuf::from("/tmp/notes.txt"));
+        assert!(!file_mode_lacks_path(&config));
+
+        config.file_path = None;
+        config.mode = crate::config::OutputMode::Clipboard;
+        assert!(!file_mode_lacks_path(&config));
+    }
+
+    #[test]
     fn test_normalize_quotes_no_change() {
         let text = "Hello, world! It's a test.";
         let result = normalize_quotes(text);
@@ -616,6 +653,24 @@ mod tests {
         assert!(is_keystroke_method("paste (clipboard + keystroke)"));
         assert!(!is_keystroke_method("clipboard (wl-copy)"));
         assert!(!is_keystroke_method("clipboard (xclip/xsel)"));
+    }
+
+    #[test]
+    fn test_chain_synthesizes_keystrokes() {
+        assert!(!chain_synthesizes_keystrokes(["clipboard (wl-copy)"]));
+        assert!(!chain_synthesizes_keystrokes([
+            "clipboard (wl-copy)",
+            "clipboard (xclip/xsel)"
+        ]));
+        assert!(!chain_synthesizes_keystrokes(std::iter::empty::<&str>()));
+        assert!(chain_synthesizes_keystrokes([
+            "paste (clipboard + keystroke)"
+        ]));
+        assert!(chain_synthesizes_keystrokes([
+            "wtype",
+            "dotool",
+            "clipboard (wl-copy)"
+        ]));
     }
 
     #[test]

@@ -793,6 +793,33 @@ pub fn enumerate_installed() -> Vec<Variant> {
         .collect()
 }
 
+/// Status of every packaged variant under `lib_dir`.
+///
+/// Independent of which binary is running. `setup onnx --enable` and friends
+/// rewrite the package's `/usr/bin/voxtype`, so what they can switch to is
+/// decided by the package layout, not by whether they were launched from it.
+/// Run through a `/usr/local/bin` wrapper around a manual install, the
+/// running binary sits outside `lib_dir`, `inventory()` reports a source
+/// install with no variants, and a switch that would work finds nothing.
+pub fn variant_statuses(
+    lib_dir: &Path,
+    cpu: &Cpu,
+    gpus: &Gpus,
+    active: Option<Variant>,
+) -> Vec<VariantStatus> {
+    Variant::ALL
+        .iter()
+        .map(|&v| VariantStatus {
+            variant: v,
+            binary_name: v.binary_name().to_string(),
+            installed: lib_dir.join(v.binary_name()).exists(),
+            runs_on_this_cpu: variant_runs_on_cpu(v, cpu),
+            gpu_available: variant_gpu_available(v, gpus),
+            active: active == Some(v),
+        })
+        .collect()
+}
+
 fn variant_runs_on_cpu(v: Variant, cpu: &Cpu) -> bool {
     match v.acceleration() {
         // The floor variant: it exists precisely so there is something to run
@@ -900,17 +927,7 @@ pub fn inventory() -> Inventory {
     let running = daemon_pid.and_then(running_variant);
 
     let variants = if install_kind == InstallKind::Package {
-        Variant::ALL
-            .iter()
-            .map(|&v| VariantStatus {
-                variant: v,
-                binary_name: v.binary_name().to_string(),
-                installed: Path::new(LIB_DIR).join(v.binary_name()).exists(),
-                runs_on_this_cpu: variant_runs_on_cpu(v, &cpu),
-                gpu_available: variant_gpu_available(v, &gpus),
-                active: active == Some(v),
-            })
-            .collect()
+        variant_statuses(Path::new(LIB_DIR), &cpu, &gpus, active)
     } else {
         Vec::new()
     };

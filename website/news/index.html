@@ -77,6 +77,67 @@
 
             <!-- v0.7.x Era Posts -->
 
+            <article class="news-article" id="v111">
+                <div class="article-meta">
+                    <time datetime="2026-10-14">October 14, 2026</time>
+                    <span class="article-tag">Release</span>
+                </div>
+                <h2>v1.1.1: GPU selection, paste mode, safer config, instant clipboard</h2>
+                <div class="article-body">
+                    <p>voxtype 1.1.1 is a fix release. Hybrid-GPU laptops get the GPU they ask for, paste mode follows your driver order and pastes in terminals, quiet microphones stop losing short dictations, config edits stop breaking your file, and clipboard output no longer waits on your input devices. Everything in 1.1.0 is included.</p>
+
+                    <h3>Hybrid-GPU laptops get the GPU they ask for (<a href="https://github.com/peteonrails/voxtype/issues/577">#577</a>, <a href="https://github.com/peteonrails/voxtype/issues/611">#611</a>)</h3>
+                    <p>On Intel + NVIDIA laptops, <code>VOXTYPE_VULKAN_DEVICE=nvidia</code> now moves Whisper to the discrete card. It used to show the selection in <code>voxtype setup gpu --status</code> and then initialize the iGPU anyway. A daemon started at login also stops losing the race with the graphics driver: it waits for a render node before loading the model, instead of falling back to CPU until a restart.</p>
+                    <div class="code-block">
+                        <div class="code-header"><span>config.toml</span></div>
+                        <pre><code>[whisper]
+gpu_wait_secs = 5   # 0 disables the wait</code></pre>
+                    </div>
+                    <p><strong>Why it matters:</strong> the reporter measured 17.7s to transcribe 20.7s of audio that takes under 2s on the GPU. Reported by Literato2 and co-authored by repparw. <code>voxtype setup gpu</code> also stops reporting Vulkan missing on NixOS and Guix (<a href="https://github.com/peteonrails/voxtype/issues/430">#430</a>), reported by Ezequiel Ramis.</p>
+
+                    <h3>Paste mode: driver order and terminals (<a href="https://github.com/peteonrails/voxtype/issues/750">#750</a>)</h3>
+                    <p>Paste mode ignored <code>driver_order</code> and always sent the keystroke with wtype, so keycode-based XWayland clients like xfreerdp received Escape instead of Ctrl+V. Paste mode now follows your order. New installs also default to <code>paste_keys = "shift+insert"</code>, because many terminals bind Ctrl+V to something else. Existing configs keep whatever they have. Reported by Scalix.</p>
+
+                    <h3>Clipboard output is instant, and "From" transcripts paste again</h3>
+                    <p>Clipboard mode checked for held modifier keys before copying, which opened every input device on the machine. On a desktop with 36 of them that took about 760 ms per dictation. Clipboard output never presses a key, so the check is gone there, and the same dictation copies in under 2 ms. Thanks to derekszen for tracking the cost down in <a href="https://github.com/peteonrails/voxtype/issues/543">#543</a>.</p>
+                    <p>Transcripts starting with "From " were offered only as <code>application/mbox</code>, because wl-copy guessed they were email, and text fields wouldn't paste them (<a href="https://github.com/peteonrails/voxtype/issues/738">#738</a>). Voxtype now tells wl-copy it's plain text. Reported by ivokosir.</p>
+
+                    <h3>Quiet microphones no longer lose short dictations</h3>
+                    <p>The energy VAD compared audio to a fixed loudness level, so on a webcam mic at 40% input volume short sentences were discarded as silence. Each recording's own background noise is now measured, and speech has to stand out from it. A loud mic behaves exactly as before, and a high <code>threshold</code> you set on purpose stays high. When a recording is discarded you now get a notification instead of what looked like a hang.</p>
+                    <div class="code-block">
+                        <div class="code-header"><span>config.toml</span></div>
+                        <pre><code>[output.notification]
+on_no_speech = false   # turn the notice off</code></pre>
+                    </div>
+
+                    <h3>Your config survives voxtype editing it</h3>
+                    <p><code>voxtype setup model</code> could leave a duplicate <code>model =</code> line that stopped the daemon from starting. <code>--config other.toml</code> on setup commands wrote your real config instead. <code>voxtype configure</code> saved the post-process command under a section voxtype never reads. All three are fixed, and every edit now goes through the same TOML editor as <code>voxtype config set</code>, so comments survive. A section in the wrong place now gets a startup warning, and <code>voxtype config set</code> reaches every scalar setting, including the whole <code>[soniox]</code> section.</p>
+
+                    <h3>Model overrides work on every engine</h3>
+                    <p><code>voxtype --model X record start</code> only worked when Whisper was the engine. Now the name picks its engine: on a Parakeet setup, <code>--model base.en</code> transcribes with Whisper and <code>--model moonshine-base</code> with Moonshine. <code>transcribe</code> does the same, and an unknown name fails with the command that fixes it.</p>
+
+                    <h3>The GTK4 OSD survives a monitor going away (<a href="https://github.com/peteonrails/voxtype/issues/580">#580</a>)</h3>
+                    <p>Closing the lid with an external monitor attached segfaulted the GTK4 OSD, from a GTK bug (<a href="https://gitlab.gnome.org/GNOME/gtk/-/work_items/8366">gtk#8366</a>) triggered by Hyprland's hotplug handling. The OSD now works around it on affected GTK versions only. Reported by Vlad Noskov. OSD recipes also apply from the command line with <code>voxtype setup osd --recipe NAME</code> (<a href="https://github.com/peteonrails/voxtype/issues/709">#709</a>), with recipes by OldJobobo.</p>
+
+                    <h3>Hotkey fixes from Ryan Ronnander (<a href="https://github.com/peteonrails/voxtype/pull/787">#787</a>, <a href="https://github.com/peteonrails/voxtype/pull/788">#788</a>)</h3>
+                    <p>Push-to-talk on a chord like RightAlt + RightCtrl now ends when you release in either order, and Print Screen is bindable as <code>key = "PRINTSCREEN"</code>.</p>
+
+                    <h3>Bug fixes</h3>
+                    <ul>
+                        <li>A second <code>voxtype daemon</code> no longer damages the running one before refusing</li>
+                        <li>A <code>record cancel</code> sent right before or after <code>record start</code> is no longer lost</li>
+                        <li>Two <code>meeting start</code> calls close together no longer create two meetings</li>
+                        <li>A <code>--file</code> recording that hits the time limit is written to the file instead of typed</li>
+                        <li>File output that can't be written falls back to the clipboard instead of dropping your text</li>
+                        <li>Eager processing no longer repeats words at chunk boundaries, and silent eager recordings no longer come back as "you"</li>
+                        <li>Paraformer and Omnilingual put spaces back in English output</li>
+                        <li>Unloading Parakeet with <code>on_demand_loading</code> returns its memory to the system</li>
+                        <li><code>record stop --wait</code> reads your configured <code>state_file</code> (<a href="https://github.com/peteonrails/voxtype/issues/714">#714</a>), reported by Zhang Erning</li>
+                        <li>OSD waveforms scroll at the display refresh rate (<a href="https://github.com/peteonrails/voxtype/issues/746">#746</a>), contributed by Carmine Paolino</li>
+                    </ul>
+                </div>
+            </article>
+
             <article class="news-article" id="v110">
                 <div class="article-meta">
                     <time datetime="2026-09-23">September 23, 2026</time>

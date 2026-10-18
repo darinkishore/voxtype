@@ -54,11 +54,9 @@ fn require_model_files(model_dir: &Path, model_name: &str) -> Result<(), Transcr
     let encoder_xml = model_dir.join("openvino_encoder_model.xml");
     if !encoder_xml.exists() {
         return Err(TranscribeError::ModelNotFound(format!(
-            "OpenVINO Whisper encoder model not found: {}\n  \
-             Run 'voxtype setup model' to download, or manually from:\n  \
-             https://huggingface.co/OpenVINO/whisper-{}",
+            "OpenVINO Whisper encoder model not found: {}\n  Run: {}",
             encoder_xml.display(),
-            model_name
+            crate::model_catalog::download_command("openvino", model_name)
         )));
     }
     OpenVinoTranscriber::require_preprocessor_config(model_dir, model_name)
@@ -691,15 +689,12 @@ fn resolve_model_path(model: &str, quantized: bool) -> Result<PathBuf, Transcrib
     } else {
         format!("{}{}", model, quant_suffix)
     };
-    let hf_repo = format!("whisper-{}-ov", model_with_quant);
 
     Err(TranscribeError::ModelNotFound(format!(
-        "OpenVINO Whisper model '{}' not found. Looked in:\n{}\n\n  \
-         Run 'voxtype setup model' to download, or manually from:\n  \
-         https://huggingface.co/OpenVINO/{}",
+        "OpenVINO Whisper model '{}' not found. Looked in:\n{}\n\n  Run: {}",
         model,
         searched.join("\n"),
-        hf_repo
+        crate::model_catalog::download_command("openvino", &model_with_quant)
     )))
 }
 
@@ -778,7 +773,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not found"));
-        assert!(err.contains("huggingface.co"));
+        assert!(err.contains("voxtype setup --download --model nonexistent-model"));
     }
 
     #[test]

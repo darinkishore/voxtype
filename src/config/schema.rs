@@ -186,6 +186,7 @@ pub fn feature_compiled(feature: &str) -> bool {
         "omnilingual" => cfg!(feature = "omnilingual"),
         "cohere" => cfg!(feature = "cohere"),
         "openvino" => cfg!(feature = "openvino-whisper"),
+        "openai-realtime" => cfg!(feature = "openai-realtime"),
         _ => false,
     }
 }
@@ -288,6 +289,14 @@ pub const REPLACEMENTS_TABLE: &str = "text.replacements";
 // ---------------------------------------------------------------------------
 // The allowlist.
 // ---------------------------------------------------------------------------
+
+const FILE_MODE_CHOICES: &[&str] = &["overwrite", "append"];
+const URGENCY_CHOICES: &[&str] = &["low", "normal", "critical"];
+const PASTE_KEY_CHOICES: &[&str] = &["shift+insert", "ctrl+v", "ctrl+shift+v", "super+v"];
+const STATE_FILE_CHOICES: &[&str] = &["auto", "disabled"];
+const MEETING_STORAGE_CHOICES: &[&str] = &["auto"];
+const DIARIZATION_BACKEND_CHOICES: &[&str] = &["simple", "ml"];
+const SUMMARY_BACKEND_CHOICES: &[&str] = &["local", "remote", "disabled"];
 
 pub const CONFIG_KEYS: &[KeySpec] = &[
     // -- Engine -------------------------------------------------------------
@@ -754,6 +763,230 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Enable live transcription through the shared sliding-window engine.",
     )
     .for_onnx_engine("openvino"),
+    // OpenAI Realtime cloud engine (vendor extension).
+    spec(
+        "openai_realtime.api_key",
+        "openai_realtime",
+        "api_key",
+        KeyType::String,
+        "Engine",
+        "API key",
+        "OpenAI API key; prefer api_key_file or OPENAI_API_KEY.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.api_key_file",
+        "openai_realtime",
+        "api_key_file",
+        KeyType::String,
+        "Engine",
+        "API key file",
+        "Private file containing the OpenAI API key.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.model",
+        "openai_realtime",
+        "model",
+        KeyType::String,
+        "Engine",
+        "Model",
+        "OpenAI Realtime transcription model.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.delay",
+        "openai_realtime",
+        "delay",
+        closed(&["minimal", "low", "medium", "high", "xhigh"]),
+        "Engine",
+        "Transcription delay",
+        "Latency and accuracy tradeoff for transcription.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.prompt",
+        "openai_realtime",
+        "prompt",
+        KeyType::String,
+        "Engine",
+        "Vocabulary prompt",
+        "Domain context for transcription.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.noise_reduction",
+        "openai_realtime",
+        "noise_reduction",
+        closed(&["near_field", "far_field", ""]),
+        "Engine",
+        "Noise reduction",
+        "Near-field or far-field filtering; an empty value disables filtering.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.turn_detection",
+        "openai_realtime",
+        "turn_detection",
+        KeyType::Bool,
+        "Engine",
+        "Server VAD",
+        "Enable server turn detection only for models that support it.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.vad_threshold",
+        "openai_realtime",
+        "vad_threshold",
+        KeyType::Float { min: 0.0, max: 1.0 },
+        "Engine",
+        "VAD threshold",
+        "Server VAD speech probability threshold.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.vad_prefix_padding_ms",
+        "openai_realtime",
+        "vad_prefix_padding_ms",
+        KeyType::Int { min: 0, max: 5000 },
+        "Engine",
+        "VAD prefix padding",
+        "Milliseconds of pre-speech audio included by server VAD.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.vad_silence_duration_ms",
+        "openai_realtime",
+        "vad_silence_duration_ms",
+        KeyType::Int { min: 0, max: 60000 },
+        "Engine",
+        "VAD silence",
+        "Milliseconds of silence that end a server VAD turn.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.streaming",
+        "openai_realtime",
+        "streaming",
+        KeyType::Bool,
+        "Engine",
+        "Streaming",
+        "Stream audio while recording instead of submitting at stop.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    spec(
+        "openai_realtime.type_partials",
+        "openai_realtime",
+        "type_partials",
+        KeyType::Bool,
+        "Engine",
+        "Type partials",
+        "Deliver partial transcript deltas during streaming.",
+    )
+    .for_engine("openairealtime")
+    .gated("openai-realtime"),
+    // soniox
+    spec(
+        "soniox.api_key",
+        "soniox",
+        "api_key",
+        KeyType::String,
+        "Engine",
+        "API key",
+        "Soniox API key. Unset falls back to the SONIOX_API_KEY environment variable.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.model",
+        "soniox",
+        "model",
+        KeyType::String,
+        "Engine",
+        "Model",
+        "Soniox model name.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.language_hints_strict",
+        "soniox",
+        "language_hints_strict",
+        KeyType::Bool,
+        "Engine",
+        "Strict language hints",
+        "Keep recognition to the hinted languages. Ignored when there are no hints.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.streaming",
+        "soniox",
+        "streaming",
+        KeyType::Bool,
+        "Engine",
+        "Streaming",
+        "Stream over a WebSocket with live partials. Off sends one request when you release the key.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.type_partials",
+        "soniox",
+        "type_partials",
+        KeyType::Bool,
+        "Engine",
+        "Type partials",
+        "Type partial results as they arrive. Off types only finalized segments.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.context",
+        "soniox",
+        "context",
+        KeyType::String,
+        "Engine",
+        "Context",
+        "Short domain description sent to Soniox, e.g. \"medical consultation\".",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.terms_file",
+        "soniox",
+        "terms_file",
+        KeyType::String,
+        "Engine",
+        "Terms file",
+        "Path to a JSON list of vocabulary boost terms, loaded at daemon startup.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.async_api",
+        "soniox",
+        "async_api",
+        KeyType::Bool,
+        "Engine",
+        "Async API",
+        "Use Soniox's async file API instead of the real-time one.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.async_max_wait_secs",
+        "soniox",
+        "async_max_wait_secs",
+        KeyType::Int { min: 1, max: 3600 },
+        "Engine",
+        "Async max wait",
+        "Seconds to wait for an async transcription before giving up.",
+    )
+    .for_engine("soniox"),
     // -- Hotkey -------------------------------------------------------------
     spec(
         "hotkey.enabled",
@@ -893,6 +1126,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     ),
     // -- Output -------------------------------------------------------------
     spec(
+        "output.streaming_delivery",
+        "output",
+        "streaming_delivery",
+        closed(&["live", "end"]),
+        "Output",
+        "Streaming delivery",
+        "Deliver text live or as one paste after the streaming session ends.",
+    ),
+    spec(
         "output.mode",
         "output",
         "mode",
@@ -954,6 +1196,33 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Output",
         "Post-process command",
         "Shell command that receives the transcription on stdin and returns the cleaned text on stdout.",
+    ),
+    spec(
+        "output.post_process.timeout_ms",
+        "output.post_process",
+        "timeout_ms",
+        KeyType::Int { min: 100, max: 600_000 },
+        "Output",
+        "Post-process timeout",
+        "Milliseconds to wait for the post-process command before typing the original text.",
+    ),
+    spec(
+        "output.post_process.trim",
+        "output.post_process",
+        "trim",
+        KeyType::Bool,
+        "Output",
+        "Trim post-process output",
+        "Strip leading and trailing whitespace from the command's output. Turn off to keep a deliberate trailing space.",
+    ),
+    spec(
+        "output.post_process.fallback_on_empty",
+        "output.post_process",
+        "fallback_on_empty",
+        KeyType::Bool,
+        "Output",
+        "Keep text when output is empty",
+        "Output the original transcription when the command prints nothing. Turn off to let the command drop a transcription.",
     ),
     // -- Text ---------------------------------------------------------------
     spec(
@@ -1084,6 +1353,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Notifications",
         "Notify with the text",
         "Post the transcribed text as a notification when it completes.",
+    ),
+    spec(
+        "output.notification.on_no_speech",
+        "output.notification",
+        "on_no_speech",
+        KeyType::Bool,
+        "Notifications",
+        "Notify when no speech is heard",
+        "Post a notification when voice activity detection finds no speech and the recording is discarded.",
     ),
     spec(
         "output.notification.show_engine_icon",
@@ -1311,6 +1589,16 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     )
     .live(),
     spec(
+        "status.icons.streaming",
+        "status.icons",
+        "streaming",
+        KeyType::String,
+        "Status",
+        "Streaming icon",
+        "Override the theme's streaming glyph.",
+    )
+    .live(),
+    spec(
         "status.icons.stopped",
         "status.icons",
         "stopped",
@@ -1372,6 +1660,18 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     )
     .for_engine("whisper"),
     spec(
+        "whisper.gpu_wait_secs",
+        "whisper",
+        "gpu_wait_secs",
+        KeyType::Int { min: 0, max: 120 },
+        "Advanced",
+        "GPU wait at startup",
+        "Seconds to wait for the graphics driver before loading the model. Only \
+         spent when no GPU is present yet; raise it if the daemon starts during \
+         login and lands on CPU.",
+    )
+    .for_engine("whisper"),
+    spec(
         "parakeet.streaming",
         "parakeet",
         "streaming",
@@ -1382,6 +1682,577 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     )
     .for_engine("parakeet")
     .gated("parakeet"),
+    spec(
+        "output.file_path",
+        "output",
+        "file_path",
+        KeyType::String,
+        "Output",
+        "Output file",
+        "File that file output mode writes transcriptions to. Also the default for --output-file.",
+    ),
+    spec(
+        "output.file_mode",
+        "output",
+        "file_mode",
+        closed(FILE_MODE_CHOICES),
+        "Output",
+        "File write mode",
+        "overwrite replaces the file on each transcription; append adds to it.",
+    ),
+    spec(
+        "output.type_delay_ms",
+        "output",
+        "type_delay_ms",
+        KeyType::Int { min: 0, max: 1000 },
+        "Output",
+        "Typing delay",
+        "Milliseconds between typed characters. 0 types as fast as the driver allows.",
+    ),
+    spec(
+        "output.paste_keys",
+        "output",
+        "paste_keys",
+        open(PASTE_KEY_CHOICES),
+        "Output",
+        "Paste keystroke",
+        "Keystroke paste mode sends after copying, e.g. shift+insert or ctrl+shift+v for terminals.",
+    ),
+    spec(
+        "output.restore_clipboard",
+        "output",
+        "restore_clipboard",
+        KeyType::Bool,
+        "Output",
+        "Restore clipboard",
+        "Put the previous clipboard contents back after paste mode pastes.",
+    ),
+    spec(
+        "output.restore_clipboard_delay_ms",
+        "output",
+        "restore_clipboard_delay_ms",
+        KeyType::Int { min: 0, max: 10000 },
+        "Output",
+        "Clipboard restore delay",
+        "Milliseconds to wait after the paste keystroke before restoring the clipboard.",
+    ),
+    spec(
+        "output.wait_for_modifier_release",
+        "output",
+        "wait_for_modifier_release",
+        KeyType::Bool,
+        "Output",
+        "Wait for modifier release",
+        "Hold typed output until Ctrl, Alt, Shift and Super are released, so text can't trigger keybindings.",
+    ),
+    spec(
+        "output.modifier_release_timeout_ms",
+        "output",
+        "modifier_release_timeout_ms",
+        KeyType::Int { min: 0, max: 60000 },
+        "Output",
+        "Modifier release timeout",
+        "Milliseconds to wait for held modifiers before falling back to the clipboard.",
+    ),
+    spec(
+        "output.wtype_shift_prefix",
+        "output",
+        "wtype_shift_prefix",
+        KeyType::Bool,
+        "Output",
+        "wtype Shift prefix",
+        "Send a Shift tap before wtype output, for apps that drop the first CJK character.",
+    ),
+    spec(
+        "output.dotool_xkb_layout",
+        "output",
+        "dotool_xkb_layout",
+        KeyType::String,
+        "Output",
+        "dotool layout",
+        "XKB layout for dotool, e.g. de or fr. Needed for non-US layouts.",
+    ),
+    spec(
+        "output.dotool_xkb_variant",
+        "output",
+        "dotool_xkb_variant",
+        KeyType::String,
+        "Output",
+        "dotool layout variant",
+        "XKB layout variant for dotool, e.g. nodeadkeys.",
+    ),
+    spec(
+        "output.eitype_xkb_layout",
+        "output",
+        "eitype_xkb_layout",
+        KeyType::String,
+        "Output",
+        "eitype layout",
+        "XKB layout eitype types with, overriding the system layout while it runs.",
+    ),
+    spec(
+        "output.eitype_xkb_variant",
+        "output",
+        "eitype_xkb_variant",
+        KeyType::String,
+        "Output",
+        "eitype layout variant",
+        "XKB layout variant for eitype, e.g. dvorak or colemak.",
+    ),
+    spec(
+        "output.pre_recording_command",
+        "output",
+        "pre_recording_command",
+        KeyType::String,
+        "Output",
+        "Pre-recording command",
+        "Shell command run when recording starts, e.g. entering a compositor submap.",
+    ),
+    spec(
+        "output.pre_output_command",
+        "output",
+        "pre_output_command",
+        KeyType::String,
+        "Output",
+        "Pre-output command",
+        "Shell command run before text is output.",
+    ),
+    spec(
+        "output.post_output_command",
+        "output",
+        "post_output_command",
+        KeyType::String,
+        "Output",
+        "Post-output command",
+        "Shell command run after output, even if output failed, e.g. resetting a submap.",
+    ),
+    spec(
+        "output.notification.urgency",
+        "output.notification",
+        "urgency",
+        closed(URGENCY_CHOICES),
+        "Notifications",
+        "Notification urgency",
+        "Urgency for voxtype notifications. On GNOME, low skips the popup banner.",
+    ),
+    spec(
+        "state_file",
+        "",
+        "state_file",
+        open(STATE_FILE_CHOICES),
+        "Advanced",
+        "State file",
+        "Where the daemon writes its state for Waybar and record commands: auto, a path, or disabled.",
+    ),
+    spec(
+        "audio.sample_rate",
+        "audio",
+        "sample_rate",
+        KeyType::Int { min: 8000, max: 48000 },
+        "Advanced",
+        "Sample rate",
+        "Capture sample rate in Hz. The engines expect 16000.",
+    ),
+    spec(
+        "audio.external_trigger_silence_timeout_secs",
+        "audio",
+        "external_trigger_silence_timeout_secs",
+        KeyType::Float { min: 0.0, max: 600.0 },
+        "Advanced",
+        "External-trigger silence timeout",
+        "Auto-stop a record start recording after this many seconds of silence. Unset never auto-stops.",
+    ),
+    spec(
+        "audio.external_trigger_speech_threshold_dbfs",
+        "audio",
+        "external_trigger_speech_threshold_dbfs",
+        KeyType::Float { min: -100.0, max: 0.0 },
+        "Advanced",
+        "External-trigger speech level",
+        "Peak level in dBFS that counts as speech for the silence timeout.",
+    ),
+    spec(
+        "audio.external_trigger_stop_command",
+        "audio",
+        "external_trigger_stop_command",
+        KeyType::String,
+        "Output",
+        "External-trigger stop command",
+        "Shell command run whenever a record start recording ends, for any reason.",
+    ),
+    spec(
+        "vad.min_speech_duration_ms",
+        "vad",
+        "min_speech_duration_ms",
+        KeyType::Int { min: 0, max: 10000 },
+        "VAD",
+        "Minimum speech",
+        "Recordings with less detected speech than this many milliseconds are discarded.",
+    ),
+    spec(
+        "vad.model",
+        "vad",
+        "model",
+        KeyType::String,
+        "VAD",
+        "VAD model path",
+        "Model file for the Whisper VAD backend. Unset uses the default models directory.",
+    ),
+    spec(
+        "whisper.eager_chunk_secs",
+        "whisper",
+        "eager_chunk_secs",
+        KeyType::Float { min: 1.0, max: 60.0 },
+        "Advanced",
+        "Eager chunk length",
+        "Nominal seconds per chunk when eager_processing is on; cuts land on the nearest pause.",
+    ),
+    spec(
+        "whisper.streaming",
+        "whisper",
+        "streaming",
+        KeyType::Bool,
+        "Advanced",
+        "Whisper streaming",
+        "Type text incrementally while you speak using sliding-window re-transcription.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.remote_timeout_secs",
+        "whisper",
+        "remote_timeout_secs",
+        KeyType::Int { min: 1, max: 3600 },
+        "Advanced",
+        "Remote timeout",
+        "Seconds to wait for a remote transcription request.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.remote_send_auto_language",
+        "whisper",
+        "remote_send_auto_language",
+        KeyType::Bool,
+        "Advanced",
+        "Send language auto",
+        "Send an explicit language=auto to remote endpoints that require the field.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.whisper_cli_path",
+        "whisper",
+        "whisper_cli_path",
+        KeyType::String,
+        "Advanced",
+        "whisper-cli path",
+        "whisper-cli binary for the cli backend. Unset searches PATH.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.max_loaded_models",
+        "whisper",
+        "max_loaded_models",
+        KeyType::Int { min: 1, max: 16 },
+        "Advanced",
+        "Loaded model limit",
+        "Models kept in memory at once when gpu_isolation is off.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.cold_model_timeout_secs",
+        "whisper",
+        "cold_model_timeout_secs",
+        KeyType::Int { min: 0, max: 86400 },
+        "Advanced",
+        "Idle model unload",
+        "Seconds before an idle secondary model is unloaded. 0 never unloads.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.context_window_optimization",
+        "whisper",
+        "context_window_optimization",
+        KeyType::Bool,
+        "Advanced",
+        "Short-clip context window",
+        "Use a smaller context window for short recordings, which is faster.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "parakeet.streaming_chunk_secs",
+        "parakeet",
+        "streaming_chunk_secs",
+        KeyType::Float { min: 0.0, max: 60.0 },
+        "Advanced",
+        "Streaming chunk",
+        "Seconds per streaming chunk. Smaller is lower latency with more inference overhead.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.streaming_left_context_secs",
+        "parakeet",
+        "streaming_left_context_secs",
+        KeyType::Float { min: 0.0, max: 60.0 },
+        "Advanced",
+        "Streaming left context",
+        "Seconds of past audio each streaming chunk sees.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.streaming_right_context_secs",
+        "parakeet",
+        "streaming_right_context_secs",
+        KeyType::Float { min: 0.0, max: 60.0 },
+        "Advanced",
+        "Streaming right context",
+        "Seconds of lookahead each streaming chunk waits for.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "streaming.interval_secs",
+        "streaming",
+        "interval_secs",
+        KeyType::Float { min: 0.1, max: 30.0 },
+        "Advanced",
+        "Streaming interval",
+        "Seconds between re-transcriptions of the rolling buffer.",
+    ),
+    spec(
+        "streaming.max_buffer_secs",
+        "streaming",
+        "max_buffer_secs",
+        KeyType::Float { min: 1.0, max: 120.0 },
+        "Advanced",
+        "Streaming buffer",
+        "Buffered seconds before the window slides forward.",
+    ),
+    spec(
+        "streaming.min_speech_rms",
+        "streaming",
+        "min_speech_rms",
+        KeyType::Float { min: 0.0, max: 1.0 },
+        "Advanced",
+        "Streaming speech floor",
+        "Skip re-transcription while the buffer RMS is below this.",
+    ),
+    spec(
+        "streaming.min_audio_secs",
+        "streaming",
+        "min_audio_secs",
+        KeyType::Float { min: 0.0, max: 30.0 },
+        "Advanced",
+        "Streaming first partial",
+        "Buffered seconds before the first partial is attempted.",
+    ),
+    spec(
+        "streaming.partial_min_words",
+        "streaming",
+        "partial_min_words",
+        KeyType::Int { min: 1, max: 100 },
+        "Advanced",
+        "Streaming words per commit",
+        "New stable words needed before a delta is committed.",
+    ),
+    spec(
+        "streaming.type_partials",
+        "streaming",
+        "type_partials",
+        KeyType::Bool,
+        "Advanced",
+        "Type partials",
+        "Type committed deltas live, or only whole segments at the end.",
+    ),
+    spec(
+        "streaming.revision_mode",
+        "streaming",
+        "revision_mode",
+        KeyType::Bool,
+        "Advanced",
+        "Revision mode",
+        "Experimental: type the best guess at once and correct it later with backspace.",
+    ),
+    spec(
+        "meeting.chunk_duration_secs",
+        "meeting",
+        "chunk_duration_secs",
+        KeyType::Int { min: 5, max: 600 },
+        "Meeting",
+        "Chunk length",
+        "Seconds of meeting audio per transcription chunk.",
+    ),
+    spec(
+        "meeting.max_duration_mins",
+        "meeting",
+        "max_duration_mins",
+        KeyType::Int { min: 0, max: 1440 },
+        "Meeting",
+        "Maximum length",
+        "Minutes before a meeting stops on its own. 0 is unlimited.",
+    ),
+    spec(
+        "meeting.retain_audio",
+        "meeting",
+        "retain_audio",
+        KeyType::Bool,
+        "Meeting",
+        "Keep audio",
+        "Keep the raw meeting audio after transcription.",
+    ),
+    spec(
+        "meeting.storage_path",
+        "meeting",
+        "storage_path",
+        open(MEETING_STORAGE_CHOICES),
+        "Meeting",
+        "Storage path",
+        "Where meetings are stored. auto uses ~/.local/share/voxtype/meetings.",
+    ),
+    spec(
+        "meeting.audio.mic_device",
+        "meeting.audio",
+        "mic_device",
+        KeyType::String,
+        "Meeting",
+        "Meeting microphone",
+        "Microphone for meetings. default uses the [audio] device.",
+    ),
+    spec(
+        "meeting.audio.vad_threshold",
+        "meeting.audio",
+        "vad_threshold",
+        KeyType::Float { min: 0.0, max: 1.0 },
+        "Meeting",
+        "Chunk speech threshold",
+        "RMS below which a meeting chunk is skipped. 0 disables the gate.",
+    ),
+    spec(
+        "meeting.diarization.backend",
+        "meeting.diarization",
+        "backend",
+        closed(DIARIZATION_BACKEND_CHOICES),
+        "Meeting",
+        "Diarization backend",
+        "simple or ml speaker labelling.",
+    ),
+    spec(
+        "meeting.diarization.max_speakers",
+        "meeting.diarization",
+        "max_speakers",
+        KeyType::Int { min: 1, max: 32 },
+        "Meeting",
+        "Maximum speakers",
+        "Most distinct speakers diarization will label.",
+    ),
+    spec(
+        "meeting.diarization.similarity_threshold",
+        "meeting.diarization",
+        "similarity_threshold",
+        KeyType::Float { min: 0.0, max: 1.0 },
+        "Meeting",
+        "Speaker similarity",
+        "Cosine similarity for the ml backend to call two segments the same speaker.",
+    ),
+    spec(
+        "meeting.diarization.min_segment_ms",
+        "meeting.diarization",
+        "min_segment_ms",
+        KeyType::Int { min: 0, max: 60000 },
+        "Meeting",
+        "Minimum segment",
+        "Shortest segment in milliseconds the ml backend embeds.",
+    ),
+    spec(
+        "meeting.diarization.vad_window_secs",
+        "meeting.diarization",
+        "vad_window_secs",
+        KeyType::Float { min: 0.1, max: 30.0 },
+        "Meeting",
+        "Diarization window",
+        "Sub-window length in seconds fed to the ml embedder.",
+    ),
+    spec(
+        "meeting.diarization.vad_hop_secs",
+        "meeting.diarization",
+        "vad_hop_secs",
+        KeyType::Float { min: 0.05, max: 30.0 },
+        "Meeting",
+        "Diarization hop",
+        "Hop between diarization sub-windows in seconds.",
+    ),
+    spec(
+        "meeting.diarization.vad_rms_floor",
+        "meeting.diarization",
+        "vad_rms_floor",
+        KeyType::Float { min: 0.0, max: 1.0 },
+        "Meeting",
+        "Diarization silence floor",
+        "RMS below which a diarization sub-window counts as silence.",
+    ),
+    spec(
+        "meeting.diarization.model_path",
+        "meeting.diarization",
+        "model_path",
+        KeyType::String,
+        "Meeting",
+        "Diarization model",
+        "Path to the ONNX speaker model for the ml backend. Unset uses the downloaded default.",
+    ),
+    spec(
+        "meeting.summary.backend",
+        "meeting.summary",
+        "backend",
+        closed(SUMMARY_BACKEND_CHOICES),
+        "Meeting",
+        "Summary backend",
+        "local uses Ollama, remote an API, disabled turns summaries off.",
+    ),
+    spec(
+        "meeting.summary.ollama_url",
+        "meeting.summary",
+        "ollama_url",
+        KeyType::String,
+        "Meeting",
+        "Ollama URL",
+        "Ollama endpoint for the local summary backend.",
+    ),
+    spec(
+        "meeting.summary.ollama_model",
+        "meeting.summary",
+        "ollama_model",
+        KeyType::String,
+        "Meeting",
+        "Ollama model",
+        "Model the local summary backend asks Ollama for.",
+    ),
+    spec(
+        "meeting.summary.remote_endpoint",
+        "meeting.summary",
+        "remote_endpoint",
+        KeyType::String,
+        "Meeting",
+        "Remote summary endpoint",
+        "API endpoint for the remote summary backend.",
+    ),
+    spec(
+        "meeting.summary.remote_api_key",
+        "meeting.summary",
+        "remote_api_key",
+        KeyType::String,
+        "Meeting",
+        "Remote summary API key",
+        "API key for the remote summary backend.",
+    ),
+    spec(
+        "meeting.summary.timeout_secs",
+        "meeting.summary",
+        "timeout_secs",
+        KeyType::Int { min: 1, max: 3600 },
+        "Meeting",
+        "Summary timeout",
+        "Seconds to wait for a summary request.",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1456,6 +2327,33 @@ pub fn find_key(dotted: &str) -> Option<Found> {
         }
     }
     None
+}
+
+/// Where a top-level `[name]` table belongs when voxtype only reads a section
+/// of that name nested under another, e.g. `[post_process]` is read as
+/// `[output.post_process]`. `None` when `name` is a real top-level section or
+/// matches nothing voxtype knows, so unknown sections stay silently ignored.
+pub fn misplaced_section_home(name: &str) -> Option<String> {
+    let mut homes = std::collections::BTreeSet::new();
+    for spec in CONFIG_KEYS {
+        let parts: Vec<&str> = spec.key.split('.').collect();
+        if parts[0] == name {
+            return None;
+        }
+        // Proper prefixes of two or more segments are the nested tables.
+        for depth in 2..parts.len() {
+            if parts[depth - 1] == name {
+                homes.insert(parts[..depth].join("."));
+            }
+        }
+    }
+    (!homes.is_empty()).then(|| {
+        homes
+            .into_iter()
+            .map(|h| format!("[{h}]"))
+            .collect::<Vec<_>>()
+            .join(" or ")
+    })
 }
 
 /// Scalar keys only — the ones that appear in the schema's `keys` array.
@@ -1604,15 +2502,13 @@ pub fn validate_value(spec: &KeySpec, raw: &str) -> Result<TypedValue, ValueErro
 fn ensure_required_siblings(editor: &mut ConfigEditor, spec: &KeySpec) {
     let Some(engine) = spec.engine else { return };
     // Whisper's table is not optional and its `model` has a serde default.
-    if engine == "whisper" || spec.field == "model" {
+    // An engine with no catalog default (Soniox) defaults `model` in serde.
+    let default = crate::model_catalog::default_model(engine);
+    if engine == "whisper" || spec.field == "model" || default.is_empty() {
         return;
     }
     if editor.get_string(spec.table, "model").is_none() {
-        editor.set_string(
-            spec.table,
-            "model",
-            crate::model_catalog::default_model(engine),
-        );
+        editor.set_string(spec.table, "model", default);
     }
 }
 
@@ -1677,6 +2573,11 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
     let om = || cfg.omnilingual.clone().unwrap_or_default();
     let co = || cfg.cohere.clone().unwrap_or_default();
     let ov = || cfg.openvino.clone().unwrap_or_default();
+    let so = || cfg.soniox.clone().unwrap_or_default();
+    let oa = || cfg.openai_realtime.clone().unwrap_or_default();
+    // Without a table, post-processing is off; report the values a new
+    // table would start with.
+    let pp = || cfg.output.post_process.clone().unwrap_or_default();
 
     let v = match key {
         "engine" => json!(cfg.engine.name()),
@@ -1705,6 +2606,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
             Some(n) => json!(n),
             None => Json::Null,
         },
+        "whisper.gpu_wait_secs" => json!(cfg.whisper.gpu_wait_secs),
 
         "parakeet.model" => json!(pk().model),
         "parakeet.model_type" => match pk().model_type {
@@ -1773,6 +2675,32 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "openvino.openvino_dir" => opt_str(ov().openvino_dir.as_ref()),
         "openvino.streaming" => json!(ov().streaming),
 
+        "openai_realtime.api_key" => opt_str(oa().api_key.as_ref()),
+        "openai_realtime.api_key_file" => oa().api_key_file.map(|p| json!(p.to_string_lossy())).unwrap_or(Json::Null),
+        "openai_realtime.model" => json!(oa().model),
+        "openai_realtime.delay" => json!(oa().delay),
+        "openai_realtime.prompt" => opt_str(oa().prompt.as_ref()),
+        "openai_realtime.noise_reduction" => json!(oa().noise_reduction),
+        "openai_realtime.turn_detection" => json!(oa().turn_detection),
+        "openai_realtime.vad_threshold" => f32_json(oa().vad_threshold),
+        "openai_realtime.vad_prefix_padding_ms" => json!(oa().vad_prefix_padding_ms),
+        "openai_realtime.vad_silence_duration_ms" => json!(oa().vad_silence_duration_ms),
+        "openai_realtime.streaming" => json!(oa().streaming),
+        "openai_realtime.type_partials" => json!(oa().type_partials),
+
+        "soniox.api_key" => opt_str(so().api_key.as_ref()),
+        "soniox.model" => json!(so().model),
+        "soniox.language_hints_strict" => json!(so().language_hints_strict),
+        "soniox.streaming" => json!(so().streaming),
+        "soniox.type_partials" => json!(so().type_partials),
+        "soniox.context" => opt_str(so().context.as_ref()),
+        "soniox.terms_file" => match so().terms_file {
+            Some(p) => json!(p.to_string_lossy()),
+            None => Json::Null,
+        },
+        "soniox.async_api" => json!(so().async_api),
+        "soniox.async_max_wait_secs" => json!(so().async_max_wait_secs),
+
         "hotkey.enabled" => json!(cfg.hotkey.enabled),
         "hotkey.key" => json!(cfg.hotkey.key),
         "hotkey.mode" => json!(match cfg.hotkey.mode {
@@ -1793,6 +2721,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "audio.feedback.theme" => json!(cfg.audio.feedback.theme),
         "audio.feedback.volume" => f32_json(cfg.audio.feedback.volume),
 
+        "output.streaming_delivery" => serde_json::to_value(cfg.output.streaming_delivery).ok()?,
         "output.mode" => serde_json::to_value(cfg.output.mode.clone()).ok()?,
         "output.fallback_to_clipboard" => json!(cfg.output.fallback_to_clipboard),
         "output.auto_submit" => json!(cfg.output.auto_submit),
@@ -1803,6 +2732,9 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
             Some(p) => json!(p.command),
             None => Json::Null,
         },
+        "output.post_process.timeout_ms" => json!(pp().timeout_ms),
+        "output.post_process.trim" => json!(pp().trim),
+        "output.post_process.fallback_on_empty" => json!(pp().fallback_on_empty),
 
         "text.spoken_punctuation" => json!(cfg.text.spoken_punctuation),
         "text.smart_auto_submit" => json!(cfg.text.smart_auto_submit),
@@ -1833,6 +2765,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
             json!(cfg.output.notification.on_recording_stop)
         }
         "output.notification.on_transcription" => json!(cfg.output.notification.on_transcription),
+        "output.notification.on_no_speech" => json!(cfg.output.notification.on_no_speech),
         "output.notification.show_engine_icon" => json!(cfg.output.notification.show_engine_icon),
 
         "osd.enabled" => json!(cfg.osd.enabled),
@@ -1865,7 +2798,86 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "status.icons.idle" => opt_str(cfg.status.icons.idle.as_ref()),
         "status.icons.recording" => opt_str(cfg.status.icons.recording.as_ref()),
         "status.icons.transcribing" => opt_str(cfg.status.icons.transcribing.as_ref()),
+        "status.icons.streaming" => opt_str(cfg.status.icons.streaming.as_ref()),
         "status.icons.stopped" => opt_str(cfg.status.icons.stopped.as_ref()),
+
+        "output.file_path" => cfg
+            .output
+            .file_path
+            .as_ref()
+            .map(|p| json!(p.display().to_string()))
+            .unwrap_or(Json::Null),
+        "output.file_mode" => json!(cfg.output.file_mode),
+        "output.type_delay_ms" => json!(cfg.output.type_delay_ms),
+        "output.paste_keys" => opt_str(cfg.output.paste_keys.as_ref()),
+        "output.restore_clipboard" => json!(cfg.output.restore_clipboard),
+        "output.restore_clipboard_delay_ms" => json!(cfg.output.restore_clipboard_delay_ms),
+        "output.wait_for_modifier_release" => json!(cfg.output.wait_for_modifier_release),
+        "output.modifier_release_timeout_ms" => json!(cfg.output.modifier_release_timeout_ms),
+        "output.wtype_shift_prefix" => json!(cfg.output.wtype_shift_prefix),
+        "output.dotool_xkb_layout" => opt_str(cfg.output.dotool_xkb_layout.as_ref()),
+        "output.dotool_xkb_variant" => opt_str(cfg.output.dotool_xkb_variant.as_ref()),
+        "output.eitype_xkb_layout" => opt_str(cfg.output.eitype_xkb_layout.as_ref()),
+        "output.eitype_xkb_variant" => opt_str(cfg.output.eitype_xkb_variant.as_ref()),
+        "output.pre_recording_command" => opt_str(cfg.output.pre_recording_command.as_ref()),
+        "output.pre_output_command" => opt_str(cfg.output.pre_output_command.as_ref()),
+        "output.post_output_command" => opt_str(cfg.output.post_output_command.as_ref()),
+        "output.notification.urgency" => json!(cfg.output.notification.urgency),
+        "state_file" => opt_str(cfg.state_file.as_ref()),
+        "audio.sample_rate" => json!(cfg.audio.sample_rate),
+        "audio.external_trigger_silence_timeout_secs" => {
+            json!(cfg.audio.external_trigger_silence_timeout_secs)
+        }
+        "audio.external_trigger_speech_threshold_dbfs" => {
+            json!(cfg.audio.external_trigger_speech_threshold_dbfs)
+        }
+        "audio.external_trigger_stop_command" => {
+            opt_str(cfg.audio.external_trigger_stop_command.as_ref())
+        }
+        "vad.min_speech_duration_ms" => json!(cfg.vad.min_speech_duration_ms),
+        "vad.model" => opt_str(cfg.vad.model.as_ref()),
+        "whisper.eager_chunk_secs" => json!(cfg.whisper.eager_chunk_secs),
+        "whisper.streaming" => json!(cfg.whisper.streaming),
+        "whisper.remote_timeout_secs" => json!(cfg.whisper.remote_timeout_secs),
+        "whisper.remote_send_auto_language" => json!(cfg.whisper.remote_send_auto_language),
+        "whisper.whisper_cli_path" => opt_str(cfg.whisper.whisper_cli_path.as_ref()),
+        "whisper.max_loaded_models" => json!(cfg.whisper.max_loaded_models),
+        "whisper.cold_model_timeout_secs" => json!(cfg.whisper.cold_model_timeout_secs),
+        "whisper.context_window_optimization" => json!(cfg.whisper.context_window_optimization),
+        "parakeet.streaming_chunk_secs" => json!(pk().streaming_chunk_secs),
+        "parakeet.streaming_left_context_secs" => json!(pk().streaming_left_context_secs),
+        "parakeet.streaming_right_context_secs" => json!(pk().streaming_right_context_secs),
+        "streaming.interval_secs" => json!(cfg.streaming.unwrap_or_default().interval_secs),
+        "streaming.max_buffer_secs" => json!(cfg.streaming.unwrap_or_default().max_buffer_secs),
+        "streaming.min_speech_rms" => json!(cfg.streaming.unwrap_or_default().min_speech_rms),
+        "streaming.min_audio_secs" => json!(cfg.streaming.unwrap_or_default().min_audio_secs),
+        "streaming.partial_min_words" => {
+            json!(cfg.streaming.unwrap_or_default().partial_min_words)
+        }
+        "streaming.type_partials" => json!(cfg.streaming.unwrap_or_default().type_partials),
+        "streaming.revision_mode" => json!(cfg.streaming.unwrap_or_default().revision_mode),
+        "meeting.chunk_duration_secs" => json!(cfg.meeting.chunk_duration_secs),
+        "meeting.max_duration_mins" => json!(cfg.meeting.max_duration_mins),
+        "meeting.retain_audio" => json!(cfg.meeting.retain_audio),
+        "meeting.storage_path" => json!(cfg.meeting.storage_path),
+        "meeting.audio.mic_device" => json!(cfg.meeting.audio.mic_device),
+        "meeting.audio.vad_threshold" => json!(cfg.meeting.audio.vad_threshold),
+        "meeting.diarization.backend" => json!(cfg.meeting.diarization.backend),
+        "meeting.diarization.max_speakers" => json!(cfg.meeting.diarization.max_speakers),
+        "meeting.diarization.similarity_threshold" => {
+            json!(cfg.meeting.diarization.similarity_threshold)
+        }
+        "meeting.diarization.min_segment_ms" => json!(cfg.meeting.diarization.min_segment_ms),
+        "meeting.diarization.vad_window_secs" => json!(cfg.meeting.diarization.vad_window_secs),
+        "meeting.diarization.vad_hop_secs" => json!(cfg.meeting.diarization.vad_hop_secs),
+        "meeting.diarization.vad_rms_floor" => json!(cfg.meeting.diarization.vad_rms_floor),
+        "meeting.diarization.model_path" => opt_str(cfg.meeting.diarization.model_path.as_ref()),
+        "meeting.summary.backend" => json!(cfg.meeting.summary.backend),
+        "meeting.summary.ollama_url" => json!(cfg.meeting.summary.ollama_url),
+        "meeting.summary.ollama_model" => json!(cfg.meeting.summary.ollama_model),
+        "meeting.summary.remote_endpoint" => opt_str(cfg.meeting.summary.remote_endpoint.as_ref()),
+        "meeting.summary.remote_api_key" => opt_str(cfg.meeting.summary.remote_api_key.as_ref()),
+        "meeting.summary.timeout_secs" => json!(cfg.meeting.summary.timeout_secs),
 
         _ => return None,
     };
@@ -2355,16 +3367,18 @@ mod tests {
     fn onnx_engine_keys_are_feature_gated() {
         for s in CONFIG_KEYS {
             let Some(engine) = s.engine else { continue };
-            if engine == "whisper" {
+            // Whisper and the Soniox cloud client are always compiled in.
+            if engine == "whisper" || engine == "soniox" {
                 assert!(
                     s.requires_feature.is_none(),
-                    "{} should not be feature-gated; whisper is always compiled in",
-                    s.key
+                    "{} should not be feature-gated; {} is always compiled in",
+                    s.key,
+                    engine
                 );
             } else {
                 assert_eq!(
                     s.requires_feature,
-                    Some(engine),
+                    Some(if engine == "openairealtime" { "openai-realtime" } else { engine }),
                     "{} is an {} key and must be gated on the '{}' feature",
                     s.key,
                     engine,
@@ -2514,5 +3528,89 @@ mod tests {
             };
             assert_eq!(s.compiled(), feature_compiled(feature), "{}", s.key);
         }
+    }
+
+    /// Fields `config set` deliberately doesn't reach. Everything else a
+    /// config struct can hold as a scalar needs a [`KeySpec`], or the
+    /// "reaches every setting" promise quietly stops being true.
+    const NOT_SETTABLE: &[&str] = &[
+        // Deprecated aliases, still read for old configs.
+        "whisper.backend",
+        "whisper.eager_overlap_secs",
+        "output.wtype_delay_ms",
+        // Deprecated per-engine copies of the shared [streaming] table.
+        "whisper.streaming_interval_secs",
+        "whisper.streaming_max_buffer_secs",
+        "whisper.streaming_min_audio_secs",
+        "whisper.streaming_min_speech_rms",
+        "whisper.streaming_partial_min_words",
+        "whisper.streaming_revision_mode",
+        "whisper.streaming_type_partials",
+        "openvino.streaming_interval_secs",
+        "openvino.streaming_max_buffer_secs",
+        "openvino.streaming_min_audio_secs",
+        "openvino.streaming_min_speech_rms",
+        "openvino.streaming_partial_min_words",
+        "openvino.streaming_revision_mode",
+        "openvino.streaming_type_partials",
+        // Lists, which need a hand edit.
+        "output.driver_order",
+        "soniox.terms",
+    ];
+
+    /// Tables of arbitrary keys, also a hand edit.
+    const NOT_SETTABLE_TABLES: &[&str] = &["output.language_to_layout."];
+
+    fn scalar_leaves(prefix: &str, v: &Json, out: &mut Vec<String>) {
+        match v {
+            Json::Object(m) => {
+                for (k, v) in m {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    scalar_leaves(&path, v, out);
+                }
+            }
+            Json::Array(_) => {}
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    #[test]
+    fn every_scalar_config_field_has_a_key() {
+        // Materialize every optional table so its fields are visible.
+        let mut src: String = [
+            "parakeet",
+            "moonshine",
+            "sensevoice",
+            "paraformer",
+            "dolphin",
+            "omnilingual",
+            "cohere",
+            "openvino",
+            "soniox",
+            "openai_realtime",
+        ]
+        .iter()
+        .map(|t| format!("[{t}]\nmodel = \"m\"\n"))
+        .collect();
+        src.push_str("[streaming]\n[output.post_process]\ncommand = \"cat\"\n");
+        let cfg: Config = toml::from_str(&src).expect("materialized config parses");
+
+        let mut leaves = Vec::new();
+        scalar_leaves("", &serde_json::to_value(&cfg).unwrap(), &mut leaves);
+        let keys: std::collections::HashSet<&str> = scalar_keys().map(|s| s.key).collect();
+        let missing: Vec<_> = leaves
+            .iter()
+            .filter(|l| !keys.contains(l.as_str()))
+            .filter(|l| !NOT_SETTABLE.contains(&l.as_str()))
+            .filter(|l| !NOT_SETTABLE_TABLES.iter().any(|t| l.starts_with(t)))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "config fields with no schema key: {missing:?}"
+        );
     }
 }

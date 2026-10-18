@@ -168,11 +168,14 @@ impl CohereTranscriber {
             ("tokenizer.json", &tokenizer_file),
         ] {
             if !path.exists() {
+                let name = model_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 return Err(TranscribeError::ModelNotFound(format!(
-                    "Cohere {label} not found: {}\n  \
-                     Download from https://huggingface.co/onnx-community/\
-                     cohere-transcribe-03-2026-ONNX",
+                    "Cohere {label} not found: {}\n  Run: {}",
                     path.display(),
+                    crate::model_catalog::download_command("cohere", &name),
                 )));
             }
         }

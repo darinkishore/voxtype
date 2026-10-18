@@ -47,14 +47,9 @@ pub(crate) async fn run_meeting_command(
             check_daemon_running()?;
 
             // Check if meeting already in progress
-            let meeting_state_file = config::Config::runtime_dir().join("meeting_state");
-            if meeting_state_file.exists() {
-                let state = std::fs::read_to_string(&meeting_state_file).unwrap_or_default();
-                if state.starts_with("recording") || state.starts_with("paused") {
-                    eprintln!("Error: A meeting is already in progress.");
-                    eprintln!("Use 'voxtype meeting stop' to end it first.");
-                    std::process::exit(1);
-                }
+            let runtime_dir = config::Config::runtime_dir();
+            if meeting_phase(&runtime_dir).0 != MeetingPhase::Idle {
+                refuse_start();
             }
 
             // --diarization ml requires the ml-diarization feature at build
@@ -96,7 +91,6 @@ pub(crate) async fn run_meeting_command(
 
             // Write the diarization override first so it's visible by the time
             // the daemon picks up the start trigger.
-            let runtime_dir = config::Config::runtime_dir();
             let diarization_file = runtime_dir.join("meeting_start_diarization");
             if let Some(ref backend) = diarization {
                 std::fs::write(&diarization_file, backend)?;
@@ -105,10 +99,21 @@ pub(crate) async fn run_meeting_command(
                 let _ = std::fs::remove_file(&diarization_file);
             }
 
-            // Write start trigger file (with optional title)
+            // Write start trigger file (with optional title). The claim is
+            // atomic, so of two starts issued together only one gets in.
             let start_file = runtime_dir.join("meeting_start");
-            let content = title.unwrap_or_default();
-            std::fs::write(&start_file, content)?;
+            if !claim_start_trigger(&start_file, &title.unwrap_or_default())? {
+                refuse_start();
+            }
+            // A meeting that came up between the check above and the claim
+            // leaves this trigger to be refused by the daemon; say so here.
+            if matches!(
+                base_meeting_state(&runtime_dir).0,
+                MeetingPhase::Recording | MeetingPhase::Paused
+            ) {
+                let _ = std::fs::remove_file(&start_file);
+                refuse_start();
+            }
 
             let suffix = diarization
                 .as_deref()
@@ -124,22 +129,21 @@ pub(crate) async fn run_meeting_command(
         MeetingAction::Stop => {
             check_daemon_running()?;
 
-            // Check if meeting is in progress
-            let meeting_state_file = config::Config::runtime_dir().join("meeting_state");
-            if !meeting_state_file.exists() {
-                eprintln!("Error: No meeting in progress.");
-                std::process::exit(1);
-            }
-
-            let state = std::fs::read_to_string(&meeting_state_file).unwrap_or_default();
-            if state.starts_with("idle") || state.is_empty() {
-                eprintln!("Error: No meeting in progress.");
-                std::process::exit(1);
+            let runtime_dir = config::Config::runtime_dir();
+            match meeting_phase(&runtime_dir).0 {
+                MeetingPhase::Idle => {
+                    eprintln!("Error: No meeting in progress.");
+                    std::process::exit(1);
+                }
+                MeetingPhase::Stopping => {
+                    println!("Meeting stop already requested.");
+                    return Ok(());
+                }
+                _ => {}
             }
 
             // Write stop trigger file
-            let stop_file = config::Config::runtime_dir().join("meeting_stop");
-            std::fs::write(&stop_file, "")?;
+            std::fs::write(runtime_dir.join("meeting_stop"), "")?;
 
             println!("Meeting stop requested.");
         }
@@ -147,22 +151,34 @@ pub(crate) async fn run_meeting_command(
         MeetingAction::Pause => {
             check_daemon_running()?;
 
-            // Check if meeting is active (not paused)
-            let meeting_state_file = config::Config::runtime_dir().join("meeting_state");
-            if !meeting_state_file.exists() {
-                eprintln!("Error: No meeting in progress.");
-                std::process::exit(1);
-            }
-
-            let state = std::fs::read_to_string(&meeting_state_file).unwrap_or_default();
-            if !state.starts_with("recording") {
-                eprintln!("Error: No active meeting to pause.");
-                std::process::exit(1);
+            let runtime_dir = config::Config::runtime_dir();
+            match meeting_phase(&runtime_dir).0 {
+                MeetingPhase::Recording => {}
+                MeetingPhase::Pausing => {
+                    println!("Meeting pause already requested.");
+                    return Ok(());
+                }
+                // Withdraw a resume the daemon has not acted on yet; if it
+                // already has, fall through and pause the resumed meeting.
+                MeetingPhase::Resuming
+                    if std::fs::remove_file(runtime_dir.join("meeting_resume")).is_ok() =>
+                {
+                    println!("Meeting pause requested.");
+                    return Ok(());
+                }
+                MeetingPhase::Resuming => {}
+                MeetingPhase::Idle => {
+                    eprintln!("Error: No meeting in progress.");
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("Error: No active meeting to pause.");
+                    std::process::exit(1);
+                }
             }
 
             // Write pause trigger file
-            let pause_file = config::Config::runtime_dir().join("meeting_pause");
-            std::fs::write(&pause_file, "")?;
+            std::fs::write(runtime_dir.join("meeting_pause"), "")?;
 
             println!("Meeting pause requested.");
         }
@@ -170,50 +186,44 @@ pub(crate) async fn run_meeting_command(
         MeetingAction::Resume => {
             check_daemon_running()?;
 
-            // Check if meeting is paused
-            let meeting_state_file = config::Config::runtime_dir().join("meeting_state");
-            if !meeting_state_file.exists() {
-                eprintln!("Error: No paused meeting to resume.");
-                std::process::exit(1);
-            }
-
-            let state = std::fs::read_to_string(&meeting_state_file).unwrap_or_default();
-            if !state.starts_with("paused") {
-                eprintln!("Error: No paused meeting to resume.");
-                std::process::exit(1);
+            let runtime_dir = config::Config::runtime_dir();
+            match meeting_phase(&runtime_dir).0 {
+                MeetingPhase::Paused => {}
+                MeetingPhase::Resuming => {
+                    println!("Meeting resume already requested.");
+                    return Ok(());
+                }
+                // Withdraw a pause the daemon has not acted on yet; if it
+                // already has, fall through and resume.
+                MeetingPhase::Pausing
+                    if std::fs::remove_file(runtime_dir.join("meeting_pause")).is_ok() =>
+                {
+                    println!("Meeting resume requested.");
+                    return Ok(());
+                }
+                MeetingPhase::Pausing => {}
+                _ => {
+                    eprintln!("Error: No paused meeting to resume.");
+                    std::process::exit(1);
+                }
             }
 
             // Write resume trigger file
-            let resume_file = config::Config::runtime_dir().join("meeting_resume");
-            std::fs::write(&resume_file, "")?;
+            std::fs::write(runtime_dir.join("meeting_resume"), "")?;
 
             println!("Meeting resume requested.");
         }
 
         MeetingAction::Status => {
-            // Read meeting state file
-            let meeting_state_file = config::Config::runtime_dir().join("meeting_state");
-            if !meeting_state_file.exists() {
-                println!("No meeting currently in progress.");
-                println!();
-                println!("Use 'voxtype meeting list' to see past meetings.");
-                return Ok(());
-            }
-
-            let state = std::fs::read_to_string(&meeting_state_file).unwrap_or_default();
-            let lines: Vec<&str> = state.lines().collect();
-
-            if lines.is_empty() || lines[0] == "idle" {
+            let (phase, meeting_id) = meeting_phase(&config::Config::runtime_dir());
+            if phase == MeetingPhase::Idle {
                 println!("No meeting currently in progress.");
                 println!();
                 println!("Use 'voxtype meeting list' to see past meetings.");
             } else {
-                let status = lines[0];
-                let meeting_id = lines.get(1).unwrap_or(&"");
-
-                println!("Meeting Status: {}", status);
-                if !meeting_id.is_empty() {
-                    println!("Meeting ID: {}", meeting_id);
+                println!("Meeting Status: {}", phase.as_str());
+                if let Some(id) = meeting_id {
+                    println!("Meeting ID: {}", id);
                 }
             }
         }
@@ -514,4 +524,193 @@ pub(crate) async fn run_meeting_command(
     }
 
     Ok(())
+}
+
+/// Where a meeting is, as the CLI sees it: the daemon's `meeting_state` file
+/// plus any trigger the daemon has not acted on yet.
+///
+/// The daemon handles triggers between meeting chunks, so while it is
+/// transcribing one a request can wait on disk for seconds. Counting pending
+/// triggers keeps `status` and the next command in step with what was asked,
+/// instead of reporting the state from before the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeetingPhase {
+    Idle,
+    Starting,
+    Recording,
+    Pausing,
+    Paused,
+    Resuming,
+    Stopping,
+}
+
+impl MeetingPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            MeetingPhase::Idle => "idle",
+            MeetingPhase::Starting => "starting",
+            MeetingPhase::Recording => "recording",
+            MeetingPhase::Pausing => "pausing",
+            MeetingPhase::Paused => "paused",
+            MeetingPhase::Resuming => "resuming",
+            MeetingPhase::Stopping => "stopping",
+        }
+    }
+}
+
+/// The daemon's own view, from `meeting_state`: Idle, Recording or Paused.
+fn base_meeting_state(runtime_dir: &std::path::Path) -> (MeetingPhase, Option<String>) {
+    let state = std::fs::read_to_string(runtime_dir.join("meeting_state")).unwrap_or_default();
+    let mut lines = state.lines();
+    let phase = match lines.next().map(str::trim) {
+        Some("recording") => MeetingPhase::Recording,
+        Some("paused") => MeetingPhase::Paused,
+        _ => return (MeetingPhase::Idle, None),
+    };
+    let id = lines
+        .next()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    (phase, id)
+}
+
+fn meeting_phase(runtime_dir: &std::path::Path) -> (MeetingPhase, Option<String>) {
+    let pending = |name: &str| runtime_dir.join(name).exists();
+    let (base, id) = base_meeting_state(runtime_dir);
+    let phase = match base {
+        MeetingPhase::Idle if pending("meeting_start") => MeetingPhase::Starting,
+        MeetingPhase::Recording | MeetingPhase::Paused if pending("meeting_stop") => {
+            MeetingPhase::Stopping
+        }
+        MeetingPhase::Recording if pending("meeting_pause") => MeetingPhase::Pausing,
+        MeetingPhase::Paused if pending("meeting_resume") => MeetingPhase::Resuming,
+        other => other,
+    };
+    (phase, id)
+}
+
+/// Create the meeting start trigger with `title` as its content, unless one
+/// already exists. Returns `false` when another start got there first.
+///
+/// The content is written to a private file and hard-linked into place, so
+/// the daemon can never read the trigger before its title is in it.
+fn claim_start_trigger(start_file: &std::path::Path, title: &str) -> std::io::Result<bool> {
+    static STAGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let staged = start_file.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&staged, title)?;
+    let linked = std::fs::hard_link(&staged, start_file);
+    let _ = std::fs::remove_file(&staged);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // A filesystem without hard links: claim with an exclusive create.
+        Err(_) => match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(start_file)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(title.as_bytes())?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+fn refuse_start() -> ! {
+    eprintln!("Error: A meeting is already in progress.");
+    eprintln!("Use 'voxtype meeting stop' to end it first.");
+    std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn touch(dir: &std::path::Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn a_pending_start_reads_as_starting() {
+        let dir = runtime();
+        assert_eq!(meeting_phase(dir.path()).0, MeetingPhase::Idle);
+        touch(dir.path(), "meeting_state", "idle");
+        touch(dir.path(), "meeting_start", "Standup");
+        assert_eq!(meeting_phase(dir.path()).0, MeetingPhase::Starting);
+    }
+
+    #[test]
+    fn pending_pause_and_resume_show_before_the_daemon_acts() {
+        let dir = runtime();
+        touch(dir.path(), "meeting_state", "recording\nabc-123");
+        touch(dir.path(), "meeting_pause", "");
+        assert_eq!(
+            meeting_phase(dir.path()),
+            (MeetingPhase::Pausing, Some("abc-123".to_string()))
+        );
+
+        std::fs::remove_file(dir.path().join("meeting_pause")).unwrap();
+        touch(dir.path(), "meeting_state", "paused\nabc-123");
+        touch(dir.path(), "meeting_resume", "");
+        assert_eq!(meeting_phase(dir.path()).0, MeetingPhase::Resuming);
+
+        touch(dir.path(), "meeting_stop", "");
+        assert_eq!(meeting_phase(dir.path()).0, MeetingPhase::Stopping);
+    }
+
+    #[test]
+    fn triggers_that_cannot_apply_do_not_change_the_phase() {
+        let dir = runtime();
+        touch(dir.path(), "meeting_state", "idle");
+        touch(dir.path(), "meeting_stop", "");
+        touch(dir.path(), "meeting_pause", "");
+        assert_eq!(meeting_phase(dir.path()).0, MeetingPhase::Idle);
+
+        touch(dir.path(), "meeting_state", "recording\nabc");
+        touch(dir.path(), "meeting_start", "");
+        assert_eq!(meeting_phase(dir.path()).0, MeetingPhase::Stopping);
+        std::fs::remove_file(dir.path().join("meeting_stop")).unwrap();
+        std::fs::remove_file(dir.path().join("meeting_pause")).unwrap();
+        assert_eq!(meeting_phase(dir.path()).0, MeetingPhase::Recording);
+    }
+
+    #[test]
+    fn only_one_of_two_starts_claims_the_trigger() {
+        let dir = runtime();
+        let start = dir.path().join("meeting_start");
+        assert!(claim_start_trigger(&start, "First").unwrap());
+        assert!(!claim_start_trigger(&start, "Second").unwrap());
+        assert_eq!(std::fs::read_to_string(&start).unwrap(), "First");
+        // No staging files left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_starts_claim_exactly_once() {
+        let dir = runtime();
+        let start = dir.path().join("meeting_start");
+        let winners: usize = (0..8)
+            .map(|i| {
+                let start = start.clone();
+                std::thread::spawn(move || claim_start_trigger(&start, &format!("m{i}")).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap() as usize)
+            .sum();
+        assert_eq!(winners, 1);
+    }
 }

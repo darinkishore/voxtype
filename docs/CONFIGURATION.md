@@ -116,6 +116,7 @@ The main key to hold for recording. Must be a valid Linux evdev key name.
 - `MEDIA` - Media key (often a dedicated button on multimedia keyboards)
 - `RECORD` - Record key
 - `INSERT` - Insert key
+- `PRINTSCREEN` - Print Screen key (alias `SYSRQ`). Pair it with a modifier, since screenshot tools also see it
 - `HOME` - Home key
 - `END` - End key
 - `PAGEUP` - Page Up key
@@ -792,6 +793,26 @@ gpu_device = 1  # Use discrete GPU (skip integrated GPU at index 0)
 
 **How to find your GPU index:** Run `voxtype setup gpu` to see detected GPUs, or `vulkaninfo --summary` for Vulkan device indices.
 
+### gpu_wait_secs
+
+**Type:** Integer
+**Default:** `5`
+**Required:** No
+
+Seconds to wait at startup for the graphics driver to publish a DRM render node before loading the model anyway.
+
+whisper.cpp registers its compute backends once, at first model load, and never revisits that decision. A daemon started as part of your login session can win the race against the graphics driver: no GPU is enumerable yet, the model loads on CPU, and it stays on CPU for the life of the process even though the GPU is working a second later. The only recovery is `systemctl --user restart voxtype`.
+
+The wait is only spent when no render node exists, so a machine whose GPU is already up pays nothing. If the wait expires, voxtype logs a warning naming the fallback rather than failing over silently.
+
+Raise it if your GPU appears late in boot. Set it to `0` to skip the check entirely.
+
+**Example:**
+```toml
+[whisper]
+gpu_wait_secs = 15  # slow dGPU bind on this machine
+```
+
 ### context_window_optimization
 
 **Type:** Boolean
@@ -872,7 +893,6 @@ Enable eager input processing. When enabled, audio is split into chunks and tran
 model = "base.en"
 eager_processing = true
 eager_chunk_secs = 5.0    # 5 second chunks
-eager_overlap_secs = 0.5  # 0.5 second overlap
 ```
 
 **CLI override:**
@@ -880,7 +900,7 @@ eager_overlap_secs = 0.5  # 0.5 second overlap
 voxtype --eager-processing daemon
 ```
 
-**Note:** Eager processing is experimental. There may be occasional word duplications or omissions at chunk boundaries.
+Voice activity detection applies to eager recordings the same way it applies to regular ones: a recording with no speech produces no output, and a chunk with no speech is skipped instead of transcribed.
 
 ### eager_chunk_secs
 
@@ -888,7 +908,7 @@ voxtype --eager-processing daemon
 **Default:** `5.0`
 **Required:** No
 
-Duration of each audio chunk in seconds when eager processing is enabled.
+Nominal duration of each audio chunk in seconds when eager processing is enabled. Each chunk ends at the quietest point in the last 1.5 seconds before this length (at most half a chunk), so cuts fall in the pauses between words. Chunks never overlap.
 
 **Example:**
 ```toml
@@ -912,20 +932,7 @@ voxtype --eager-processing --eager-chunk-secs 3.0 daemon
 **Default:** `0.5`
 **Required:** No
 
-Overlap duration in seconds between adjacent chunks when eager processing is enabled. Overlap helps catch words that span chunk boundaries.
-
-**Example:**
-```toml
-[whisper]
-eager_processing = true
-eager_chunk_secs = 5.0
-eager_overlap_secs = 1.0  # More overlap for better boundary handling
-```
-
-**CLI override:**
-```bash
-voxtype --eager-processing --eager-overlap-secs 1.0 daemon
-```
+No longer used. Earlier versions overlapped adjacent chunks by this much and removed duplicated words where they met, which could drop a word you really said twice and still left duplicates when punctuation differed. Chunks are now cut at a quiet point and never overlap. The setting is still accepted, so existing configs keep working, but it has no effect.
 
 **Trade-offs:**
 - More overlap: Better word boundary handling, slightly more processing
@@ -1013,7 +1020,7 @@ voxtype --initial-prompt "Discussion about Kubernetes and Terraform" daemon
 **Default:** None (disabled)
 **Required:** No
 
-A secondary Whisper model that can be triggered on-demand using the `model_modifier` hotkey or the `--model` CLI flag. Useful for having a fast model for everyday use and a more accurate model available when needed.
+A secondary model that can be triggered on-demand using the `model_modifier` hotkey or the `--model` CLI flag. Useful for having a fast model for everyday use and a more accurate model available when needed. It usually names a Whisper model, but any engine's model works (for example a Whisper model as the fallback for a Parakeet setup); a model from another engine is loaded alongside the default one.
 
 **Example:**
 ```toml
@@ -2185,16 +2192,16 @@ The `paste` mode is an alternative for non-US keyboard layouts. Instead of typin
 ### paste_keys
 
 **Type:** String
-**Default:** `"ctrl+v"`
+**Default:** `"shift+insert"` in the shipped `config.toml`; `"ctrl+v"` is the built-in fallback if the key is removed from the file entirely
 **Required:** No
 
-Keystroke to simulate for paste mode. Change this if your environment uses a different paste shortcut.
+Keystroke to simulate for paste mode. The shipped default is `shift+insert` because it pastes correctly in terminal emulators as well as GUI apps — many terminals bind `ctrl+v` to their own function (readline's literal-insert, a tmux/screen prefix, etc.) rather than treating it as paste. Change this if your environment uses a different paste shortcut.
 
 **Format:** `"modifier+key"` or `"modifier+modifier+key"` (case-insensitive)
 
 **Common values:**
-- `"ctrl+v"` - Standard paste (default)
-- `"shift+insert"` - Universal paste for Hyprland/Omarchy
+- `"shift+insert"` - Universal paste shortcut, works in terminals and GUI apps (shipped default)
+- `"ctrl+v"` - Standard GUI paste shortcut
 - `"ctrl+shift+v"` - Some terminal emulators
 
 **Example:**
@@ -2256,7 +2263,7 @@ restore_clipboard_delay_ms = 300  # Longer delay for slower systems
 **Default:** `true`
 **Required:** No
 
-When `true` and `mode = "type"`, falls back to clipboard if typing fails.
+When `true` and `mode = "type"`, falls back to clipboard if typing fails. With file output (`mode = "file"` or `--file`), a transcription that can't be written to the file goes to the clipboard instead.
 
 **Note:** This setting is ignored when `driver_order` is set, since the driver list explicitly defines what's tried.
 
@@ -2274,6 +2281,8 @@ fallback_to_clipboard = true  # Use clipboard if typing drivers fail
 **Required:** No
 
 Custom order of output drivers to try when `mode = "type"`. Each driver is tried in sequence until one succeeds. This allows you to prefer specific drivers or exclude others entirely.
+
+**Also applies to `mode = "paste"`:** paste mode uses this same setting for its keystroke-simulation step, filtered down to the drivers that can send a keystroke (`wtype`, `eitype`, `ydotool` — `dotool`/`clipboard`/`xclip` entries are ignored there). If `driver_order` doesn't name any of those three, paste mode falls back to `wtype → eitype → ydotool`. This matters for RDP/VNC clients under XWayland (e.g. `xfreerdp`): wtype uploads its own minimal XKB keymap, so its keycodes don't match what the remote session expects, and the paste keystroke can arrive as the wrong key entirely. `ydotool` sends real evdev keycodes and doesn't have this problem, so put it first for those clients: `driver_order = ["ydotool", "wtype"]`.
 
 **Available drivers:**
 - `wtype` - Wayland virtual keyboard protocol (best CJK/Unicode support, wlroots compositors only)
@@ -2584,6 +2593,8 @@ file_path = "~/transcriptions/output.txt"
 
 **Note:** Parent directories are created automatically if they don't exist.
 
+If the file can't be written (a read-only directory, say), the transcription goes to the clipboard instead when `fallback_to_clipboard = true` (the default), and a notification names the path that failed. With `fallback_to_clipboard = false`, the notification says the transcription wasn't saved. `pre_output_command` and `post_output_command` run around file output the same as for every other mode, so a compositor submap entered for the recording is always reset.
+
 ### file_mode
 
 **Type:** String
@@ -2650,6 +2661,16 @@ on_recording_start = true   # Notify when PTT activates
 on_recording_stop = true    # Notify when transcribing
 on_transcription = true     # Show transcribed text
 ```
+
+### on_no_speech
+
+**Type:** Boolean
+**Default:** `true`
+**Required:** No
+
+When `true`, shows a notification when voice activity detection finds no speech in a recording and discards it. Without it, a discarded dictation looks the same as a hang: you stop recording and nothing happens. Turn it off if you often tap the hotkey without speaking and don't want the notice.
+
+If you see this notification while you were speaking, your microphone level is probably too low. Raise the input volume, or lower `[vad] threshold`.
 
 ### urgency
 
@@ -2881,9 +2902,19 @@ the transcribed text on stdin and should output the processed text on stdout.
 
 **Type:** String
 **Default:** None (disabled)
-**Required:** Yes (if section is present)
 
 The shell command to execute. Text is piped to stdin, processed text read from stdout.
+An empty or missing command turns post-processing off, so the section can hold
+`trim` or `fallback_on_empty` on its own.
+
+Every option in this section can be set from the command line:
+
+```bash
+voxtype config set output.post_process.command "sed 's/uh, //g'"
+voxtype config set output.post_process.trim false
+voxtype config set output.post_process.fallback_on_empty false
+voxtype config set output.post_process.timeout_ms 10000
+```
 
 **Examples:**
 ```toml
@@ -3301,6 +3332,8 @@ Speech detection sensitivity threshold. Lower values are more sensitive (detect 
 - `0.0` - Very sensitive, may detect background noise as speech
 - `0.5` - Balanced, filters silence while allowing normal speech (default)
 - `1.0` - Aggressive, requires loud clear speech
+
+With the energy backend (`backend = "energy"`, or `"auto"` with a non-Whisper engine), this is an upper bound rather than a fixed level. Each recording's own background noise is measured, and when speech three times louder than that noise (about 10 dB) is below the configured level, the lower bar is used, down to at most a tenth of the configured level. A quiet or low-gain microphone therefore still detects speech, a loud one behaves exactly as the setting says, and a high setting chosen to ignore quiet background speech still does so in a quiet room. Only sustained sound counts: runs of at least 60 ms, so keyboard clicks don't pass as speech.
 
 **Example:**
 ```toml
@@ -4175,9 +4208,26 @@ packages under `/usr/share/voxtype/osd/` and recipe presets under
 [`examples/osd-packages/`](../examples/osd-packages/) (full packages,
 including the `aegis-hud` custom-QML showcase) and
 [`examples/osd-recipes/`](../examples/osd-recipes/) (recipe presets).
-Recipes are plain `[osd]` config snippets, not packages: open one and copy
-the `[osd.frame]` and `[[osd.visual.layers]]` keys you want into your own
-config. Each example package ships a README covering what it looks like, how
+Recipes are plain `[osd]` config snippets, not packages. Apply one with
+`voxtype setup osd --recipe <name>` rather than copying its keys by hand: the
+recipe's keys replace the matching ones in your config (its
+`[[osd.visual.layers]]` replace your layers wholesale), `[osd]` keys the
+recipe doesn't set are kept, comments are preserved, and the result is
+validated before it is written. Hand-copying a recipe into a config that
+already has `[osd]` is an easy way to end up with a duplicate `[osd]` table
+the daemon refuses to load.
+
+```bash
+voxtype setup osd --list                                # installed recipes
+voxtype setup osd --recipe showcase-bars --dry-run      # preview
+voxtype setup osd --recipe showcase-bars                # apply
+voxtype setup osd --recipe ./my-recipe.toml             # apply a file
+```
+
+Recipe names resolve against `~/.config/voxtype/osd-recipes/`,
+`~/.local/share/voxtype/osd-recipes/`, then `/usr/share/voxtype/osd-recipes/`,
+so a user copy shadows a shipped one. Each changed key is printed with its
+previous value, which is what you set back to revert. Each example package ships a README covering what it looks like, how
 to run it standalone, and which manifest fields it uses; the
 [aegis-hud README](../examples/osd-packages/aegis-hud/README.md) is the
 reference for documenting your own package.

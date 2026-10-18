@@ -22,6 +22,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const VOXTYPE_LIB_DIR: &str = "/usr/lib/voxtype";
 const VOXTYPE_BIN: &str = "/usr/bin/voxtype";
@@ -239,6 +240,16 @@ impl GpuVendor {
             GpuVendor::Other => "Other",
         }
     }
+
+    /// The `VOXTYPE_VULKAN_DEVICE` value that selects this vendor.
+    fn env_value(&self) -> Option<&'static str> {
+        match self {
+            GpuVendor::Nvidia => Some("nvidia"),
+            GpuVendor::Amd => Some("amd"),
+            GpuVendor::Intel => Some("intel"),
+            GpuVendor::Other => None,
+        }
+    }
 }
 
 /// Information about a detected GPU
@@ -408,6 +419,83 @@ pub fn detect_gpu() -> Option<String> {
 }
 
 /// Parse VOXTYPE_VULKAN_DEVICE environment variable and return the appropriate vendor
+/// Status and hints for choosing among several GPUs, naming only vendors that
+/// are actually installed. A vendor that `VOXTYPE_VULKAN_DEVICE` asks for but
+/// no detected GPU matches is reported as auto, because that is what the
+/// Whisper device resolution falls back to.
+fn gpu_selection_advice(vendors: &[GpuVendor], selected: Option<GpuVendor>) -> Vec<String> {
+    let mut present: Vec<GpuVendor> = Vec::new();
+    for v in vendors {
+        if v.env_value().is_some() && !present.contains(v) {
+            present.push(*v);
+        }
+    }
+
+    match selected {
+        Some(v) if present.contains(&v) => {
+            return vec![format!(
+                "GPU selection: {} (via VOXTYPE_VULKAN_DEVICE)",
+                v.display_name()
+            )];
+        }
+        Some(v) => {
+            return vec![
+                "GPU selection: auto (first available)".to_string(),
+                format!(
+                    "  VOXTYPE_VULKAN_DEVICE asks for {0}, but no {0} GPU was detected",
+                    v.display_name()
+                ),
+            ];
+        }
+        None => {}
+    }
+
+    let mut lines = vec![
+        "GPU selection: auto (first available)".to_string(),
+        String::new(),
+    ];
+    if present.len() > 1 {
+        lines.push("Multiple GPUs detected. To select one by vendor, set:".to_string());
+        for v in &present {
+            let env = v.env_value().unwrap_or_default();
+            lines.push(format!(
+                "  VOXTYPE_VULKAN_DEVICE={:<8} # Use {} GPU",
+                env,
+                v.display_name()
+            ));
+        }
+        // Prefer a discrete vendor for the example; Intel is usually the iGPU.
+        let example = present
+            .iter()
+            .find(|v| **v != GpuVendor::Intel)
+            .unwrap_or(&present[0])
+            .env_value()
+            .unwrap_or_default();
+        lines.push(String::new());
+        lines.push(
+            "For systemd, create ~/.config/systemd/user/voxtype.service.d/gpu.conf:".to_string(),
+        );
+        lines.push("  [Service]".to_string());
+        lines.push(format!(
+            "  Environment=\"VOXTYPE_VULKAN_DEVICE={}\"",
+            example
+        ));
+    } else {
+        let name = present
+            .first()
+            .map(|v| v.display_name())
+            .unwrap_or("the same vendor");
+        lines.push(format!(
+            "All detected GPUs are {}, so a vendor name can't tell them apart. Pick one by",
+            name
+        ));
+        lines.push("Vulkan device index instead (see `vulkaninfo --summary`):".to_string());
+        lines.push("  [whisper]".to_string());
+        lines.push("  gpu_device = 1".to_string());
+    }
+    lines
+}
+
 pub fn get_selected_gpu_vendor() -> Option<GpuVendor> {
     std::env::var("VOXTYPE_VULKAN_DEVICE")
         .ok()
@@ -417,6 +505,136 @@ pub fn get_selected_gpu_vendor() -> Option<GpuVendor> {
             "intel" => Some(GpuVendor::Intel),
             _ => None,
         })
+}
+
+/// Vulkan devices as ggml sees them: index and reported device name.
+///
+/// Shells out to `vulkaninfo --summary` because we have no Vulkan bindings of
+/// our own and adding some to answer one question would be a large dependency
+/// for a small job. Returns empty when vulkan-tools is not installed, which is
+/// common enough that callers must treat it as "unknown", never as "no GPU".
+pub fn enumerate_vulkan_devices() -> Vec<(i32, String)> {
+    let Ok(out) = Command::new("vulkaninfo").arg("--summary").output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_vulkan_summary(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pull `(index, deviceName)` pairs out of `vulkaninfo --summary` output.
+///
+/// Split from the command invocation so the parsing can be tested against
+/// captured output rather than whatever hardware the test happens to run on.
+fn parse_vulkan_summary(text: &str) -> Vec<(i32, String)> {
+    let mut devices = Vec::new();
+    let mut current: Option<i32> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("GPU") {
+            if let Ok(idx) = rest.trim_end_matches(':').parse::<i32>() {
+                current = Some(idx);
+            }
+        } else if let Some(name) = trimmed.strip_prefix("deviceName") {
+            if let Some(idx) = current.take() {
+                let name = name.trim_start_matches([' ', '=']).trim().to_string();
+                devices.push((idx, name));
+            }
+        }
+    }
+    devices
+}
+
+/// Lowest device index whose name matches `vendor`.
+fn pick_vendor_index(devices: &[(i32, String)], vendor: GpuVendor) -> Option<i32> {
+    let needles: &[&str] = match vendor {
+        GpuVendor::Nvidia => &["nvidia", "geforce", "rtx", "quadro"],
+        GpuVendor::Amd => &["amd", "radeon"],
+        GpuVendor::Intel => &["intel"],
+        GpuVendor::Other => return None,
+    };
+    devices
+        .iter()
+        .filter(|(_, name)| {
+            let lower = name.to_lowercase();
+            needles.iter().any(|n| lower.contains(n))
+        })
+        .map(|(idx, _)| *idx)
+        .min()
+}
+
+/// The Vulkan device index matching a vendor, if one can be identified.
+///
+/// `VOXTYPE_VULKAN_DEVICE` sets `VK_LOADER_DRIVERS_SELECT`, which asks the
+/// loader to expose only that vendor's driver. That does not work everywhere:
+/// it needs a recent loader, and on a hybrid machine whisper.cpp has still
+/// been observed initialising device 0 (the iGPU) regardless, while setting
+/// `gpu_device` by hand works. Resolving the vendor to an index lets us set
+/// the thing that actually takes effect (#577).
+///
+/// Returns the lowest matching index, so a machine with two devices from the
+/// same vendor gets the discrete one that Vulkan enumerates first.
+pub fn resolve_vulkan_device_index(vendor: GpuVendor) -> Option<i32> {
+    pick_vendor_index(&enumerate_vulkan_devices(), vendor)
+}
+
+/// Whether the kernel has published a DRM render node yet.
+///
+/// This is the thing that is actually missing during the race in #611: the
+/// daemon starts as part of the login session and `amdgpu` has not finished
+/// binding `/dev/dri/renderD128`, so Vulkan enumerates zero devices. Checking
+/// for the node is cheap and needs nothing installed, unlike `vulkaninfo`,
+/// which many systems do not have and which costs a process spawn.
+///
+/// It is a proxy, not a proof: a present render node does not guarantee a
+/// working ICD. It is the right proxy for the reported failure, and being
+/// wrong in the optimistic direction just means behaving as we do today.
+pub fn render_node_present() -> bool {
+    let Ok(entries) = std::fs::read_dir("/dev/dri") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("renderD"))
+    })
+}
+
+/// Block until a DRM render node appears, up to `timeout`.
+///
+/// Returns `true` if one is present by the time we give up waiting. Returns
+/// immediately when a node already exists, which is the normal case, so a
+/// machine whose GPU is up pays nothing for this.
+///
+/// Call before the first model load. whisper.cpp/ggml registers its compute
+/// backends once per process, so a GPU that shows up after that point cannot
+/// be used at all until the daemon restarts (#611).
+pub fn wait_for_render_node(timeout: Duration) -> bool {
+    if render_node_present() {
+        return true;
+    }
+    if timeout.is_zero() {
+        return false;
+    }
+
+    tracing::info!(
+        "No DRM render node yet; waiting up to {}s for the GPU driver before \
+         loading the model. ggml picks its backends once, so a GPU that \
+         appears after this point cannot be used until restart.",
+        timeout.as_secs()
+    );
+
+    let deadline = Instant::now() + timeout;
+    let poll = Duration::from_millis(100);
+    while Instant::now() < deadline {
+        std::thread::sleep(poll);
+        if render_node_present() {
+            tracing::info!("GPU render node appeared; continuing with model load");
+            return true;
+        }
+    }
+    false
 }
 
 /// Apply GPU selection environment variables based on VOXTYPE_VULKAN_DEVICE
@@ -436,7 +654,26 @@ pub fn apply_gpu_selection() -> Option<GpuVendor> {
 
 /// Check if Vulkan runtime is available
 pub fn check_vulkan_runtime() -> bool {
-    // Check for vulkan ICD loader
+    // Ask the dynamic loader, which answers the question we actually care
+    // about — can this process load Vulkan — rather than guessing at paths.
+    //
+    // The previous implementation checked three FHS locations. NixOS is not
+    // FHS-compliant and keeps libvulkan in the store, so it reported "Vulkan
+    // runtime not found" on machines where Vulkan worked perfectly well
+    // (#430). Guix, and anyone using a non-standard prefix or
+    // LD_LIBRARY_PATH, had the same problem.
+    unsafe {
+        let name = c"libvulkan.so.1";
+        let handle = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY);
+        if !handle.is_null() {
+            libc::dlclose(handle);
+            return true;
+        }
+    }
+
+    // Fall back to the path check. dlopen can fail in a sandbox that permits
+    // the file but not the mapping, and a present library is still worth
+    // reporting as available.
     let vulkan_paths = [
         "/usr/lib/libvulkan.so.1",
         "/usr/lib64/libvulkan.so.1",
@@ -824,22 +1061,9 @@ pub fn show_status() {
         // Show GPU selection status if multiple GPUs
         if gpus.len() > 1 {
             println!();
-            if let Some(selected) = get_selected_gpu_vendor() {
-                println!(
-                    "GPU selection: {} (via VOXTYPE_VULKAN_DEVICE)",
-                    selected.display_name()
-                );
-            } else {
-                println!("GPU selection: auto (first available)");
-                println!();
-                println!("Multiple GPUs detected. To select a specific GPU, set:");
-                println!("  VOXTYPE_VULKAN_DEVICE=nvidia   # Use NVIDIA GPU");
-                println!("  VOXTYPE_VULKAN_DEVICE=amd      # Use AMD GPU");
-                println!("  VOXTYPE_VULKAN_DEVICE=intel    # Use Intel GPU");
-                println!();
-                println!("For systemd, create ~/.config/systemd/user/voxtype.service.d/gpu.conf:");
-                println!("  [Service]");
-                println!("  Environment=\"VOXTYPE_VULKAN_DEVICE=nvidia\"");
+            let vendors: Vec<GpuVendor> = gpus.iter().map(|g| g.vendor).collect();
+            for line in gpu_selection_advice(&vendors, get_selected_gpu_vendor()) {
+                println!("{}", line);
             }
         }
     }
@@ -991,7 +1215,7 @@ pub fn enable() -> anyhow::Result<()> {
             )
         })?;
 
-        switch_backend_tiered_parakeet(backend_binary)?;
+        switch_backend_tiered_parakeet(backend_binary, "setup gpu --enable")?;
 
         // Regenerate systemd service if it exists
         if super::systemd::regenerate_service_file()? {
@@ -1059,7 +1283,7 @@ pub fn disable() -> anyhow::Result<()> {
         // ONNX mode: switch to best ONNX CPU backend
         let best_backend = detect_best_parakeet_cpu_backend();
         if let Some(backend_name) = best_backend {
-            switch_backend_tiered_parakeet(backend_name)?;
+            switch_backend_tiered_parakeet(backend_name, "setup gpu --disable")?;
             println!(
                 "Switched to ONNX ({}) backend.",
                 backend_name
@@ -1147,8 +1371,10 @@ fn detect_best_parakeet_cpu_backend() -> Option<&'static str> {
     find_binary("voxtype-onnx-avx2", "voxtype-parakeet-avx2")
 }
 
-/// Switch to an ONNX backend binary (tiered mode)
-fn switch_backend_tiered_parakeet(binary_name: &str) -> anyhow::Result<()> {
+/// Switch to an ONNX backend binary (tiered mode). `retry_hint` is the
+/// command suggested if the install needs root, so it must name the command
+/// the user actually ran (#449).
+fn switch_backend_tiered_parakeet(binary_name: &str, retry_hint: &str) -> anyhow::Result<()> {
     let binary_path = Path::new(VOXTYPE_LIB_DIR).join(binary_name);
     let active_bin = get_active_binary_path();
 
@@ -1160,11 +1386,177 @@ fn switch_backend_tiered_parakeet(binary_name: &str) -> anyhow::Result<()> {
         );
     }
 
-    install_active_binary(active_bin, &binary_path, "setup onnx --enable")
+    install_active_binary(active_bin, &binary_path, retry_hint)
 }
 
 #[cfg(test)]
 mod tests {
+
+    fn advice(vendors: &[super::GpuVendor], selected: Option<super::GpuVendor>) -> String {
+        super::gpu_selection_advice(vendors, selected).join("\n")
+    }
+
+    /// An AMD dGPU + AMD iGPU box was told to set VOXTYPE_VULKAN_DEVICE=nvidia.
+    #[test]
+    fn single_vendor_box_is_steered_to_gpu_device_not_absent_vendors() {
+        use super::GpuVendor::Amd;
+        let text = advice(&[Amd, Amd], None);
+        assert!(!text.to_lowercase().contains("nvidia"), "{text}");
+        assert!(!text.to_lowercase().contains("intel"), "{text}");
+        assert!(text.contains("gpu_device"), "{text}");
+    }
+
+    #[test]
+    fn hybrid_laptop_lists_its_two_vendors_and_prefers_the_discrete_one() {
+        use super::GpuVendor::{Intel, Nvidia};
+        let text = advice(&[Intel, Nvidia], None);
+        assert!(text.contains("VOXTYPE_VULKAN_DEVICE=intel"), "{text}");
+        assert!(text.contains("VOXTYPE_VULKAN_DEVICE=nvidia"), "{text}");
+        assert!(!text.contains("=amd"), "{text}");
+        assert!(
+            text.contains("Environment=\"VOXTYPE_VULKAN_DEVICE=nvidia\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_selection_is_only_claimed_when_that_vendor_exists() {
+        use super::GpuVendor::{Amd, Nvidia};
+        assert_eq!(
+            advice(&[Amd, Nvidia], Some(Nvidia)),
+            "GPU selection: NVIDIA (via VOXTYPE_VULKAN_DEVICE)"
+        );
+        let absent = advice(&[Amd, Amd], Some(Nvidia));
+        assert!(absent.starts_with("GPU selection: auto"), "{absent}");
+        assert!(absent.contains("no NVIDIA GPU was detected"), "{absent}");
+    }
+
+    /// #611: the wait exists to cover a driver that binds a second or two
+    /// after the daemon starts. It must not turn into a startup stall on a
+    /// machine that genuinely has no GPU, and it must cost nothing on a
+    /// machine whose GPU is already up.
+    #[test]
+    fn render_node_wait_returns_immediately_when_disabled() {
+        let start = Instant::now();
+        let found = wait_for_render_node(Duration::ZERO);
+        assert_eq!(
+            found,
+            render_node_present(),
+            "a zero timeout must report the current state, not a guess"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "gpu_wait_secs = 0 must not sleep"
+        );
+    }
+
+    /// A present node short-circuits before any sleeping, so the common case
+    /// on a working desktop adds no startup latency at all.
+    #[test]
+    fn render_node_wait_is_free_when_the_gpu_is_already_up() {
+        if !render_node_present() {
+            // No GPU on this runner; the timing claim is only meaningful when
+            // there is a node to find.
+            return;
+        }
+        let start = Instant::now();
+        assert!(wait_for_render_node(Duration::from_secs(30)));
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "an existing render node must be detected without waiting"
+        );
+    }
+
+    /// The probe reads a directory that may not exist at all (containers, a
+    /// headless build box). It must answer false rather than propagate an
+    /// error into the startup path.
+    #[test]
+    fn render_node_probe_tolerates_a_missing_dev_dri() {
+        let _ = render_node_present();
+    }
+
+    /// #430: detection must agree with the loader, not with FHS layout.
+    /// This machine has Vulkan, so the probe must find it; the value of the
+    /// test is that it fails loudly if the probe regresses to path guessing
+    /// on a system where the paths happen to be absent.
+    #[test]
+    fn vulkan_detection_matches_the_loader() {
+        let via_loader = unsafe {
+            let name = c"libvulkan.so.1";
+            let h = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY);
+            let found = !h.is_null();
+            if found {
+                libc::dlclose(h);
+            }
+            found
+        };
+        if via_loader {
+            assert!(
+                check_vulkan_runtime(),
+                "the loader can open libvulkan but check_vulkan_runtime says otherwise"
+            );
+        }
+    }
+
+    /// #577: the vendor must resolve to the index whisper actually uses.
+    /// Parsing is pinned against real `vulkaninfo --summary` output.
+    #[test]
+    fn vulkan_summary_parsing_pairs_index_with_name() {
+        // Shape taken verbatim from vulkaninfo on a two-device machine.
+        let sample = "\
+Devices:
+========
+GPU0:
+\tapiVersion         = 1.4.305
+\tdriverVersion      = 25.0.3
+\tdeviceName         = AMD Radeon RX 7800 XT (RADV NAVI32)
+\tdriverName         = radv
+GPU1:
+\tapiVersion         = 1.4.305
+\tdeviceName         = AMD Ryzen 9 9900X3D 12-Core Processor (RADV RAPHAEL_MENDOCINO)
+\tdriverName         = radv
+";
+        let devices = parse_vulkan_summary(sample);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].0, 0);
+        assert!(devices[0].1.contains("RX 7800 XT"));
+        assert_eq!(devices[1].0, 1);
+    }
+
+    /// A hybrid machine: the vendor must map to its own device, not device 0.
+    #[test]
+    fn vendor_matches_the_right_device_on_a_hybrid_machine() {
+        let sample = "\
+GPU0:
+\tdeviceName         = Intel(R) UHD Graphics 630
+GPU1:
+\tdeviceName         = NVIDIA GeForce RTX 3060 Laptop GPU
+";
+        let devices = parse_vulkan_summary(sample);
+        assert_eq!(pick_vendor_index(&devices, GpuVendor::Nvidia), Some(1));
+        assert_eq!(pick_vendor_index(&devices, GpuVendor::Intel), Some(0));
+        assert_eq!(pick_vendor_index(&devices, GpuVendor::Amd), None);
+    }
+
+    /// Two devices from one vendor: take the first, which Vulkan enumerates
+    /// as the discrete one.
+    #[test]
+    fn same_vendor_twice_picks_the_lowest_index() {
+        let sample = "\
+GPU0:
+\tdeviceName         = AMD Radeon RX 7800 XT
+GPU1:
+\tdeviceName         = AMD Ryzen 9 Integrated Graphics
+";
+        let devices = parse_vulkan_summary(sample);
+        assert_eq!(pick_vendor_index(&devices, GpuVendor::Amd), Some(0));
+    }
+
+    /// vulkan-tools missing must read as "unknown", never as "no GPU".
+    #[test]
+    fn empty_enumeration_yields_no_selection() {
+        assert_eq!(pick_vendor_index(&[], GpuVendor::Nvidia), None);
+    }
     use super::*;
 
     #[test]
