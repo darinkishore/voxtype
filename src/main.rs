@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Check if this is the worker command (needs stderr-only logging)
-    let is_worker = matches!(cli.command, Some(Commands::TranscribeWorker { .. }));
+    let is_worker = matches!(cli.command, Some(Commands::TranscribeWorker { .. } | Commands::Transcribe { json: true, .. }));
 
     // Initialize logging
     let log_level = if cli.quiet {

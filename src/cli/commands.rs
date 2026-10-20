@@ -31,6 +31,10 @@ pub enum Commands {
             long_help = format!("Override transcription engine: {}", super::ENGINE_NAMES_CSV),
         )]
         engine: Option<String>,
+
+        /// Write one JSON object to stdout; diagnostics go to stderr
+        #[arg(long)]
+        json: bool,
     },
 
     /// Internal: Worker process for GPU-isolated transcription

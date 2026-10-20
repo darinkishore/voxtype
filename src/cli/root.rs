@@ -651,10 +651,16 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn test_transcribe_json_flag() {
+        let cli = Cli::parse_from(["voxtype", "transcribe", "test.wav", "--json"]);
+        assert!(matches!(cli.command, Some(Commands::Transcribe { json: true, .. })));
+    }
+
+    #[test]
     fn test_transcribe_engine_flag() {
         let cli = Cli::parse_from(["voxtype", "transcribe", "test.wav", "--engine", "moonshine"]);
         match cli.command {
-            Some(Commands::Transcribe { file, engine }) => {
+            Some(Commands::Transcribe { file, engine, .. }) => {
                 assert_eq!(file, std::path::PathBuf::from("test.wav"));
                 assert_eq!(engine, Some("moonshine".to_string()));
             }

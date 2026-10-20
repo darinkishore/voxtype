@@ -8,15 +8,15 @@ use std::path::PathBuf;
 use voxtype::{config, transcribe, vad};
 
 /// Transcribe an audio file
-pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow::Result<()> {
+pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf, json: bool) -> anyhow::Result<()> {
     use hound::WavReader;
 
-    println!("Loading audio file: {:?}", path);
+    eprintln!("Loading audio file: {:?}", path);
 
     let reader = WavReader::open(path)?;
     let spec = reader.spec();
 
-    println!(
+    eprintln!(
         "Audio format: {} Hz, {} channel(s), {:?}",
         spec.sample_rate, spec.channels, spec.sample_format
     );
@@ -49,13 +49,13 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow
 
     // Resample to 16kHz if needed
     let final_samples = if spec.sample_rate != 16000 {
-        println!("Resampling from {} Hz to 16000 Hz...", spec.sample_rate);
+        eprintln!("Resampling from {} Hz to 16000 Hz...", spec.sample_rate);
         voxtype::audio::resampler::resample_buffer(&mono_samples, spec.sample_rate, 16000)
     } else {
         mono_samples
     };
 
-    println!(
+    eprintln!(
         "Processing {} samples ({:.2}s)...",
         final_samples.len(),
         final_samples.len() as f32 / 16000.0
@@ -65,13 +65,14 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow
     if let Ok(Some(vad)) = vad::create_vad(config) {
         match vad.detect(&final_samples) {
             Ok(result) => {
-                println!(
+                eprintln!(
                     "VAD: {:.2}s speech ({:.1}% of audio)",
                     result.speech_duration_secs,
                     result.speech_ratio * 100.0
                 );
                 if !result.has_speech {
-                    println!("No speech detected, skipping transcription.");
+                    eprintln!("No speech detected, skipping transcription.");
+                    write_transcript(config, "", json)?;
                     return Ok(());
                 }
             }
@@ -86,7 +87,24 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow
     let transcriber = transcribe::create_transcriber(config)?;
     let text = transcriber.transcribe(&final_samples)?;
 
-    println!("\n{}", process_transcript(config, &text));
+    write_transcript(config, &process_transcript(config, &text), json)?;
+    Ok(())
+}
+
+fn write_transcript(config: &config::Config, text: &str, json: bool) -> anyhow::Result<()> {
+    if json {
+        // No configuration dump: credentials and vocabulary stay private.
+        let model = if config.engine == config::TranscriptionEngine::OpenaiRealtime {
+            config.openai_realtime.as_ref().map(|c| c.model.as_str())
+        } else {
+            None
+        };
+        println!("{}", serde_json::to_string(&serde_json::json!({
+            "text": text, "engine": config.engine.to_string(), "model": model
+        }))?);
+    } else {
+        println!("\n{text}");
+    }
     Ok(())
 }
 
