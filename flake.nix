@@ -314,7 +314,7 @@
         alignmentPython = pkgs.python3.withPackages (ps: [ ps.whisperx ]);
         alignmentWeights = pkgs.fetchurl {
           url = "https://download.pytorch.org/torchaudio/models/wav2vec2_fairseq_base_ls960_asr_ls960.pth";
-          hash = "0pclijail48n1c4c21m8b5qrpyxrq5w44cs5r7zkhi78dpqx93s8";
+          sha256 = "0pclijail48n1c4c21m8b5qrpyxrq5w44cs5r7zkhi78dpqx93s8";
         };
         alignmentModelDir = pkgs.runCommand "voxtype-alignment-model" {} ''
           mkdir -p $out
