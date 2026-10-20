@@ -119,7 +119,7 @@ pub(crate) async fn dispatch(
             menubar::run(state_file);
         }
 
-        Commands::Transcribe { file, engine, json } => {
+        Commands::Transcribe { file, engine, json, file_model, timestamps } => {
             if let Some(engine_name) = engine {
                 match engine_name.parse::<config::TranscriptionEngine>() {
                     Ok(e) => config.engine = e,
@@ -133,7 +133,7 @@ pub(crate) async fn dispatch(
                     }
                 }
             }
-            transcribe_file(&config, &file, json)?;
+            transcribe_file(&config, &file, json, file_model.as_deref(), timestamps)?;
         }
 
         Commands::TranscribeWorker {

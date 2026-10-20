@@ -8,7 +8,13 @@ use std::path::PathBuf;
 use voxtype::{config, transcribe, vad};
 
 /// Transcribe an audio file
-pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf, json: bool) -> anyhow::Result<()> {
+pub(crate) fn transcribe_file(
+    config: &config::Config,
+    path: &PathBuf,
+    json: bool,
+    file_model: Option<&str>,
+    timestamps: bool,
+) -> anyhow::Result<()> {
     use hound::WavReader;
 
     eprintln!("Loading audio file: {:?}", path);
@@ -61,6 +67,28 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf, json: boo
         final_samples.len() as f32 / 16000.0
     );
 
+    if let Some(model) = file_model {
+        #[cfg(feature = "openai-realtime")]
+        {
+            let settings = config.openai_realtime.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("File transcription requires [openai_realtime] credentials/context")
+            })?;
+            let result =
+                super::file_transcription::run(settings, &final_samples, model, timestamps)?;
+            if json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                println!("{}", result.text);
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "openai-realtime"))]
+        {
+            let _ = (model, timestamps);
+            anyhow::bail!("File transcription requires the openai-realtime build feature");
+        }
+    }
+
     // Run VAD if enabled
     if let Ok(Some(vad)) = vad::create_vad(config) {
         match vad.detect(&final_samples) {
@@ -99,9 +127,12 @@ fn write_transcript(config: &config::Config, text: &str, json: bool) -> anyhow::
         } else {
             None
         };
-        println!("{}", serde_json::to_string(&serde_json::json!({
-            "text": text, "engine": config.engine.to_string(), "model": model
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "text": text, "engine": config.engine.to_string(), "model": model
+            }))?
+        );
     } else {
         println!("\n{text}");
     }

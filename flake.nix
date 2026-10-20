@@ -94,13 +94,14 @@
         ];
 
         # Wrap a package with runtime dependencies
-        wrapVoxtype = pkg: pkgs.symlinkJoin {
+        wrapVoxtype = wrapVoxtypeWith [];
+        wrapVoxtypeWith = extraRuntimeDeps: pkg: pkgs.symlinkJoin {
           name = "${pkg.pname or "voxtype"}-wrapped-${pkg.version}";
           paths = [ pkg ];
           buildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram $out/bin/voxtype \
-              --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
+              --prefix PATH : ${pkgs.lib.makeBinPath (runtimeDeps ++ extraRuntimeDeps)}
           '';
           inherit (pkg) meta;
         };
@@ -307,6 +308,26 @@
           features = [ "openai-realtime" ];
         };
 
+        # Timed file transcription uses the packaged acoustic aligner. Model
+        # weights and tokenizer data are fixed-output Nix inputs, not downloads
+        # at capture time. CPU inference avoids live NVIDIA version mismatches.
+        alignmentPython = pkgs.python3.withPackages (ps: [ ps.whisperx ]);
+        alignmentWeights = pkgs.fetchurl {
+          url = "https://download.pytorch.org/torchaudio/models/wav2vec2_fairseq_base_ls960_asr_ls960.pth";
+          hash = "0pclijail48n1c4c21m8b5qrpyxrq5w44cs5r7zkhi78dpqx93s8";
+        };
+        alignmentModelDir = pkgs.runCommand "voxtype-alignment-model" {} ''
+          mkdir -p $out
+          ln -s ${alignmentWeights} $out/wav2vec2_fairseq_base_ls960_asr_ls960.pth
+        '';
+        alignment = pkgs.writeShellScriptBin "voxtype-align" ''
+          export NLTK_DATA=${pkgs.nltk-data.punkt-tab}
+          export HF_HUB_OFFLINE=1
+          export OMP_NUM_THREADS=4
+          exec ${alignmentPython}/bin/python ${./scripts/alignment/align.py} \
+            --model-dir ${alignmentModelDir} "$@"
+        '';
+
         # OSD frontend packages. The launcher binary (`voxtype-osd`) ships
         # with every main voxtype package, these provide the GUI frontend
         # the launcher execs into.
@@ -382,7 +403,8 @@
           default = wrapVoxtype (mkVoxtypeUnwrapped {});
           vulkan = wrapVoxtype vulkanUnwrapped;
           rocm = wrapVoxtype rocmUnwrapped;
-          openai-realtime = wrapVoxtype openaiRealtimeUnwrapped;
+          openai-realtime = wrapVoxtypeWith (pkgs.lib.optionals pkgs.stdenv.isLinux [ alignment ]) openaiRealtimeUnwrapped;
+          alignment = alignment;
 
           # ONNX variants (all ONNX engines: Parakeet, Moonshine, SenseVoice,
           # Paraformer, Dolphin, Omnilingual)

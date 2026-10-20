@@ -35,6 +35,14 @@ pub enum Commands {
         /// Write one JSON object to stdout; diagnostics go to stderr
         #[arg(long)]
         json: bool,
+
+        /// Use recorded-audio OpenAI transcription, sharing [openai_realtime] credentials/context
+        #[arg(long, value_parser = ["gpt-transcribe"], conflicts_with = "engine")]
+        file_model: Option<String>,
+
+        /// Align every transcript word against audio locally (English); requires the aligner package
+        #[arg(long, requires_all = ["json", "file_model"])]
+        timestamps: bool,
     },
 
     /// Internal: Worker process for GPU-isolated transcription

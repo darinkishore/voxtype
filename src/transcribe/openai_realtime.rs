@@ -214,7 +214,7 @@ pub struct OpenaiRealtimeTranscriber {
 /// fall-through to the env var — mirrors `soniox.rs`'s `terms_file`
 /// handling (an explicit misconfigured path should fail loudly, not
 /// silently degrade).
-fn resolve_api_key(config: &OpenaiRealtimeConfig) -> Result<String, TranscribeError> {
+pub fn resolve_api_key(config: &OpenaiRealtimeConfig) -> Result<String, TranscribeError> {
     if let Some(key) = &config.api_key {
         if !key.trim().is_empty() {
             return Ok(key.clone());

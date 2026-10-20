@@ -29,6 +29,8 @@ mod overrides;
 mod record;
 pub(crate) mod sigpipe;
 mod status;
+#[cfg(feature = "openai-realtime")]
+mod file_transcription;
 mod transcribe_file;
 mod updates;
 
